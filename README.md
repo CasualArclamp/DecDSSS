@@ -46,8 +46,9 @@ side by side. Two ways of spreading, as a ladder of modes (`decdsss modes`):
 LDPC (rate ½, ⅔ or ¾, 1152-bit codewords, designed in this repository) and a
 time interleaver sit under both. A file is sent as frames in segments, each a
 preamble, a rate-¼ header (callsign, mode, frame numbers) and blocks; a long
-transmission repeats the preamble so a late listener can join, and a repeated
-pass fills a file's gaps.
+transmission repeats the preamble so a late listener can join. Frames are
+erasure-coded: any as many frames as the file has data frames rebuild it, however
+they were lost, and each repeat pass sends new coded frames.
 
 [`docs/DESIGN.md`](docs/DESIGN.md) has the air interface, the receiver as built,
 and every measurement. In short, on AWGN through the whole receiver every mode
@@ -63,7 +64,7 @@ CSK64 on 2.4 kHz).
 cargo run --release -p decdsss-cli -- modes --profile 2k4
 
 # A file to audio, through the HF channel simulator, and back
-cargo run --release -p decdsss-cli -- tx photo.webp --call VK2ABC --mode ds8-1/2 -o tx.wav
+cargo run --release -p decdsss-cli -- tx photo.webp --call VK2ABC --mode ds8-1/2 --parity 25 -o tx.wav
 cargo run --release -p decdsss-cli -- channel tx.wav noisy.wav --snr -4 --fading moderate --offset 12 --clock-ppm 25
 cargo run --release -p decdsss-cli -- rx noisy.wav --out-dir received
 

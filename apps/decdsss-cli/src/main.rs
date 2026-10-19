@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_chan::{Channel, Watterson};
 use decdsss_core::{Mode, Profile};
-use decdsss_link::{Assembler, SendSpec, container, segments};
+use decdsss_link::{Assembler, SendSpec, container, plan};
 use decdsss_phy::codes::{normalise_call, own_code};
 use decdsss_phy::framing::{Layout, PayloadType};
 use decdsss_phy::rx::{Event, MultiReceiver};
@@ -53,7 +53,12 @@ enum Command {
         /// Seconds of payload between preambles (late joiners wait this long).
         #[arg(long, default_value_t = 60.0)]
         resync: f64,
-        /// Send the whole thing this many times (a receiver fills its gaps).
+        /// Coded frames sent with the data frames, in percent of them: any
+        /// frames, in any number of passes, rebuild the file once as many have
+        /// arrived as there are data frames.
+        #[arg(long, default_value_t = 25.0)]
+        parity: f64,
+        /// Passes to send; each later pass sends new coded frames.
         #[arg(long, default_value_t = 1)]
         repeat: usize,
         /// Session number 0-63, to tell transmissions apart.
@@ -169,6 +174,7 @@ fn main() -> Result<()> {
             mode,
             depth,
             resync,
+            parity,
             repeat,
             session,
             rate,
@@ -184,6 +190,7 @@ fn main() -> Result<()> {
             &mode,
             depth,
             resync,
+            parity,
             repeat,
             session,
             rate,
@@ -307,6 +314,7 @@ fn tx(
     mode: &str,
     depth: usize,
     resync: f64,
+    parity: f64,
     repeat: usize,
     session: Option<u8>,
     rate: u32,
@@ -348,21 +356,25 @@ fn tx(
         session: session & 63,
         ptype: PayloadType::File,
         resync_s: resync,
+        parity: parity / 100.0,
+        passes: repeat.max(1),
     };
-    let segs = segments(&spec, &stream).map_err(anyhow::Error::msg)?;
+    let plan = plan(&spec, &stream).map_err(anyhow::Error::msg)?;
+    let segs = &plan.segments;
     let layout = Layout::new(profile, mode, depth);
     let mut chips = Vec::new();
-    for _ in 0..repeat.max(1) {
-        for s in &segs {
-            chips.extend(segment_chips(s).context("cannot build the header")?);
-        }
+    for s in segs {
+        chips.extend(segment_chips(s).context("cannot build the header")?);
     }
     let audio = chips_to_audio(&chips, profile, f64::from(rate), level, lead, tail);
     println!(
-        "{}: {} bytes → {} frames of {} bytes in {} segment(s), {} {} depth {depth}",
+        "{}: {} bytes → {} data + {} coded frames in the first pass ({} pass(es), {} frames of {} bytes in all, {} segment(s)), {} {} depth {depth}",
         name,
         data.len(),
-        segs.iter().map(|s| s.frames.len()).sum::<usize>(),
+        plan.data_frames,
+        plan.coded_first_pass,
+        plan.passes,
+        plan.frames(),
         layout.frame_bytes(),
         segs.len(),
         profile.label(),
@@ -538,12 +550,11 @@ impl RxRun {
         );
         for (call, session) in &self.open {
             if let Some(p) = self.asm.progress(call, *session)
-                && p.total > 0
-                && p.have < p.total
+                && p.have < p.need
             {
                 println!(
-                    "{call} session {session}: {}/{} frames, not complete",
-                    p.have, p.total
+                    "{call} session {session}: {} of the {} frames needed, not complete",
+                    p.have, p.need
                 );
             }
         }

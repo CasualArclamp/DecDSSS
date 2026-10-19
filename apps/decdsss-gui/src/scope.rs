@@ -544,10 +544,16 @@ pub fn soft_bits(ui: &mut Ui, llrs: &[f32], size: Vec2) {
     );
 }
 
-/// Which frames of a transmission are in.
-pub fn frame_map(ui: &mut Ui, map: &[bool], size: Vec2) {
-    let have = map.iter().filter(|&&b| b).count();
-    let (painter, area) = panel(ui, size, "Frames", &format!("{have} / {}", map.len()));
+/// Which data frames of a transmission are in as themselves, and how many
+/// distinct frames in all (data or coded) of the `map.len()` needed.
+pub fn frame_map(ui: &mut Ui, map: &[bool], have: usize, size: Vec2) {
+    let coded = have.saturating_sub(map.iter().filter(|&&b| b).count());
+    let reading = if coded > 0 {
+        format!("{have} / {} needed (+{coded} coded)", map.len())
+    } else {
+        format!("{have} / {} needed", map.len())
+    };
+    let (painter, area) = panel(ui, size, "Frames", &reading);
     if map.is_empty() {
         return;
     }

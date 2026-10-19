@@ -240,9 +240,19 @@ CRC-16 (headers) and CRC-32 (payload frames).
 
 ## Payloads and link layer
 
-- **Files** (M2): one-way, split into frames. Extra frames are erasure-coded
-  (Cauchy Reed–Solomon across frames, as in COFDMtv), so any large enough
-  subset rebuilds the file.
+- **Files** (done): one-way, erasure-coded. The file goes into a small container
+  (name, length, CRC-32), is cut into `K` data shards, and the sender adds coded
+  shards (Cauchy Reed–Solomon over GF(2^16), ported from COFDMtv, itself from
+  aicodix): any `K` distinct frames rebuild the file, however they are lost. Each
+  frame's data is `[ident u16][K u16][shard]`, so a receiver learns `K` from any
+  frame it hears and needs no frame numbers. A pass sends the `K` data frames
+  then some coded ones (`--parity`, 25 % by default); each further pass
+  (`--repeat`) sends *new* coded frames, so every frame of the next pass helps
+  whatever the first lost, where the old plain repeat only helped for the frames
+  that happened to be the lost ones. Decoding cost follows the number of data
+  frames missing, not `K`. A 2400-byte file through slow fading that lost 3–5
+  frames of 38 a pass now arrives in one pass with 10 coded frames (4 of 5
+  seeds; the fifth lost 13 of 48, more than the code covers).
 - **Pictures** (M3): COFDMtv's pipeline. WebP by default, progressive JPEG as an
   option, sized by air time, systematic frames first so the picture draws as it
   arrives.

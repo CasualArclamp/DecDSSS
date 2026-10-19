@@ -719,7 +719,7 @@ fn channel_card(ui: &mut Ui, c: &ChannelView, tr: Option<&Transfer>, w: f32, is_
         });
         scope::soft_bits(ui, &live.soft, vec2(w - 24.0, 44.0));
         if let Some(t) = tr {
-            scope::frame_map(ui, &t.map, vec2(w - 24.0, 34.0));
+            scope::frame_map(ui, &t.map, t.have, vec2(w - 24.0, 34.0));
         }
     });
 }

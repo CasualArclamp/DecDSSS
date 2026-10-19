@@ -408,9 +408,9 @@ fn handle_event(shared: &Arc<Mutex<Shared>>, r: &mut Run, t: f64, profile: Profi
                     call: header.call.clone(),
                     session: header.session,
                     have: 0,
-                    total: usize::from(header.total_frames),
+                    total: 0,
                     done: false,
-                    map: vec![false; usize::from(header.total_frames)],
+                    map: Vec::new(),
                 });
         }
         Event::Block { header, result, .. } => {
@@ -427,16 +427,17 @@ fn handle_event(shared: &Arc<Mutex<Shared>>, r: &mut Run, t: f64, profile: Profi
                     ),
                 );
             }
-            if let Some(tr) = r.transfers.get_mut(&(header.call.clone(), header.session)) {
-                for (i, f) in result.frames.iter().enumerate() {
-                    let idx = result.first_frame + i;
-                    if f.is_some() && idx < tr.map.len() && !tr.map[idx] {
-                        tr.map[idx] = true;
-                        tr.have += 1;
-                    }
-                }
+            let finished = r.asm.push(&header, &result);
+            // Progress comes from the assembler: distinct frames in against the
+            // frames needed (any that many rebuild the file).
+            if let Some(p) = r.asm.progress(&header.call, header.session)
+                && let Some(tr) = r.transfers.get_mut(&(header.call.clone(), header.session))
+            {
+                tr.have = p.have;
+                tr.total = p.need;
+                tr.map = p.data_held;
             }
-            if let Some(f) = r.asm.push(&header, &result) {
+            if let Some(f) = finished {
                 if let Some(tr) = r.transfers.get_mut(&(f.call.clone(), f.session)) {
                     tr.done = true;
                 }

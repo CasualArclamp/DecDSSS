@@ -50,6 +50,8 @@ fn station(
         session,
         ptype: PayloadType::File,
         resync_s: 40.0,
+        parity: 0.2,
+        passes: 1,
     };
     let segs = segments(&spec, &container::pack(name, data)).expect("demo segments");
     let mut chips = Vec::new();

@@ -21,6 +21,7 @@ pub struct TxPanel {
     mode: String,
     depth: usize,
     resync: f64,
+    parity: f64,
     repeat: usize,
     level: f32,
     rate: u32,
@@ -38,6 +39,7 @@ impl Default for TxPanel {
             mode: "ds8-1/2".into(),
             depth: 4,
             resync: 60.0,
+            parity: 25.0,
             repeat: 1,
             level: 0.2,
             rate: 48_000,
@@ -110,13 +112,13 @@ impl TxPanel {
                 % 64) as u8,
             ptype: PayloadType::File,
             resync_s: self.resync,
+            parity: self.parity / 100.0,
+            passes: self.repeat.max(1),
         };
         let segs = segments(&spec, &container::pack(&name, &data))?;
         let mut chips = Vec::new();
-        for _ in 0..self.repeat.max(1) {
-            for s in &segs {
-                chips.extend(segment_chips(s).ok_or("cannot build the header")?);
-            }
+        for s in &segs {
+            chips.extend(segment_chips(s).ok_or("cannot build the header")?);
         }
         let audio = chips_to_audio(&chips, self.profile, f64::from(rate), self.level, 1.0, 1.0);
         Ok(Plan {
@@ -197,7 +199,10 @@ impl TxPanel {
                     ui.label("Preamble every");
                     ui.add(egui::Slider::new(&mut self.resync, 15.0..=300.0).suffix(" s").logarithmic(true));
                     ui.end_row();
-                    ui.label("Repeat");
+                    ui.label("Coded frames");
+                    ui.add(egui::Slider::new(&mut self.parity, 0.0..=100.0).suffix(" % extra"));
+                    ui.end_row();
+                    ui.label("Passes");
                     ui.add(egui::Slider::new(&mut self.repeat, 1..=5));
                     ui.end_row();
                     ui.label("Level");
