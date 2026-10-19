@@ -1,10 +1,9 @@
 // made by CasualArclamp
 //! `decdsss`: the command line.
 
-mod wav;
-
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use decdsss_audio::wav;
 use decdsss_chan::{Channel, Watterson};
 use decdsss_core::{Mode, Profile};
 use decdsss_link::{Assembler, SendSpec, container, segments};
@@ -96,9 +95,12 @@ enum Command {
         /// Codewords per block.
         #[arg(long, default_value_t = 4)]
         depth: usize,
-        /// Blocks per transmission.
+        /// Blocks per segment.
         #[arg(long, default_value_t = 2)]
         blocks: u16,
+        /// Segments sent back to back (a long file).
+        #[arg(long, default_value_t = 1)]
+        segments: usize,
         /// Eb/N0 range start, end and step, dB.
         #[arg(long, num_args = 3, value_names = ["FROM", "TO", "STEP"], allow_negative_numbers = true)]
         ebn0: Vec<f64>,
@@ -174,6 +176,7 @@ fn main() -> Result<()> {
             mode,
             depth,
             blocks,
+            segments,
             ebn0,
             trials,
             fading,
@@ -184,6 +187,7 @@ fn main() -> Result<()> {
             &mode,
             depth,
             blocks,
+            segments,
             &ebn0,
             trials,
             fading.as_deref(),
@@ -381,18 +385,17 @@ fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> 
             .collect::<Result<_>>()?
     };
     std::fs::create_dir_all(out_dir)?;
-    let mut mr: Option<MultiReceiver> = None;
+    let rate = f64::from(wav::sample_rate(input)?);
+    let mut mr = MultiReceiver::new(&profiles, rate);
     let mut asm = Assembler::new();
     let mut seen = 0u64;
     let mut files = 0;
-    let mut rate = 0.0;
     let mut headers = 0;
     let mut frames_ok = 0usize;
     let mut frames_bad = 0usize;
     let mut open: std::collections::BTreeMap<(String, u8), ()> = Default::default();
-    let sr = wav::stream(input, 8192, |chunk| {
-        let r = mr
-            .get_or_insert_with(|| MultiReceiver::new(&profiles, rate_of(chunk, &mut rate, input)));
+    wav::stream(input, 8192, |chunk| {
+        let r = &mut mr;
         seen += chunk.len() as u64;
         let t = seen as f64 / rate;
         for tagged in r.push(chunk) {
@@ -470,7 +473,6 @@ fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> 
             }
         }
     })?;
-    let _ = sr;
     println!(
         "{} header(s), {frames_ok} frames decoded, {frames_bad} lost, {files} file(s) complete",
         headers
@@ -487,16 +489,6 @@ fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> 
         }
     }
     Ok(())
-}
-
-/// The first chunk fixes the receiver's sample rate: read it from the file.
-fn rate_of(_chunk: &[f32], rate: &mut f64, input: &Path) -> f64 {
-    if *rate == 0.0 {
-        *rate = hound::WavReader::open(input)
-            .map(|r| f64::from(r.spec().sample_rate))
-            .unwrap_or(48000.0);
-    }
-    *rate
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -561,6 +553,7 @@ fn sweep(
     mode: &str,
     depth: usize,
     blocks: u16,
+    segments: usize,
     ebn0: &[f64],
     trials: usize,
     fading: Option<&str>,
@@ -603,6 +596,7 @@ fn sweep(
                 mode,
                 depth,
                 nblocks: blocks,
+                segments,
                 ebn0_db: x,
                 fading,
                 offset_hz: offset,

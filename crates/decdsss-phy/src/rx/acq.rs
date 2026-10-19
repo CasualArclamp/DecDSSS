@@ -45,7 +45,10 @@ pub struct Detection {
     /// frequency hypotheses × `cols` code phases, normalised to the noise
     /// mean, row 0 the lowest frequency.
     pub surface: Surface,
-    /// Absolute index of the first sample of the oldest window used.
+    /// Absolute index of the start of the first window in which the detected
+    /// cell is lit up: where the preamble began, to within a window. Earlier
+    /// windows in the search hold only whatever came before (noise, the end of
+    /// a payload).
     pub first_sample: i64,
 }
 
@@ -285,6 +288,17 @@ impl Acquirer {
         out
     }
 
+    /// Start of the first window whose power at cell `idx` is at least a
+    /// quarter of the strongest window's: the preamble was on by then.
+    fn onset(&self, idx: usize) -> Option<i64> {
+        let power: Vec<f32> = self.ring.iter().map(|w| w[idx]).collect();
+        let top = power.iter().copied().fold(0.0f32, f32::max);
+        let first = power.iter().position(|&p| p >= 0.25 * top)?;
+        // One window earlier, in case the preamble began late in it.
+        let first = first.saturating_sub(1);
+        self.starts.get(first).copied()
+    }
+
     fn detect(&self, last_start: i64) -> Option<Detection> {
         let m = self.ring.len();
         // Noise level: the median cell of a sum of m exponentials is
@@ -356,7 +370,7 @@ impl Acquirer {
                 peak_row: row - r0,
                 peak_col: span as usize,
             },
-            first_sample: self.starts.front().copied().unwrap_or(last_start),
+            first_sample: self.onset(idx).unwrap_or(last_start),
         })
     }
 }

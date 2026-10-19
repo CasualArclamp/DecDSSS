@@ -465,6 +465,44 @@ mod tests {
         );
     }
 
+    /// Segments back to back: each preamble starts right after the previous
+    /// payload ends. The search must start the preamble tracker where the
+    /// signal began, not at the oldest search window (which then holds payload,
+    /// where the A..A B B pattern test can match by chance and lock too early).
+    #[test]
+    fn five_back_to_back_segments_all_arrive() {
+        let profile = Profile::W2400;
+        let segs: Vec<Segment> = (0..5usize)
+            .map(|i| {
+                let mut s = segment(profile, "csk32-1/2", 1, 2);
+                s.header.frame0 = (i * 2) as u16;
+                s.header.total_frames = 10;
+                for (j, f) in s.frames.iter_mut().enumerate() {
+                    for b in f.iter_mut() {
+                        *b = b.wrapping_add((i * 2 + j) as u8 * 11);
+                    }
+                }
+                s
+            })
+            .collect();
+        let mut chips = Vec::new();
+        for s in &segs {
+            chips.extend(segment_chips(s).unwrap());
+        }
+        let audio = chips_to_audio(&chips, profile, FS, LEVEL, 1.0, 1.0);
+        let mut ch = channel(profile, -3.0);
+        ch.offset_hz = 9.0;
+        ch.clock_ppm = -25.0;
+        let audio = ch.apply(&audio, FS);
+        let mut rx = Receiver::new(profile, FS);
+        let events = run(&mut rx, &audio);
+        let got = frames_of(&events);
+        assert_eq!(got.len(), 10, "frames: {}", got.len());
+        for (i, f) in got {
+            assert_eq!(f.as_ref(), Some(&segs[i / 2].frames[i % 2]), "frame {i}");
+        }
+    }
+
     #[test]
     fn two_stations_at_once_on_different_codes() {
         let profile = Profile::W2400;

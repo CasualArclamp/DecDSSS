@@ -1,10 +1,11 @@
 // made by CasualArclamp
-//! WAV in and out for the command line.
+//! WAV in and out for the command line and the GUI.
 
-use anyhow::{Context, Result, bail};
+use crate::{Error, Result};
 use std::path::Path;
 
-/// Writes mono 16-bit PCM. Scales down (and says so) if the audio would clip.
+/// Writes mono 16-bit PCM. Scales down if the audio would clip; returns the
+/// peak level written.
 pub fn write(path: &Path, audio: &[f32], rate: u32) -> Result<f32> {
     let peak = audio.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let scale = if peak > 0.98 { 0.98 / peak } else { 1.0 };
@@ -14,8 +15,7 @@ pub fn write(path: &Path, audio: &[f32], rate: u32) -> Result<f32> {
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut w = hound::WavWriter::create(path, spec)
-        .with_context(|| format!("cannot create {}", path.display()))?;
+    let mut w = hound::WavWriter::create(path, spec)?;
     for &v in audio {
         w.write_sample((v * scale * 32767.0).round() as i16)?;
     }
@@ -23,21 +23,28 @@ pub fn write(path: &Path, audio: &[f32], rate: u32) -> Result<f32> {
     Ok(peak * scale)
 }
 
+/// The sample rate of a WAV file.
+pub fn sample_rate(path: &Path) -> Result<u32> {
+    Ok(hound::WavReader::open(path)?.spec().sample_rate)
+}
+
 /// Reads a whole WAV as mono f32 (channels averaged) and its sample rate.
 pub fn read(path: &Path) -> Result<(Vec<f32>, u32)> {
-    let mut chunks = Vec::new();
-    let rate = stream(path, 1 << 20, |c| chunks.extend_from_slice(c))?;
-    Ok((chunks, rate))
+    let mut all = Vec::new();
+    let rate = stream(path, 1 << 20, |c| all.extend_from_slice(c))?;
+    Ok((all, rate))
 }
 
 /// Calls `f` with successive mono chunks of about `chunk` samples; returns
 /// the sample rate.
 pub fn stream(path: &Path, chunk: usize, mut f: impl FnMut(&[f32])) -> Result<u32> {
-    let mut r =
-        hound::WavReader::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut r = hound::WavReader::open(path)?;
     let spec = r.spec();
     if spec.sample_rate < 8000 {
-        bail!("sample rate {} Hz is too low", spec.sample_rate);
+        return Err(Error::InvalidArgument(format!(
+            "sample rate {} Hz is too low",
+            spec.sample_rate
+        )));
     }
     let ch = usize::from(spec.channels.max(1));
     let mut buf: Vec<f32> = Vec::with_capacity(chunk);
@@ -70,4 +77,29 @@ pub fn stream(path: &Path, chunk: usize, mut f: impl FnMut(&[f32])) -> Result<u3
         f(&buf);
     }
     Ok(spec.sample_rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_and_clip_guard() {
+        let dir = std::env::temp_dir().join("decdsss-audio-wav-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.wav");
+        let x: Vec<f32> = (0..4800).map(|i| 0.4 * (i as f32 * 0.05).sin()).collect();
+        write(&p, &x, 48_000).unwrap();
+        let (y, rate) = read(&p).unwrap();
+        assert_eq!(rate, 48_000);
+        assert_eq!(y.len(), x.len());
+        assert!(x.iter().zip(&y).all(|(a, b)| (a - b).abs() < 1e-3));
+        // Too loud: scaled down, not wrapped.
+        let loud: Vec<f32> = x.iter().map(|v| v * 5.0).collect();
+        let peak = write(&p, &loud, 48_000).unwrap();
+        assert!(peak <= 0.981, "{peak}");
+        let (z, _) = read(&p).unwrap();
+        assert!(z.iter().all(|v| v.abs() < 0.99));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

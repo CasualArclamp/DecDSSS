@@ -22,6 +22,8 @@ pub struct Scenario {
     pub mode: Mode,
     pub depth: usize,
     pub nblocks: u16,
+    /// Segments sent back to back (a long file); each has `nblocks` blocks.
+    pub segments: usize,
     /// Eb/N0 per information bit of a codeword (its CRC counted, the pilots
     /// and padding of the block counted as air time), dB.
     pub ebn0_db: f64,
@@ -62,22 +64,28 @@ pub fn frames(layout: &Layout, n: usize) -> Vec<Vec<u8>> {
 /// Runs one scenario through the whole receiver.
 pub fn run(sc: &Scenario) -> Outcome {
     let layout = Layout::new(sc.profile, sc.mode, sc.depth);
-    let n = usize::from(sc.nblocks) * sc.depth;
-    let seg = Segment {
-        header: Header {
-            profile: sc.profile,
-            mode: sc.mode,
-            depth: sc.depth,
-            ptype: PayloadType::Test,
-            call: "VK2ABC".into(),
-            session: 1,
-            frame0: 0,
-            nblocks: sc.nblocks,
-            total_frames: 0,
-        },
-        frames: frames(&layout, n),
-    };
-    let chips = segment_chips(&seg).expect("header packs");
+    let per = usize::from(sc.nblocks) * sc.depth;
+    let segments = sc.segments.max(1);
+    let n = per * segments;
+    let all = frames(&layout, n);
+    let mut chips = Vec::new();
+    for i in 0..segments {
+        let seg = Segment {
+            header: Header {
+                profile: sc.profile,
+                mode: sc.mode,
+                depth: sc.depth,
+                ptype: PayloadType::Test,
+                call: "VK2ABC".into(),
+                session: 1,
+                frame0: (i * per) as u16,
+                nblocks: sc.nblocks,
+                total_frames: n as u16,
+            },
+            frames: all[i * per..(i + 1) * per].to_vec(),
+        };
+        chips.extend(segment_chips(&seg).expect("header packs"));
+    }
     let audio = chips_to_audio(&chips, sc.profile, FS, LEVEL, 1.0, 2.0);
     let ch = Channel {
         snr_db: Some(snr_for_ebn0(&layout, sc.ebn0_db)),
@@ -93,6 +101,7 @@ pub fn run(sc: &Scenario) -> Outcome {
         frames_total: n,
         ..Outcome::default()
     };
+    let mut seen = vec![false; n];
     for chunk in audio.chunks(4800) {
         for e in rx.push(chunk) {
             match e {
@@ -100,7 +109,8 @@ pub fn run(sc: &Scenario) -> Outcome {
                 Event::Block { result, .. } => {
                     for (i, f) in result.frames.iter().enumerate() {
                         let idx = result.first_frame + i;
-                        if idx < n && f.as_ref() == Some(&seg.frames[idx]) {
+                        if idx < n && !seen[idx] && f.as_ref() == Some(&all[idx]) {
+                            seen[idx] = true;
                             out.frames_ok += 1;
                         }
                     }
@@ -176,6 +186,7 @@ mod tests {
             mode: Mode::from_name("csk64-1/2").unwrap(),
             depth: 4,
             nblocks: 2,
+            segments: 1,
             ebn0_db: 22.0,
             fading: Some(Watterson::GOOD),
             offset_hz: 0.0,
@@ -269,6 +280,7 @@ mod tests {
             mode: Mode::from_name("csk64-1/2").unwrap(),
             depth: 2,
             nblocks: 2,
+            segments: 1,
             ebn0_db: 12.0,
             fading: None,
             offset_hz: 4.0,
@@ -278,6 +290,31 @@ mod tests {
         let o = run(&sc);
         assert!(o.header);
         assert_eq!((o.frames_ok, o.frames_total), (4, 4));
+    }
+
+    /// A file sent as many segments back to back (a preamble right after the
+    /// previous payload) must arrive whole. The search once started its preamble
+    /// tracker at the oldest search window, which then held payload: the pattern
+    /// test could match there by chance and lock early, losing a whole segment
+    /// (4-6 % of frames at any SNR in this scenario).
+    #[test]
+    fn many_back_to_back_segments_lose_nothing() {
+        let t = run_many(
+            &Scenario {
+                profile: Profile::W2400,
+                mode: Mode::from_name("csk64-1/2").unwrap(),
+                depth: 1,
+                nblocks: 3,
+                segments: 6,
+                ebn0_db: 11.0,
+                fading: None,
+                offset_hz: 5.0,
+                clock_ppm: 0.0,
+                seed: 2000,
+            },
+            16,
+        );
+        assert_eq!(t.frames_ok, t.frames_total, "{t:?}");
     }
 
     #[test]
