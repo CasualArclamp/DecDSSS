@@ -600,6 +600,8 @@ impl App {
                     ui.horizontal(|ui| self.cat_button(ui));
                 });
             });
+            // The listen card is the widest: it gets a line of its own.
+            ui.end_row();
             frame(ui).show(ui, |ui| {
                 ui.vertical(|ui| {
                     Self::caption(ui, "LISTEN");
