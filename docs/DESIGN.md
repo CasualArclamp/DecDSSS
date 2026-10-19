@@ -20,7 +20,7 @@ milestones. Update it when a decision changes.
 | Bandwidths | 2.4 kHz (300–2700 Hz) and 3 kHz (300–3300 Hz), plus a 500 Hz weak-signal profile. |
 | Station ID | Callsign in the header only (no CW ID). |
 | Code use | CDMA: a common *call code* for preambles and headers, then data on a code derived from the station's callsign; the receiver despreads every station it finds at once. |
-| Radio I/O | Sound card with VOX/manual PTT; CAT keying for IC-7300 / FT-710 (from voicemodem); WAV and IQ files in and out. |
+| Radio I/O | Sound card with VOX/manual PTT; CAT keying for IC-7300 / FT-710 (from voicemodem), any Hamlib rig through `rigctld`, and DTR/RTS keying; WAV and IQ files in and out. |
 | Receiver panels | DVB-CID's set, plus acquisition heatmap, rake/multipath profile, waterfall + PSD against the noise floor, chip scope. |
 | Link | Both: one-way broadcast with FEC, and an ARQ connected mode for files. |
 | FEC | LDPC with a time interleaver. |
@@ -443,7 +443,7 @@ CRC-16 (headers) and CRC-32 (payload frames).
     "microphone" for 12 s, the CLI received header and five blocks and saved
     12.8 s of speech at the end frame; the speech player was checked by playing a
     tone through it into one cable and recording it from the other.
-  - *Not yet:* CAT keying (voicemodem's rig crate), a short preamble.
+  - *Keying:* see Radio I/O. *Not yet:* a short preamble.
 - **ARQ** (M5): a connected mode for files on both stations' own codes, with
   selective repeat and ACK bitmaps sent at a robust mode.
 
@@ -566,10 +566,57 @@ takes the picture from inside the window, for unattended checks.
 
 ## Radio I/O
 
-Sound card in and out (cpal), with VOX or manual PTT. CAT keying for the IC-7300
-and FT-710 comes from voicemodem's `rig` crate. Files: WAV (mono audio, or
-stereo as I/Q) and raw `cf32`. Live tests go through VB-Audio cable A, which is
-silent.
+Sound card in and out (cpal), with VOX or manual PTT, or the transmitter keyed by
+the program (below). Files: WAV (mono audio, or stereo as I/Q) and raw `cf32`.
+Live tests go through VB-Audio cable A, which is silent.
+
+**Keying** (`decdsss-rig`, the GUI's *CAT / PTT…* button in the bar; a dialog laid
+out as WSJT-X's "CAT and PTT Config"). The program only keys the transmitter: the
+operator sets the frequency and the mode (USB, or data) on the radio, as with any
+sound-card interface. What keys it (*PTT uses*):
+
+- **VOX** (the default): nothing is keyed; the radio is on VOX or keyed by hand.
+- **CAT**: a command to the rig, found on its port first. The IC-7300 by CI-V
+  (address 94h as it comes) and the FT-710 by Yaesu's ASCII (`TX1;` / `TX0;`, the
+  state read back with `TX;`) are driven directly; the code is voicemodem's `rig`
+  crate (same author). Any other rig goes through Hamlib's `rigctld` over TCP
+  (`T 1` / `T 0`; the model "Hamlib rigctld", address `host:port`, 4532 if none):
+  Hamlib itself is C and is not linked in, so this is how the whole Hamlib list is
+  reached without it. The CAT rate set is tried first and the rig's other rates
+  after it.
+- **DTR** or **RTS**: the line of a serial port goes high to transmit and low to
+  receive, on the CAT port or on a port of its own (*PTT serial device*). Both
+  lines are held low when a port is opened, so opening one never keys the rig.
+  *Force RTS / DTR* hold a line of the CAT port high, for an interface that takes
+  its power from it.
+
+A transmission to the radio (files, pictures, text, voice overs, live voice) keys
+the transmitter before its first sample and lets go after its last: the rig's
+answer is waited for (CAT) and then a lead time (100 ms as it comes), and after the
+last sample a tail time (100 ms) passes before the key is let go; both are set in
+the dialog. A rig that will not key stops the transmission before any audio, with
+the reason in the Transmit panel. STOP TX lets go at once. The transmitter is
+never left keyed: the key is held by a guard that lets go however the transmission
+ends, the rig's thread lets go when it is dropped, and the window lets go on exit.
+Audio to the speakers (the RF monitor, received speech) never keys. *Test PTT* keys
+with no audio until it is pressed again, and lets go by itself after 15 s. If the
+rig was not found (switched off at start-up), the next transmission looks again.
+The settings are remembered (`rig_*` in the preferences file); unattended runs
+(`--screenshot`) neither read nor write them. `decdsss rig` lists the serial ports
+and, with `--model` and `--port`, checks that a rig answers (it asks "ID;" or its
+equivalent and never keys).
+
+*Checked:* the CAT, line and `rigctld` code against stand-in rigs (`cargo test -p
+decdsss-rig`, including `rigctld` over a real local TCP socket); the keying around
+audio through VB-Audio cable A with a stand-in rig (`cargo test -p decdsss-gui --
+--ignored keyed_around`); and, without keying, the real FT-710 on this PC answering
+`ID;` with 0800 on both of its COM ports (the Standard one at 4800 baud, the
+Enhanced one at 38400). *Not checked:* keying a real transmitter (Rory's to do),
+the IC-7300 against a real one, CI-V and `rigctld` against real rigs, and DTR/RTS
+on a real interface. There is no CAT keying on the command line yet (`tx --play`
+does not key). Not done from the WSJT-X dialog: OmniRig, a separate PTT input
+(CTS), the left-channel VOX tone (the Transmit panel's VOX box sends a tone ahead
+of the signal) and the rest of Hamlib's models other than through `rigctld`.
 
 ## Crate layout
 
@@ -584,7 +631,7 @@ silent.
 | `decdsss-codec2` | Codec2 (vendored C core, LGPL-2.1) with a safe wrapper: modes 3200 … 450, bit-exact frame packing. |
 | `decdsss-image` | Pictures: load, scale and compress to a byte budget as a progressive JPEG; decode one that is cut short. |
 | `decdsss-audio` | Sound-card capture and playback (cpal) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
-| `decdsss-rig` | CAT keying (M4). |
+| `decdsss-rig` | Transmitter keying: CAT (IC-7300, FT-710, Hamlib `rigctld`) and DTR/RTS, on a thread that owns the rig. |
 | `apps/decdsss-cli` | `decdsss`: modes, devices, tx, rx, channel, sweep. |
 | `apps/decdsss-gui` | `decdsss-gui`: the window above. |
 
@@ -605,7 +652,8 @@ silent.
   did not finish) and the GUI. *Done* (see Verification).
 - **M4** — voice, VOX/manual PTT, CAT keying. Link layer and CLI (`tx --voice`,
   `rx` writes the speech), GUI (record, send, receive cards, play) and VOX tone
-  *done*; CAT keying and the fast-mode fix (see Verification) to do.
+  *done*; CAT/PTT keying *done* (Radio I/O; not yet tried on a real transmitter);
+  the fast-mode fix (see Verification) to do.
 - **M5** — ARQ connected mode.
 - **M6** — polish and the first release (portable exes), when Rory says so.
 

@@ -38,6 +38,22 @@ enum Command {
     },
     /// List the sound cards (inputs and outputs) with their rates.
     Devices,
+    /// List the serial ports, or check that a rig answers on one. Never keys
+    /// the transmitter: it only asks the rig what it is.
+    Rig {
+        /// The rig: ic7300, ft710 or rigctld (Hamlib's, over TCP).
+        #[arg(long, requires = "port")]
+        model: Option<String>,
+        /// Its serial port (COM7), or for rigctld its address (localhost:4532).
+        #[arg(long, requires = "model")]
+        port: Option<String>,
+        /// The CAT rate to try first (the rig's other rates are tried after).
+        #[arg(long)]
+        baud: Option<u32>,
+        /// The IC-7300's CI-V address, in hexadecimal (94 as it comes).
+        #[arg(long, value_parser = parse_hex_byte)]
+        civ: Option<u8>,
+    },
     /// Turn a file into a transmission (a WAV of audio to feed a radio).
     Tx {
         /// The file to send (not needed with --text or --cq).
@@ -209,6 +225,12 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Modes { profile } => modes(profile.as_deref()),
         Command::Devices => devices(),
+        Command::Rig {
+            model,
+            port,
+            baud,
+            civ,
+        } => rig(model.as_deref(), port.as_deref(), baud, civ),
         Command::Tx {
             file,
             text,
@@ -1005,6 +1027,45 @@ fn devices() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn parse_hex_byte(s: &str) -> Result<u8, String> {
+    u8::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| format!("{s}: {e}"))
+}
+
+/// `decdsss rig`: the serial ports; with a model and a port, whether the rig is
+/// there. Nothing is keyed.
+fn rig(model: Option<&str>, port: Option<&str>, baud: Option<u32>, civ: Option<u8>) -> Result<()> {
+    let (Some(model), Some(port)) = (model, port) else {
+        println!("Serial ports:");
+        let ports = decdsss_rig::ports();
+        if ports.is_empty() {
+            println!("  (none)");
+        }
+        for p in ports {
+            println!("  {}  {}", p.name, p.description);
+        }
+        println!("Rigs: ic7300, ft710, rigctld (any Hamlib rig; start rigctld first)");
+        return Ok(());
+    };
+    let Some(parsed) = decdsss_rig::Model::parse(model) else {
+        bail!("no rig {model:?}: ic7300, ft710 or rigctld");
+    };
+    let mut settings = decdsss_rig::Settings::new(parsed, port);
+    if let Some(b) = baud {
+        settings.baud = b;
+    }
+    if let Some(c) = civ {
+        settings.civ = c;
+    }
+    let found = decdsss_rig::connect(&settings).map_err(anyhow::Error::msg)?;
+    let rate = if found.baud > 0 {
+        format!(" at {} baud", found.baud)
+    } else {
+        String::new()
+    };
+    println!("{} on {port}{rate}: {}", parsed.name(), found.answer);
     Ok(())
 }
 

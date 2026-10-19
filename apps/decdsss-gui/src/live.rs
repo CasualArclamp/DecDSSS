@@ -11,6 +11,7 @@
 //! block is chosen about a second before it goes out. Letting go sends what is
 //! left and an end frame; abort cuts the audio at once.
 
+use crate::radio::Radio;
 use decdsss_audio::channels::downmix_to_mono;
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream};
 use decdsss_codec2::Mode as Codec;
@@ -43,6 +44,8 @@ pub struct LiveConfig {
     pub out_device: Option<String>,
     pub out_rate: u32,
     pub mic_device: Option<String>,
+    /// The radio's keying: held down for as long as the signal goes out.
+    pub radio: Radio,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +338,18 @@ fn modulate(
     }
     let _ = ready.send(Ok(()));
     let ch = fmt.channels.max(1);
+    // Key the transmitter before the first sample (declared after `out`, so
+    // that any way out of here lets go of the key before the audio is cut). A
+    // rig that will not key ends the transmission, with the reason.
+    let hold = match cfg.radio.hold() {
+        Ok(h) => h,
+        Err(e) => {
+            fail(&shared, e);
+            abort.store(true, Ordering::Relaxed);
+            shared.lock().unwrap().modulator_done = true;
+            return;
+        }
+    };
     // For checking: what is played, as a WAV (DECDSSS_LIVE_WAV=path).
     let mut played: Vec<f32> = Vec::new();
     let keep = std::env::var_os("DECDSSS_LIVE_WAV").is_some();
@@ -403,6 +418,11 @@ fn modulate(
     }
     if alive {
         out.drain(Duration::from_secs(10));
+    }
+    // Played out: the tail time, then let go. Stopped or failed: `hold` lets go
+    // at once as it is dropped.
+    if alive && let Some(h) = hold {
+        h.finish();
     }
     let stats = out.stats();
     if stats.underruns > 0 {

@@ -1,0 +1,14 @@
+# made by CasualArclamp
+[package]
+name = "decdsss-rig"
+description = "Transmitter keying for DecDSSS: CAT (IC-7300 CI-V, FT-710, Hamlib rigctld) and the DTR/RTS lines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Pure Rust on Windows (Win32 through winapi); without its default features it
+# leaves out libudev, which is C and Linux's alone.
+serialport = { version = "4", default-features = false }

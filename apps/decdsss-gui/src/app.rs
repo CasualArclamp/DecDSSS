@@ -1,10 +1,12 @@
 // made by CasualArclamp
 //! The application window.
 
+use crate::cat::{self, CatDialog};
 use crate::engine::{
     Cmd, Config, Engine, PictureView, Shared, Source, SpectrumView, Transfer, VoiceView,
 };
 use crate::prefs::Prefs;
+use crate::radio::{Lamp, Radio};
 use crate::scope::{self, HeatTexture, col};
 use crate::tx::TxPanel;
 use decdsss_audio::{list_input_devices, list_output_devices};
@@ -59,6 +61,8 @@ pub struct Automation {
     pub after: Option<f64>,
     pub screenshot: Option<PathBuf>,
     pub open_tx: bool,
+    /// Open the CAT and PTT dialog at launch.
+    pub open_cat: bool,
     /// Open the transmit window with this file chosen.
     pub tx_file: Option<PathBuf>,
     /// Open the transmit window set to send this text (a message; `cq` for a CQ call).
@@ -109,6 +113,9 @@ pub struct App {
     waterfall: Option<crate::waterfall::Waterfall>,
     heat: [HeatTexture; 5],
     tx: TxPanel,
+    /// The radio's keying (CAT, DTR, RTS) and the dialog that sets it.
+    radio: Radio,
+    cat: CatDialog,
     view: View,
     /// The RF monitor: on or off, how loud, and on which output (0 the default).
     monitor_on: bool,
@@ -184,6 +191,10 @@ impl App {
         };
         let mut tx = TxPanel::default();
         tx.restore(&prefs);
+        // The rig is looked for at once, so it is found by the first transmission.
+        let radio = tx.radio.clone();
+        let cat_config = cat::restore(&prefs);
+        radio.apply(cat_config.clone());
         let mut view = prefs
             .get("view")
             .and_then(View::from_name)
@@ -234,7 +245,7 @@ impl App {
                 .unwrap_or(Plot::Delay),
         ];
         let mut app = App {
-            engine: Engine::spawn(),
+            engine: Engine::spawn(radio.clone()),
             source,
             wav,
             devices_in,
@@ -251,6 +262,8 @@ impl App {
             waterfall: None,
             heat: Default::default(),
             tx,
+            radio,
+            cat: CatDialog::new(cat_config),
             view,
             monitor_on: false,
             monitor_volume,
@@ -273,6 +286,10 @@ impl App {
             card_plots,
             pictures: Default::default(),
         };
+        if app.auto.open_cat {
+            let radio = app.radio.clone();
+            app.cat.show_open(&radio);
+        }
         if let Some(hint) = app.auto.listen.clone() {
             app.monitor_device = app
                 .devices_out
@@ -453,10 +470,44 @@ impl App {
                 self.engine.send(Cmd::StopTransmit);
             }
             ui.separator();
+            self.cat_button(ui);
+            ui.separator();
             self.monitor_controls(ui, sh);
             ui.separator();
             ui.label(RichText::new(&sh.status).weak());
         });
+    }
+
+    /// The CAT and PTT button, with a lamp: grey when the program keys nothing,
+    /// amber while the rig is being found, green when it is ready, red when the
+    /// transmitter is keyed or the rig is not working.
+    fn cat_button(&mut self, ui: &mut Ui) {
+        let s = self.radio.status();
+        let colour = match (s.keyed, &s.lamp) {
+            (true, _) | (_, Lamp::Bad) => col::BAD,
+            (_, Lamp::Wait) => col::MARK,
+            (_, Lamp::Ok) => col::LOCK,
+            (_, Lamp::Off) => Color32::GRAY,
+        };
+        ui.label(RichText::new("●").color(colour));
+        let label = if s.keyed {
+            "CAT / PTT — TX"
+        } else {
+            "CAT / PTT…"
+        };
+        if ui
+            .button(label)
+            .on_hover_text(format!(
+                "{}
+{}",
+                self.radio.config().summary(),
+                s.text
+            ))
+            .clicked()
+        {
+            let radio = self.radio.clone();
+            self.cat.show_open(&radio);
+        }
     }
 
     /// The RF monitor: a button to hear what the receiver hears, its volume and
@@ -819,6 +870,7 @@ impl App {
             audio: crate::voice::speech_to_audio(speech, rate),
             rate,
             device,
+            key: false,
         });
     }
 
@@ -1459,6 +1511,11 @@ fn plot(ui: &mut Ui, p: Plot, c: &ChannelView, size: egui::Vec2) {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Never leave the transmitter keyed behind a window that is gone.
+        self.radio.shut();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // At most 60 frames a second: a waterfall row is made 60 times a second, so
         // more frames only repeat rows (and a 144 or 165 Hz display would run the
@@ -1557,6 +1614,12 @@ impl eframe::App for App {
         };
 
         egui::Panel::top("bar").show(ui, |ui| self.top_bar(ui, &sh));
+        self.cat.show(
+            ui.ctx(),
+            &self.radio,
+            &mut self.prefs,
+            self.auto.screenshot.is_none(),
+        );
         let devices_out = self.devices_out.clone();
         let devices_in = self.devices_in.clone();
         let listen = self.listen();

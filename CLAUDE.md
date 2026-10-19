@@ -12,6 +12,7 @@ cargo check --workspace --all-targets   # fast feedback
 cargo test --workspace                  # unit tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p decdsss-cli -- modes       # the mode ladder and its rates
+cargo run -p decdsss-cli -- rig         # serial ports; add --model ft710 --port COM7 to check a rig answers (never keys)
 cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --picture --air 120 -o pic.wav   # a picture sized to the air time
 cargo run --release -p decdsss-cli -- tx speech.wav --call VK2ABC --voice -o voice.wav   # Codec2 speech
 cargo run --release -p decdsss-cli -- tx file.bin --call VK2ABC --profile 500 --slot +500 -o f.wav   # a 500 Hz slot (-500, 0 or +500)
@@ -41,4 +42,6 @@ cargo run --release -p decdsss-gui -- --demo   # the window; --screenshot OUT.pn
 - Heavy test sweeps (threshold measurements, long fading runs) belong on CI or
   behind `#[ignore]`, not on Rory's machine by default.
 - Live tests go through VB-Audio cable A (silent). Live radio tests are Rory's;
-  never key a transmitter.
+  never key a transmitter. That includes the GUI's *Test PTT* and any `Ptt` built
+  on a real port: tests of keying use `decdsss_rig::testing::FakeRig`. `decdsss rig
+  --model … --port …` only asks the rig what it is, which is fine.

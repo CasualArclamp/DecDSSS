@@ -21,6 +21,7 @@ decdsss-core = { path = "../../crates/decdsss-core" }
 decdsss-image = { path = "../../crates/decdsss-image" }
 decdsss-link = { path = "../../crates/decdsss-link" }
 decdsss-phy = { path = "../../crates/decdsss-phy" }
+decdsss-rig = { path = "../../crates/decdsss-rig" }
 anyhow.workspace = true
 rustfft.workspace = true
 # The glow (OpenGL) renderer instead of eframe's default wgpu: plenty for 2-D

@@ -7,6 +7,7 @@
 use crate::demo;
 use crate::monitor::Monitor;
 use crate::player::Player;
+use crate::radio::Radio;
 use crate::spectrum::Spectrum;
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_codec2::Mode as Codec;
@@ -66,11 +67,14 @@ pub enum Cmd {
         device: Option<String>,
         volume: f32,
     },
-    /// Plays audio (already at `rate`) on the output device.
+    /// Plays audio (already at `rate`) on the output device. `key`: the audio
+    /// goes to the radio, so the transmitter is keyed for it (if the CAT and PTT
+    /// settings say how); false for audio to the speakers.
     Transmit {
         audio: Vec<f32>,
         rate: u32,
         device: Option<String>,
+        key: bool,
     },
     Quit,
 }
@@ -204,13 +208,13 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn spawn() -> Engine {
+    pub fn spawn(radio: Radio) -> Engine {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (cmd, rx) = mpsc::channel();
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
             .name("decdsss-engine".into())
-            .spawn(move || worker(s2, rx))
+            .spawn(move || worker(s2, rx, radio))
             .expect("engine thread");
         Engine {
             shared,
@@ -454,7 +458,7 @@ fn log(shared: &Arc<Mutex<Shared>>, line: String) {
     g.version += 1;
 }
 
-fn worker(shared: Arc<Mutex<Shared>>, rx: Receiver<Cmd>) {
+fn worker(shared: Arc<Mutex<Shared>>, rx: Receiver<Cmd>, radio: Radio) {
     let mut run: Option<Run> = None;
     let mut monitor = Monitor::default();
     let mut player = Player::default();
@@ -508,7 +512,15 @@ fn worker(shared: Arc<Mutex<Shared>>, rx: Receiver<Cmd>) {
                 audio,
                 rate,
                 device,
-            }) => transmit(&shared, audio, rate, device, tx_stop.clone()),
+                key,
+            }) => transmit(
+                &shared,
+                audio,
+                rate,
+                device,
+                tx_stop.clone(),
+                key.then(|| radio.clone()),
+            ),
             None => {}
         }
         // The speech output is fed whether or not a receiver is running.
@@ -949,6 +961,7 @@ fn transmit(
     rate: u32,
     device: Option<String>,
     stop: Arc<AtomicBool>,
+    radio: Option<Radio>,
 ) {
     {
         let mut g = shared.lock().unwrap();
@@ -984,10 +997,19 @@ fn transmit(
             }
             let ch = fmt.channels.max(1);
             let total = audio.len();
+            // Key the transmitter, with the stream already open so that nothing
+            // but the rig's answer and the lead time stands between the key and
+            // the first sample. A rig that will not key stops the transmission.
+            // Declared after `out`, so a stop or an error lets go of the key
+            // first, then cuts the audio.
+            let hold = match &radio {
+                Some(r) => r.hold()?,
+                None => None,
+            };
             let mut i = 0;
             while i < total {
                 if stop.load(Ordering::Relaxed) {
-                    // Dropping the stream at the end of this closure cuts the audio.
+                    // Dropping the key, then the stream, at the end of this closure.
                     shared.lock().unwrap().tx.stopped = true;
                     return Ok(());
                 }
@@ -1004,6 +1026,10 @@ fn transmit(
                 g.version += 1;
             }
             out.drain(Duration::from_secs(10));
+            // The tail time, then let go.
+            if let Some(h) = hold {
+                h.finish();
+            }
             Ok(())
         })();
         let mut g = shared.lock().unwrap();
@@ -1011,4 +1037,83 @@ fn transmit(
         g.tx.error = result.err();
         g.version += 1;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use decdsss_rig::testing::FakeRig;
+
+    /// Plays two seconds of a tone through `transmit` into VB-Audio cable A
+    /// (silent) with a stand-in rig: the rig is keyed before the first sample
+    /// reaches the card and let go after the last. Needs the cable, so it is run
+    /// by hand: `cargo test -p decdsss-gui -- --ignored keyed_around`.
+    #[test]
+    #[ignore = "needs VB-Audio cable A"]
+    fn the_rig_is_keyed_around_the_audio() {
+        let rig = FakeRig::new(decdsss_rig::Model::Ft710);
+        let radio = Radio::with_fake_rig(&rig, 150, 150);
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let audio: Vec<f32> = (0..96_000).map(|i| 0.1 * (i as f32 * 0.13).sin()).collect();
+        let started = Instant::now();
+        transmit(
+            &shared,
+            audio,
+            48_000,
+            Some("CABLE-A Input".into()),
+            Arc::new(AtomicBool::new(false)),
+            Some(radio),
+        );
+        // While audio is being played the rig is keyed, from before the first
+        // sample (progress is only reported once a piece has been written).
+        let mut keyed_when_playing = None;
+        while shared.lock().unwrap().tx.active {
+            let played = shared.lock().unwrap().tx.played;
+            if played > 0.0 && keyed_when_playing.is_none() {
+                keyed_when_playing = Some(rig.transmitting());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let g = shared.lock().unwrap();
+        assert_eq!(g.tx.error, None);
+        assert_eq!(keyed_when_playing, Some(true));
+        assert!(!rig.transmitting());
+        assert_eq!(rig.keyings(), [true, false]);
+        // The lead (0.15 s), two seconds of audio, the tail (0.15 s).
+        assert!(
+            started.elapsed() >= Duration::from_millis(2300),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A rig that will not key stops the transmission before any audio.
+    #[test]
+    #[ignore = "needs VB-Audio cable A"]
+    fn a_rig_that_will_not_key_stops_the_transmission() {
+        let rig = FakeRig::new(decdsss_rig::Model::Ft710).refuse(true);
+        let radio = Radio::with_fake_rig(&rig, 10, 10);
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        transmit(
+            &shared,
+            vec![0.0; 48_000],
+            48_000,
+            Some("CABLE-A Input".into()),
+            Arc::new(AtomicBool::new(false)),
+            Some(radio),
+        );
+        while shared.lock().unwrap().tx.active {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let g = shared.lock().unwrap();
+        assert!(
+            g.tx.error
+                .as_deref()
+                .is_some_and(|e| e.contains("would not key")),
+            "{:?}",
+            g.tx.error
+        );
+        assert_eq!(g.tx.played, 0.0);
+        assert!(!rig.transmitting());
+    }
 }

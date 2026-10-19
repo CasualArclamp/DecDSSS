@@ -5,6 +5,7 @@
 use crate::engine::{Cmd, Engine, TxState};
 use crate::live::{LiveConfig, LiveTxSession, Phase};
 use crate::prefs::Prefs;
+use crate::radio::Radio;
 use crate::voice::{Play, VoicePanel};
 use decdsss_audio::wav;
 use decdsss_codec2::Mode as Codec;
@@ -150,6 +151,8 @@ pub struct TxPanel {
     live_mode: bool,
     /// The live transmission in progress.
     live: Option<LiveTxSession>,
+    /// The radio's keying, shared with the window and the transmit threads.
+    pub radio: Radio,
 }
 
 impl Default for TxPanel {
@@ -184,6 +187,7 @@ impl Default for TxPanel {
             voice_summary: None,
             live_mode: false,
             live: None,
+            radio: Radio::default(),
         }
     }
 }
@@ -246,6 +250,7 @@ impl TxPanel {
                 audio: plan.audio,
                 rate,
                 device,
+                key: true,
             }),
             Err(e) => self.note = e,
         }
@@ -408,6 +413,7 @@ impl TxPanel {
             audio: crate::voice::speech_to_audio(&pcm, rate),
             rate,
             device,
+            key: false,
         });
     }
 
@@ -428,6 +434,7 @@ impl TxPanel {
                     } else {
                         devices_out.get(self.device - 1).map(|d| d.0.clone())
                     },
+                    key: true,
                 });
             }
             Err(e) => self.note = e,
@@ -504,6 +511,7 @@ impl TxPanel {
             out_device,
             out_rate,
             mic_device,
+            radio: self.radio.clone(),
         };
         match LiveTxSession::start(&cfg) {
             Ok(s) => {

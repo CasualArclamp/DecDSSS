@@ -20,6 +20,7 @@ decdsss-chan = { path = "../../crates/decdsss-chan" }
 decdsss-image = { path = "../../crates/decdsss-image" }
 decdsss-link = { path = "../../crates/decdsss-link" }
 decdsss-phy = { path = "../../crates/decdsss-phy" }
+decdsss-rig = { path = "../../crates/decdsss-rig" }
 anyhow.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 
