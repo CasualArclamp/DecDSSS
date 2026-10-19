@@ -2,6 +2,7 @@
 //! The application window.
 
 use crate::engine::{Cmd, Config, Engine, Shared, Source, SpectrumView, Transfer};
+use crate::prefs::Prefs;
 use crate::scope::{self, HeatTexture, col};
 use crate::tx::TxPanel;
 use decdsss_audio::{list_input_devices, list_output_devices};
@@ -35,8 +36,11 @@ pub struct App {
     source: SourceKind,
     wav: Option<PathBuf>,
     devices_in: Vec<String>,
-    devices_out: Vec<String>,
+    /// Output devices with the rate each runs at.
+    devices_out: Vec<(String, u32)>,
     device_in: usize,
+    details: bool,
+    prefs: Prefs,
     profiles: [bool; 3],
     speed: f64,
     out_dir: PathBuf,
@@ -67,22 +71,46 @@ impl App {
         speed: f64,
         out_dir: Option<PathBuf>,
         profiles: Option<[bool; 3]>,
+        initial_device: Option<String>,
     ) -> App {
-        let devices_in = list_input_devices()
+        let devices_in: Vec<String> = list_input_devices()
             .map(|v| v.into_iter().map(|d| d.name).collect())
             .unwrap_or_default();
-        let devices_out = list_output_devices()
-            .map(|v| v.into_iter().map(|d| d.name).collect())
+        let devices_out: Vec<(String, u32)> = list_output_devices()
+            .map(|v| {
+                v.into_iter()
+                    .map(|d| (d.name, d.default_format.map_or(48_000, |f| f.sample_rate)))
+                    .collect()
+            })
             .unwrap_or_default();
+        let prefs = if auto.screenshot.is_some() {
+            // Unattended runs neither take nor overwrite what the user last had.
+            Prefs::default()
+        } else {
+            Prefs::load()
+        };
         let mut tx = TxPanel::default();
         tx.open = auto.open_tx;
+        tx.restore(&prefs);
+        let out_dir = out_dir.or_else(|| prefs.get("out_dir").map(PathBuf::from));
+        let device_in = initial_device
+            .as_deref()
+            .or_else(|| prefs.get("device_in"))
+            .and_then(|n| {
+                devices_in
+                    .iter()
+                    .position(|d| d.to_lowercase().contains(&n.to_lowercase()))
+            })
+            .map_or(0, |i| i + 1);
         App {
             engine: Engine::spawn(),
             source,
             wav,
             devices_in,
             devices_out,
-            device_in: 0,
+            device_in,
+            details: false,
+            prefs,
             profiles: profiles.unwrap_or([true, true, true]),
             speed,
             out_dir: out_dir.unwrap_or_else(default_out_dir),
@@ -121,7 +149,18 @@ impl App {
             profiles,
             out_dir: self.out_dir.clone(),
             speed: self.speed,
+            details: self.details,
         }));
+        // Remember the choices.
+        if self.auto.screenshot.is_none() {
+            self.prefs
+                .set("out_dir", self.out_dir.display().to_string());
+            if let Some(n) = self.devices_in.get(self.device_in.wrapping_sub(1)) {
+                self.prefs.set("device_in", n.clone());
+            }
+            self.tx.remember(&mut self.prefs);
+            self.prefs.save();
+        }
     }
 
     fn top_bar(&mut self, ui: &mut Ui, sh: &Shared) {
@@ -351,8 +390,22 @@ impl App {
         if self.waterfall_version != view.row_version || self.waterfall.is_none() {
             let w = view.psd.len();
             let h = view.rows.len();
+            // From just under the noise floor to 26 dB over it, or to the recent
+            // peaks where those are higher (a clean cable has no noise to speak of).
+            let mut recent: Vec<f32> = view
+                .rows
+                .iter()
+                .rev()
+                .take(40)
+                .flat_map(|r| r.iter().copied())
+                .collect();
+            recent.sort_by(f32::total_cmp);
+            let p99 = recent
+                .get(recent.len() * 995 / 1000)
+                .copied()
+                .unwrap_or(0.0);
             let lo = view.floor_db - 3.0;
-            let hi = view.floor_db + 26.0;
+            let hi = (view.floor_db + 26.0).max(p99 + 3.0);
             let mut pixels = Vec::with_capacity(w * h);
             for row in view.rows.iter().rev() {
                 for &d in row.iter().take(w) {
@@ -481,6 +534,10 @@ impl App {
                 });
             }
         }
+        ui.checkbox(
+            &mut self.details,
+            "Show the search in the log (applies at the next Start)",
+        );
         egui::CollapsingHeader::new("Log")
             .default_open(self.log_open)
             .show(ui, |ui| {

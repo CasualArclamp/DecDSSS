@@ -3,6 +3,7 @@
 //! DecDSSS never keys a transmitter; it plays audio and you do the rest.
 
 use crate::engine::{Cmd, Engine, TxState};
+use crate::prefs::Prefs;
 use decdsss_audio::wav;
 use decdsss_core::{Mode, Profile};
 use decdsss_link::{SendSpec, container, segments};
@@ -54,7 +55,42 @@ struct Plan {
 }
 
 impl TxPanel {
-    fn build(&self) -> Result<Plan, String> {
+    pub fn restore(&mut self, p: &Prefs) {
+        if let Some(c) = p.get("call") {
+            self.call = c.to_string();
+        }
+        if let Some(p) = p.get("tx_profile").and_then(Profile::from_name) {
+            self.profile = p;
+        }
+        if let Some(m) = p.get("tx_mode")
+            && Mode::from_name(m).is_some()
+        {
+            self.mode = m.to_string();
+        }
+        if let Some(d) = p.get("tx_depth").and_then(|d| d.parse().ok())
+            && DEPTHS.contains(&d)
+        {
+            self.depth = d;
+        }
+    }
+
+    pub fn remember(&self, p: &mut Prefs) {
+        p.set("call", self.call.clone());
+        p.set("tx_profile", self.profile.name());
+        p.set("tx_mode", self.mode.clone());
+        p.set("tx_depth", self.depth.to_string());
+    }
+
+    /// The rate the selected output device runs at.
+    fn device_rate(&self, devices_out: &[(String, u32)]) -> u32 {
+        if self.device == 0 {
+            self.rate
+        } else {
+            devices_out.get(self.device - 1).map_or(self.rate, |d| d.1)
+        }
+    }
+
+    fn build(&self, rate: u32) -> Result<Plan, String> {
         let path = self.file.as_ref().ok_or("choose a file")?;
         let call = normalise_call(&self.call)
             .ok_or("enter your callsign (letters, digits and /, up to 9)")?;
@@ -82,18 +118,11 @@ impl TxPanel {
                 chips.extend(segment_chips(s).ok_or("cannot build the header")?);
             }
         }
-        let audio = chips_to_audio(
-            &chips,
-            self.profile,
-            f64::from(self.rate),
-            self.level,
-            1.0,
-            1.0,
-        );
+        let audio = chips_to_audio(&chips, self.profile, f64::from(rate), self.level, 1.0, 1.0);
         Ok(Plan {
             frames: segs.iter().map(|s| s.frames.len()).sum(),
             segments: segs.len(),
-            seconds: audio.len() as f64 / f64::from(self.rate),
+            seconds: audio.len() as f64 / f64::from(rate),
             audio,
         })
     }
@@ -103,7 +132,7 @@ impl TxPanel {
         ctx: &Context,
         engine: &Engine,
         state: &TxState,
-        devices_out: &[String],
+        devices_out: &[(String, u32)],
         _out_dir: &Path,
     ) {
         let mut open = self.open;
@@ -179,12 +208,15 @@ impl TxPanel {
                         .selected_text(if self.device == 0 {
                             "System default".to_string()
                         } else {
-                            devices_out.get(self.device - 1).cloned().unwrap_or_default()
+                            devices_out
+                                .get(self.device - 1)
+                                .map(|d| d.0.clone())
+                                .unwrap_or_default()
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.device, 0, "System default");
                             for (i, d) in devices_out.iter().enumerate() {
-                                ui.selectable_value(&mut self.device, i + 1, d);
+                                ui.selectable_value(&mut self.device, i + 1, format!("{} ({} Hz)", d.0, d.1));
                             }
                         });
                     ui.end_row();
@@ -204,7 +236,8 @@ impl TxPanel {
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!state.active, |ui| {
                         if ui.button("▶ Play to the sound card").clicked() {
-                            match self.build() {
+                            let rate = self.device_rate(devices_out);
+                            match self.build(rate) {
                                 Ok(plan) => {
                                     self.note = format!(
                                         "{} frames in {} segment(s), {:.0} s of audio",
@@ -212,11 +245,11 @@ impl TxPanel {
                                     );
                                     engine.send(Cmd::Transmit {
                                         audio: plan.audio,
-                                        rate: self.rate,
+                                        rate,
                                         device: if self.device == 0 {
                                             None
                                         } else {
-                                            devices_out.get(self.device - 1).cloned()
+                                            devices_out.get(self.device - 1).map(|d| d.0.clone())
                                         },
                                     });
                                 }
@@ -224,7 +257,7 @@ impl TxPanel {
                             }
                         }
                         if ui.button("Save WAV…").clicked() {
-                            match self.build() {
+                            match self.build(self.rate) {
                                 Ok(plan) => {
                                     if let Some(p) = rfd::FileDialog::new()
                                         .add_filter("WAV audio", &["wav"])

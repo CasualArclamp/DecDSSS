@@ -4,6 +4,7 @@
 mod app;
 mod demo;
 mod engine;
+mod prefs;
 mod scope;
 mod spectrum;
 mod tx;
@@ -13,7 +14,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: decdsss-gui [--demo | --wav FILE] [--speed X] [--profile 500,2k4,3k] \
-[--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx]";
+[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx]";
 
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
@@ -22,6 +23,7 @@ fn main() -> eframe::Result {
     let mut speed = 1.0;
     let mut out_dir = None;
     let mut profiles = None;
+    let mut device: Option<String> = None;
     let mut auto = Automation::default();
     let mut size = [1500.0, 900.0];
     while let Some(a) = args.next() {
@@ -37,6 +39,10 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             "--demo" => source = SourceKind::Demo,
+            "--device" => {
+                source = SourceKind::Device;
+                device = Some(value("--device"));
+            }
             "--wav" => {
                 source = SourceKind::Wav;
                 wav = Some(PathBuf::from(value("--wav")));
@@ -83,7 +89,7 @@ fn main() -> eframe::Result {
     if auto.screenshot.is_some() && auto.after.is_none() {
         auto.after = Some(20.0);
     }
-    let autostart = matches!(source, SourceKind::Demo | SourceKind::Wav);
+    let autostart = matches!(source, SourceKind::Demo | SourceKind::Wav) || device.is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(size)
@@ -103,7 +109,7 @@ fn main() -> eframe::Result {
                 f.push("Hack".into());
             }
             cc.egui_ctx.set_fonts(fonts);
-            let mut app = App::new(auto, source, wav, speed, out_dir, profiles);
+            let mut app = App::new(auto, source, wav, speed, out_dir, profiles, device);
             if autostart {
                 app.start();
             }

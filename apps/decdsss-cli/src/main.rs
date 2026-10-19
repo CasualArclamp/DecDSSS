@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use decdsss_audio::wav;
+use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_chan::{Channel, Watterson};
 use decdsss_core::{Mode, Profile};
 use decdsss_link::{Assembler, SendSpec, container, segments};
@@ -32,6 +32,8 @@ enum Command {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// List the sound cards (inputs and outputs) with their rates.
+    Devices,
     /// Turn a file into a transmission (a WAV of audio to feed a radio).
     Tx {
         /// The file to send.
@@ -71,11 +73,23 @@ enum Command {
         tail: f64,
         /// The WAV to write.
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        /// Play the audio on this output device (a name or part of one; "default"
+        /// for the system default). You key the radio.
+        #[arg(long)]
+        play: Option<String>,
     },
     /// Receive: decode a WAV recording and save the files in it.
     Rx {
-        input: PathBuf,
+        /// The recording to decode (omit with --device).
+        input: Option<PathBuf>,
+        /// Listen on this input device instead of a file ("default" for the
+        /// system default).
+        #[arg(long)]
+        device: Option<String>,
+        /// With --device, stop after this many seconds (default: until Ctrl-C).
+        #[arg(long)]
+        duration: Option<f64>,
         /// Profiles to listen on: all, or a comma-separated list of 500, 2k4, 3k.
         #[arg(long, default_value = "all")]
         profile: String,
@@ -147,6 +161,7 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Modes { profile } => modes(profile.as_deref()),
+        Command::Devices => devices(),
         Command::Tx {
             file,
             call,
@@ -161,16 +176,38 @@ fn main() -> Result<()> {
             lead,
             tail,
             output,
+            play,
         } => tx(
-            &file, &call, &profile, &mode, depth, resync, repeat, session, rate, level, lead, tail,
-            &output,
+            &file,
+            &call,
+            &profile,
+            &mode,
+            depth,
+            resync,
+            repeat,
+            session,
+            rate,
+            level,
+            lead,
+            tail,
+            output.as_deref(),
+            play.as_deref(),
         ),
         Command::Rx {
             input,
+            device,
+            duration,
             profile,
             out_dir,
             verbose,
-        } => rx(&input, &profile, &out_dir, verbose),
+        } => rx(
+            input.as_deref(),
+            device.as_deref(),
+            duration,
+            &profile,
+            &out_dir,
+            verbose,
+        ),
         Command::Sweep {
             profile,
             mode,
@@ -276,8 +313,12 @@ fn tx(
     level: f32,
     lead: f64,
     tail: f64,
-    output: &Path,
+    output: Option<&Path>,
+    play: Option<&str>,
 ) -> Result<()> {
+    if output.is_none() && play.is_none() {
+        bail!("give -o FILE.wav to write the audio and/or --play DEVICE to play it");
+    }
     let profile = parse_profile(profile)?;
     let mode = Mode::from_name(mode).with_context(|| format!("unknown mode {mode:?}"))?;
     let call = normalise_call(call).with_context(|| {
@@ -317,7 +358,6 @@ fn tx(
         }
     }
     let audio = chips_to_audio(&chips, profile, f64::from(rate), level, lead, tail);
-    let peak = wav::write(output, &audio, rate)?;
     println!(
         "{}: {} bytes → {} frames of {} bytes in {} segment(s), {} {} depth {depth}",
         name,
@@ -328,13 +368,18 @@ fn tx(
         profile.label(),
         mode,
     );
-    println!(
-        "{:.1} s of audio at {rate} Hz → {} (peak {:.2}, own code {})",
-        audio.len() as f64 / f64::from(rate),
-        output.display(),
-        peak,
-        own_code(&call).unwrap_or(0),
-    );
+    let secs = audio.len() as f64 / f64::from(rate);
+    if let Some(output) = output {
+        let peak = wav::write(output, &audio, rate)?;
+        println!(
+            "{secs:.1} s of audio at {rate} Hz → {} (peak {peak:.2}, own code {})",
+            output.display(),
+            own_code(&call).unwrap_or(0),
+        );
+    }
+    if let Some(dev) = play {
+        play_audio(&audio, rate, dev)?;
+    }
     Ok(())
 }
 
@@ -375,34 +420,46 @@ fn unique(dir: &Path, name: &str) -> PathBuf {
         .unwrap()
 }
 
-fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> {
-    let profiles: Vec<Profile> = if profile == "all" {
-        Profile::ALL.to_vec()
-    } else {
-        profile
-            .split(',')
-            .map(parse_profile)
-            .collect::<Result<_>>()?
-    };
-    std::fs::create_dir_all(out_dir)?;
-    let rate = f64::from(wav::sample_rate(input)?);
-    let mut mr = MultiReceiver::new(&profiles, rate);
-    let mut asm = Assembler::new();
-    let mut seen = 0u64;
-    let mut files = 0;
-    let mut headers = 0;
-    let mut frames_ok = 0usize;
-    let mut frames_bad = 0usize;
-    let mut open: std::collections::BTreeMap<(String, u8), ()> = Default::default();
-    wav::stream(input, 8192, |chunk| {
-        let r = &mut mr;
-        seen += chunk.len() as u64;
-        let t = seen as f64 / rate;
-        for tagged in r.push(chunk) {
+/// Everything `rx` keeps while it listens, whatever the audio comes from.
+struct RxRun {
+    mr: MultiReceiver,
+    rate: f64,
+    seen: u64,
+    asm: Assembler,
+    out_dir: PathBuf,
+    verbose: bool,
+    files: usize,
+    headers: usize,
+    frames_ok: usize,
+    frames_bad: usize,
+    open: std::collections::BTreeSet<(String, u8)>,
+}
+
+impl RxRun {
+    fn new(profiles: &[Profile], rate: f64, out_dir: &Path, verbose: bool) -> RxRun {
+        RxRun {
+            mr: MultiReceiver::new(profiles, rate),
+            rate,
+            seen: 0,
+            asm: Assembler::new(),
+            out_dir: out_dir.to_path_buf(),
+            verbose,
+            files: 0,
+            headers: 0,
+            frames_ok: 0,
+            frames_bad: 0,
+            open: Default::default(),
+        }
+    }
+
+    fn push(&mut self, chunk: &[f32]) {
+        self.seen += chunk.len() as u64;
+        let t = self.seen as f64 / self.rate;
+        for tagged in self.mr.push(chunk) {
             let p = tagged.profile.label();
             match tagged.event {
                 Event::Acquired(d) => {
-                    if verbose {
+                    if self.verbose {
                         println!(
                             "[{t:7.1}s] {p}: preamble found ({:+.1} Hz, {:.0} dB over threshold)",
                             d.freq_hz, d.margin_db
@@ -410,7 +467,7 @@ fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> 
                     }
                 }
                 Event::PreambleLocked(l) => {
-                    if verbose {
+                    if self.verbose {
                         println!(
                             "[{t:7.1}s] {p}: preamble locked (carrier {:+.2} Hz, clock {:+.0} ppm)",
                             l.freq_hz,
@@ -419,13 +476,13 @@ fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> 
                     }
                 }
                 Event::Lost(why) => {
-                    if verbose {
+                    if self.verbose {
                         println!("[{t:7.1}s] {p}: lost it: {why}");
                     }
                 }
                 Event::Header { header, snr_db, .. } => {
-                    headers += 1;
-                    open.insert((header.call.clone(), header.session), ());
+                    self.headers += 1;
+                    self.open.insert((header.call.clone(), header.session));
                     println!(
                         "[{t:7.1}s] {p}: {} sending {} depth {}, session {}, frames {}.. of {} ({} blocks), symbol SNR {:.0} dB",
                         header.call,
@@ -440,9 +497,9 @@ fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> 
                 }
                 Event::Block { header, result, .. } => {
                     let ok = result.frames.iter().filter(|f| f.is_some()).count();
-                    frames_ok += ok;
-                    frames_bad += result.frames.len() - ok;
-                    if verbose || ok < result.frames.len() {
+                    self.frames_ok += ok;
+                    self.frames_bad += result.frames.len() - ok;
+                    if self.verbose || ok < result.frames.len() {
                         println!(
                             "[{t:7.1}s] {p}: {} block {}: {ok}/{} frames, SNR {:.0} dB, carrier {:+.2} Hz",
                             header.call,
@@ -452,11 +509,11 @@ fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> 
                             result.freq_hz
                         );
                     }
-                    if let Some(f) = asm.push(&header, &result) {
-                        let path = unique(out_dir, &sanitize(&f.name));
+                    if let Some(f) = self.asm.push(&header, &result) {
+                        let path = unique(&self.out_dir, &sanitize(&f.name));
                         match std::fs::write(&path, &f.data) {
                             Ok(()) => {
-                                files += 1;
+                                self.files += 1;
                                 println!(
                                     "[{t:7.1}s] FILE {} ({} bytes) from {} → {}",
                                     f.name,
@@ -472,22 +529,143 @@ fn rx(input: &Path, profile: &str, out_dir: &Path, verbose: bool) -> Result<()> 
                 Event::SegmentEnd { .. } => {}
             }
         }
-    })?;
-    println!(
-        "{} header(s), {frames_ok} frames decoded, {frames_bad} lost, {files} file(s) complete",
-        headers
-    );
-    for (call, session) in open.keys() {
-        if let Some(p) = asm.progress(call, *session)
-            && p.total > 0
-            && p.have < p.total
-        {
+    }
+
+    fn summary(&self) {
+        println!(
+            "{} header(s), {} frames decoded, {} lost, {} file(s) complete",
+            self.headers, self.frames_ok, self.frames_bad, self.files
+        );
+        for (call, session) in &self.open {
+            if let Some(p) = self.asm.progress(call, *session)
+                && p.total > 0
+                && p.have < p.total
+            {
+                println!(
+                    "{call} session {session}: {}/{} frames, not complete",
+                    p.have, p.total
+                );
+            }
+        }
+    }
+}
+
+fn rx(
+    input: Option<&Path>,
+    device: Option<&str>,
+    duration: Option<f64>,
+    profile: &str,
+    out_dir: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let profiles: Vec<Profile> = if profile == "all" {
+        Profile::ALL.to_vec()
+    } else {
+        profile
+            .split(',')
+            .map(parse_profile)
+            .collect::<Result<_>>()?
+    };
+    std::fs::create_dir_all(out_dir)?;
+    match (input, device) {
+        (Some(path), None) => {
+            let rate = f64::from(wav::sample_rate(path)?);
+            let mut run = RxRun::new(&profiles, rate, out_dir, verbose);
+            wav::stream(path, 8192, |chunk| run.push(chunk))?;
+            run.summary();
+            Ok(())
+        }
+        (None, Some(dev)) => {
+            let mut stream = InputStream::open(&InputOptions {
+                device: device_name(dev),
+                channels: Some(1),
+                ..InputOptions::default()
+            })?;
+            let fmt = stream.format();
             println!(
-                "{call} session {session}: {}/{} frames, not complete",
-                p.have, p.total
+                "listening on {} ({fmt}){}",
+                stream.device_name(),
+                duration.map_or(", Ctrl-C to stop".to_string(), |d| format!(" for {d:.0} s"))
+            );
+            let mut run = RxRun::new(&profiles, f64::from(fmt.sample_rate), out_dir, verbose);
+            let started = std::time::Instant::now();
+            while duration.is_none_or(|d| started.elapsed().as_secs_f64() < d) {
+                if stream.is_dead() {
+                    bail!("the input device stopped");
+                }
+                let frames = stream.available_frames().min(8192);
+                if frames == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                let mono =
+                    decdsss_audio::channels::downmix_to_mono(&stream.read(frames), fmt.channels);
+                run.push(&mono);
+            }
+            run.summary();
+            Ok(())
+        }
+        _ => bail!("give either a WAV file or --device NAME"),
+    }
+}
+
+/// "default" (or empty) means the system default device.
+fn device_name(dev: &str) -> Option<String> {
+    let d = dev.trim();
+    (!d.is_empty() && !d.eq_ignore_ascii_case("default")).then(|| d.to_string())
+}
+
+fn devices() -> Result<()> {
+    for (label, list) in [
+        ("Inputs", decdsss_audio::list_input_devices()?),
+        ("Outputs", decdsss_audio::list_output_devices()?),
+    ] {
+        println!("{label}:");
+        if list.is_empty() {
+            println!("  (none)");
+        }
+        for d in list {
+            let fmt = d
+                .default_format
+                .map_or(String::new(), |f| format!("  [{f}]"));
+            println!(
+                "  {}{}{fmt}",
+                if d.is_default { "* " } else { "  " },
+                d.name
             );
         }
     }
+    Ok(())
+}
+
+/// Plays mono audio on an output device, blocking until it has played.
+fn play_audio(audio: &[f32], rate: u32, dev: &str) -> Result<()> {
+    let mut out = OutputStream::open(&OutputOptions {
+        device: device_name(dev),
+        sample_rate: Some(rate),
+        channels: Some(1),
+        ..OutputOptions::default()
+    })?;
+    let fmt = out.format();
+    if fmt.sample_rate != rate {
+        bail!(
+            "{} runs at {} Hz but the audio was made for {rate} Hz: pass --rate {}",
+            out.device_name(),
+            fmt.sample_rate,
+            fmt.sample_rate
+        );
+    }
+    println!("playing on {} ({fmt})", out.device_name());
+    let ch = fmt.channels.max(1);
+    for block in audio.chunks(rate as usize / 10) {
+        let mut frames = Vec::with_capacity(block.len() * ch);
+        for &v in block {
+            frames.extend(std::iter::repeat_n(v, ch));
+        }
+        out.write_blocking(&frames, std::time::Duration::from_secs(5))?;
+    }
+    out.drain(std::time::Duration::from_secs(10));
+    println!("done");
     Ok(())
 }
 

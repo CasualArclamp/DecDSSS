@@ -258,23 +258,34 @@ CRC-16 (headers) and CRC-32 (payload frames).
 
 ## Receiver panels (GUI)
 
-DecSAT's instrument-panel look: dark faces, hairline frames, one muted hue per
-quantity.
+Built (egui, glow renderer), in DecSAT's instrument-panel look: dark faces,
+hairline frames, one muted hue per quantity.
 
-- **Band view** — waterfall and spectrum of the audio passband with the three
-  profiles marked; PSD against the estimated noise floor, so you can see the
-  spread signal sitting under the noise beside its despread SNR.
-- **Per station** (one card per decoding channel):
-  - acquisition heatmap (code phase × frequency, peak marked)
-  - chip-phase correlation profile around the prompt
-  - rake / multipath profile (path delays and strengths in chips, fingers marked)
-  - E/P/L code tracking
-  - despread constellation, and the symbol × previous symbol constellation
-  - chip scope (raw chips against the local replica, chip eye)
-  - despread SNR and frequency strips
-  - soft bits, frame sync, and LDPC iterations / FER
-- **Payload views** — picture as it arrives, file list, voice level.
-- **Transmit** — profile, mode, payload, callsign, PTT (VOX/manual/CAT).
+- **Band view** — the audio spectrum 0–4 kHz with the three profile bands
+  shaded, the noise floor (15th percentile of 300–3300 Hz), and a label at each
+  locked carrier; a waterfall below it (levels from the floor to the strongest
+  recent signal).
+- **Per profile** — the acquisition search surface as a heatmap (frequency ×
+  code phase, scaled to the noise, the peak ringed) and one row per candidate
+  preamble with its A/B period bars.
+- **Per station** (one card per decoding channel; dimmed between segments):
+  - DS-PSK: despread constellation (Es/N0 from the error), symbol × previous
+    symbol, early/prompt/late timing; CSK: the Walsh correlator bank (a waterfall
+    of the correlators whose bright trace is the decided codes), the last symbol's
+    bars, timing
+  - the delay profile with the rake fingers marked (multipath, in chips)
+  - the chip scope (the last symbol's chips as received, and despread)
+  - symbol SNR and carrier strips
+  - the last codeword's soft bits, and a frame map of the transmission
+- **Files** — the received list (click to open), progress bars, the log.
+- **Transmit** — file, callsign, profile, mode (with its rate and the SNR it
+  needs), depth, preamble interval, repeat, level, output device; play to the
+  sound card (at that device's own rate) or save a WAV.
+
+Sources: a sound card or virtual cable (stereo is mixed to mono), a WAV file at
+any speed, or the built-in demo (two stations, one DS8 and one CSK64, on one
+2.4 kHz channel through moderate fading). `--screenshot OUT.png --after SECS`
+takes the picture from inside the window, for unattended checks.
 
 ## Radio I/O
 
@@ -288,15 +299,15 @@ silent.
 | Crate | Role |
 |---|---|
 | `decdsss-core` | Profiles, modes, rates — the fixed numbers. |
-| `decdsss-dsp` | NCO, RRC, resamplers, FFT correlation, AGC (M1). |
-| `decdsss-fec` | QC-LDPC, interleaver, CRC, erasure code (M1–M2). |
-| `decdsss-phy` | Codes, TX modulator, acquisition, tracking, rake, demod, over framing (M1). |
-| `decdsss-chan` | Channel simulator: AWGN, frequency offset and drift, Watterson HF fading (ITU-R F.1487 good/moderate/poor) (M1). |
-| `decdsss-audio` | Sound card and WAV/IQ file I/O (M2). |
-| `decdsss-link` | Files, pictures, voice, ARQ (M2–M5). |
+| `decdsss-dsp` | RRC, pulse shaper, resampler, matched filter, interpolation, Hilbert, a seeded RNG. |
+| `decdsss-fec` | QC-LDPC (design, encoder, layered min-sum), the interleaver, CRCs. |
+| `decdsss-phy` | Codes, framing, the transmitter, the receiver (search, preamble, header, payload, refinement), the end-to-end simulator. |
+| `decdsss-chan` | Channel simulator: AWGN, carrier offset and drift, clock error, Watterson fading with the CCIR presets. |
+| `decdsss-link` | File container, sender planning (segments, repeat), receive-side assembly. |
+| `decdsss-audio` | Sound-card capture and playback (cpal) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
 | `decdsss-rig` | CAT keying (M4). |
-| `apps/decdsss-cli` | `decdsss` CLI: modes, tx/rx to WAV, simulate, measure. |
-| `apps/decdsss-gui` | egui GUI (M2). |
+| `apps/decdsss-cli` | `decdsss`: modes, devices, tx, rx, channel, sweep. |
+| `apps/decdsss-gui` | `decdsss-gui`: the window above. |
 
 ## Milestones
 
@@ -306,9 +317,10 @@ silent.
   through WAV; thresholds measured on AWGN and Watterson channels. *Done* (see
   Verification).
 - **M2** — GUI with every receiver panel, live sound card RX/TX, one-way files.
-  Checked through VB-Audio cable A. *Next:* the demodulator is already
-  incremental and publishes the data behind the scopes (`rx::payload::Live`,
-  `Receiver::snapshot`).
+  Checked through VB-Audio cable A (a file sent by the CLI into CABLE-A Input
+  and received in the GUI and the CLI from CABLE-A Output, byte-identical).
+  *Done.* Left for later: erasure-coded extra frames (the picture and file
+  modes will want them), a CI smoke test of the window.
 - **M3** — pictures.
 - **M4** — voice, VOX/manual PTT, CAT keying.
 - **M5** — ARQ connected mode.

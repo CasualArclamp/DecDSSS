@@ -36,6 +36,8 @@ pub struct Config {
     pub out_dir: PathBuf,
     /// Faster than real time for files and the demo.
     pub speed: f64,
+    /// Log the search too: preambles found, locked or lost.
+    pub details: bool,
 }
 
 pub enum Cmd {
@@ -160,6 +162,7 @@ struct Run {
     spectrum: Spectrum,
     asm: Assembler,
     out_dir: PathBuf,
+    details: bool,
     samples: u64,
     last_publish: Instant,
     row_version: u64,
@@ -298,6 +301,7 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
         spectrum: Spectrum::new(rate),
         asm: Assembler::new(),
         out_dir: cfg.out_dir.clone(),
+        details: cfg.details,
         samples: 0,
         last_publish: Instant::now(),
         row_version: 0,
@@ -319,7 +323,9 @@ fn step(shared: &Arc<Mutex<Shared>>, r: &mut Run) -> bool {
                 std::thread::sleep(Duration::from_millis(5));
                 Vec::new()
             } else {
-                input.read(frames)
+                // A device may deliver stereo whatever we asked for.
+                let ch = input.format().channels;
+                decdsss_audio::channels::downmix_to_mono(&input.read(frames), ch)
             }
         }
         Reader::Memory {
@@ -364,14 +370,14 @@ fn step(shared: &Arc<Mutex<Shared>>, r: &mut Run) -> bool {
 fn handle_event(shared: &Arc<Mutex<Shared>>, r: &mut Run, t: f64, profile: Profile, event: Event) {
     let p = profile.label();
     match event {
-        Event::Acquired(d) => log(
+        Event::Acquired(d) if r.details => log(
             shared,
             format!(
                 "[{t:6.1}s] {p}: preamble found ({:+.1} Hz, {:.0} dB over threshold)",
                 d.freq_hz, d.margin_db
             ),
         ),
-        Event::PreambleLocked(l) => log(
+        Event::PreambleLocked(l) if r.details => log(
             shared,
             format!(
                 "[{t:6.1}s] {p}: preamble locked, carrier {:+.2} Hz, clock {:+.0} ppm",
@@ -379,7 +385,8 @@ fn handle_event(shared: &Arc<Mutex<Shared>>, r: &mut Run, t: f64, profile: Profi
                 (4.0 / l.step - 1.0) * 1e6
             ),
         ),
-        Event::Lost(why) => log(shared, format!("[{t:6.1}s] {p}: lost it: {why}")),
+        Event::Lost(why) if r.details => log(shared, format!("[{t:6.1}s] {p}: lost it: {why}")),
+        Event::Acquired(_) | Event::PreambleLocked(_) | Event::Lost(_) => {}
         Event::Header { header, snr_db, .. } => {
             log(
                 shared,
