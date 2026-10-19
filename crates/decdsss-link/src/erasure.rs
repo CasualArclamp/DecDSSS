@@ -221,6 +221,19 @@ impl Decoder {
             .collect()
     }
 
+    /// The data blocks held from the first one without a gap, one after the
+    /// other (a stream whose front is readable before the rest is in).
+    pub fn prefix(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 0..self.count as u16 {
+            match self.blocks.get(&i) {
+                Some(b) => out.extend_from_slice(b),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// The data (`count` blocks one after the other) if enough blocks are in.
     pub fn solve(&self) -> Option<Vec<u8>> {
         if self.blocks.len() < self.count {

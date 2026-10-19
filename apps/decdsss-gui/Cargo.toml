@@ -16,6 +16,7 @@ path = "src/main.rs"
 decdsss-audio = { path = "../../crates/decdsss-audio" }
 decdsss-chan = { path = "../../crates/decdsss-chan" }
 decdsss-core = { path = "../../crates/decdsss-core" }
+decdsss-image = { path = "../../crates/decdsss-image" }
 decdsss-link = { path = "../../crates/decdsss-link" }
 decdsss-phy = { path = "../../crates/decdsss-phy" }
 anyhow.workspace = true

@@ -11,5 +11,5 @@ pub mod container;
 pub mod erasure;
 pub mod send;
 
-pub use assemble::{Assembler, Progress, ReceivedFile};
-pub use send::{Plan, SendSpec, plan, segments};
+pub use assemble::{Assembler, Front, Progress, ReceivedFile};
+pub use send::{Plan, SendSpec, air_seconds, max_stream_bytes, plan, segments};

@@ -6,12 +6,84 @@ use crate::engine::{Cmd, Engine, TxState};
 use crate::prefs::Prefs;
 use decdsss_audio::wav;
 use decdsss_core::{Mode, Profile};
-use decdsss_link::{SendSpec, container, segments};
+use decdsss_image::Source;
+use decdsss_link::{SendSpec, air_seconds, container, max_stream_bytes, segments};
 use decdsss_phy::codes::normalise_call;
 use decdsss_phy::framing::{DEPTHS, Layout, PayloadType};
 use decdsss_phy::tx::{chips_to_audio, segment_chips};
-use eframe::egui::{self, Context, RichText};
+use eframe::egui::{self, ColorImage, Context, RichText, TextureHandle, TextureOptions};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+
+/// File extensions the picture mode is switched on for.
+const PICTURE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
+
+/// What a prepared picture depends on.
+#[derive(Clone, PartialEq)]
+struct PicKey {
+    path: PathBuf,
+    /// Bytes the picture may take (what the air time carries).
+    budget: usize,
+    min_quality: u8,
+}
+
+/// A picture scaled and compressed for sending.
+struct Prepared {
+    name: String,
+    jpeg: Vec<u8>,
+    width: u32,
+    height: u32,
+    quality: u8,
+    /// Size of the picture it came from.
+    source: (u32, u32),
+    /// The JPEG decoded, RGBA, as the receiver will show it.
+    preview: Vec<u8>,
+}
+
+type PicResult = Result<Prepared, String>;
+
+/// Compressing a picture takes a moment, so it runs off the UI thread.
+struct PicJob {
+    key: PicKey,
+    rx: mpsc::Receiver<(Option<Arc<Source>>, PicResult)>,
+}
+
+fn is_picture(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| PICTURE_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
+fn picture_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map_or_else(|| "picture".into(), |s| s.to_string_lossy().into_owned());
+    format!("{stem}.jpg")
+}
+
+fn prepare(key: &PicKey, cached: Option<Arc<Source>>) -> (Option<Arc<Source>>, PicResult) {
+    let src = match cached {
+        Some(s) => s,
+        None => match Source::open(&key.path) {
+            Ok(s) => Arc::new(s),
+            Err(e) => return (None, Err(e)),
+        },
+    };
+    let result = decdsss_image::encode_auto(&src.image, key.budget, 1 << 20, key.min_quality)
+        .and_then(|enc| {
+            let preview = decdsss_image::decode(&enc.bytes).ok_or("the JPEG does not decode")?;
+            Ok(Prepared {
+                name: picture_name(&key.path),
+                width: enc.width,
+                height: enc.height,
+                quality: enc.quality,
+                source: src.image.dimensions(),
+                preview: preview.into_raw(),
+                jpeg: enc.bytes,
+            })
+        });
+    (Some(src), result)
+}
 
 pub struct TxPanel {
     pub open: bool,
@@ -27,6 +99,15 @@ pub struct TxPanel {
     rate: u32,
     device: usize,
     note: String,
+    /// Send the file as a picture: scaled and compressed to the air time.
+    picture: bool,
+    /// Seconds of signal one pass of a picture may take.
+    air: f64,
+    min_quality: u8,
+    pic_source: Option<(PathBuf, Arc<Source>)>,
+    pic_job: Option<PicJob>,
+    pic_result: Option<(PicKey, PicResult)>,
+    pic_tex: Option<(PicKey, TextureHandle)>,
 }
 
 impl Default for TxPanel {
@@ -45,6 +126,13 @@ impl Default for TxPanel {
             rate: 48_000,
             device: 0,
             note: String::new(),
+            picture: false,
+            air: 120.0,
+            min_quality: 30,
+            pic_source: None,
+            pic_job: None,
+            pic_result: None,
+            pic_tex: None,
         }
     }
 }
@@ -74,6 +162,16 @@ impl TxPanel {
         {
             self.depth = d;
         }
+        if let Some(a) = p.get("tx_air").and_then(|a| a.parse::<f64>().ok()) {
+            self.air = a.clamp(20.0, 900.0);
+        }
+    }
+
+    /// Opens the window with a file chosen, as if from the dialog.
+    pub fn preload(&mut self, path: PathBuf) {
+        self.picture = is_picture(&path);
+        self.file = Some(path);
+        self.open = true;
     }
 
     pub fn remember(&self, p: &mut Prefs) {
@@ -81,6 +179,142 @@ impl TxPanel {
         p.set("tx_profile", self.profile.name());
         p.set("tx_mode", self.mode.clone());
         p.set("tx_depth", self.depth.to_string());
+        p.set("tx_air", format!("{:.0}", self.air));
+    }
+
+    /// The transmission as the picture will be sent, `passes` of it.
+    fn picture_spec(&self, passes: usize) -> Option<SendSpec> {
+        Some(SendSpec {
+            profile: self.profile,
+            mode: Mode::from_name(&self.mode)?,
+            depth: self.depth,
+            call: "AA0AA".into(),
+            session: 0,
+            ptype: PayloadType::Picture,
+            resync_s: self.resync,
+            parity: self.parity / 100.0,
+            passes,
+        })
+    }
+
+    /// What the picture should be prepared for now, if it is to be sent.
+    fn wanted_key(&self) -> Option<PicKey> {
+        if !self.picture {
+            return None;
+        }
+        let path = self.file.clone()?;
+        let spec = self.picture_spec(1)?;
+        let overhead = container::pack(&picture_name(&path), &[]).len();
+        Some(PicKey {
+            budget: max_stream_bytes(&spec, self.air).saturating_sub(overhead),
+            min_quality: self.min_quality,
+            path,
+        })
+    }
+
+    /// Collects a finished picture job and starts the next if what is wanted
+    /// has changed.
+    fn drive_picture(&mut self, ctx: &Context) {
+        if let Some(job) = self.pic_job.take() {
+            match job.rx.try_recv() {
+                Ok((src, res)) => {
+                    if let Some(s) = src {
+                        self.pic_source = Some((job.key.path.clone(), s));
+                    }
+                    self.pic_result = Some((job.key, res));
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.pic_job = Some(job);
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pic_result = Some((job.key, Err("the picture worker stopped".into())));
+                }
+            }
+        }
+        if self.pic_job.is_some() {
+            return;
+        }
+        let Some(key) = self.wanted_key() else { return };
+        if self.pic_result.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        if key.budget < 200 {
+            let e = format!(
+                "{:.0} s of {} {} carries only {} bytes: raise the air time or choose a faster mode",
+                self.air, self.profile, self.mode, key.budget
+            );
+            self.pic_result = Some((key, Err(e)));
+            return;
+        }
+        let cached = self
+            .pic_source
+            .as_ref()
+            .filter(|(p, _)| *p == key.path)
+            .map(|(_, s)| s.clone());
+        let (tx, rx) = mpsc::channel();
+        let job_key = key.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(prepare(&job_key, cached));
+        });
+        self.pic_job = Some(PicJob { key, rx });
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    /// The prepared picture and what sending it costs.
+    fn picture_status(&mut self, ui: &mut egui::Ui) {
+        if self.pic_job.is_some() {
+            ui.label(RichText::new("preparing the picture…").weak());
+        }
+        let passes = self.repeat.max(1);
+        let spec = self.picture_spec(passes);
+        let Some((key, res)) = &self.pic_result else {
+            return;
+        };
+        match res {
+            Err(e) => {
+                ui.colored_label(crate::scope::col::BAD, e);
+            }
+            Ok(p) => {
+                let tex = match &self.pic_tex {
+                    Some((k, t)) if k == key => t.clone(),
+                    _ => {
+                        let img = ColorImage::from_rgba_unmultiplied(
+                            [p.width as usize, p.height as usize],
+                            &p.preview,
+                        );
+                        let t = ui
+                            .ctx()
+                            .load_texture("tx-picture", img, TextureOptions::LINEAR);
+                        self.pic_tex = Some((key.clone(), t.clone()));
+                        t
+                    }
+                };
+                let scale = (280.0 / p.width as f32)
+                    .min(200.0 / p.height as f32)
+                    .min(8.0);
+                ui.add(egui::Image::new((
+                    tex.id(),
+                    egui::vec2(p.width as f32 * scale, p.height as f32 * scale),
+                )));
+                let stream = container::pack(&p.name, &p.jpeg).len();
+                let air = spec
+                    .and_then(|s| air_seconds(&s, stream).ok())
+                    .map_or(String::new(), |s| format!(", {s:.0} s of signal"));
+                ui.label(
+                    RichText::new(format!(
+                        "{}×{} → {}×{} progressive JPEG, quality {}, {} bytes{air}",
+                        p.source.0,
+                        p.source.1,
+                        p.width,
+                        p.height,
+                        p.quality,
+                        p.jpeg.len()
+                    ))
+                    .size(11.0),
+                );
+            }
+        }
     }
 
     /// The rate the selected output device runs at.
@@ -97,10 +331,22 @@ impl TxPanel {
         let call = normalise_call(&self.call)
             .ok_or("enter your callsign (letters, digits and /, up to 9)")?;
         let mode = Mode::from_name(&self.mode).ok_or("choose a mode")?;
-        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let name = path
-            .file_name()
-            .map_or("file".to_string(), |n| n.to_string_lossy().into_owned());
+        let (name, data, ptype) = if self.picture {
+            let key = self.wanted_key().ok_or("choose a picture")?;
+            match &self.pic_result {
+                Some((k, Ok(p))) if *k == key => {
+                    (p.name.clone(), p.jpeg.clone(), PayloadType::Picture)
+                }
+                Some((_, Err(e))) => return Err(e.clone()),
+                _ => return Err("the picture is still being prepared: try again".into()),
+            }
+        } else {
+            let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let name = path
+                .file_name()
+                .map_or("file".to_string(), |n| n.to_string_lossy().into_owned());
+            (name, data, PayloadType::File)
+        };
         let spec = SendSpec {
             profile: self.profile,
             mode,
@@ -110,7 +356,7 @@ impl TxPanel {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs())
                 % 64) as u8,
-            ptype: PayloadType::File,
+            ptype,
             resync_s: self.resync,
             parity: self.parity / 100.0,
             passes: self.repeat.max(1),
@@ -137,6 +383,7 @@ impl TxPanel {
         devices_out: &[(String, u32)],
         _out_dir: &Path,
     ) {
+        self.drive_picture(ctx);
         let mut open = self.open;
         egui::Window::new("Transmit")
             .open(&mut open)
@@ -154,8 +401,13 @@ impl TxPanel {
                     ui.label("File");
                     ui.horizontal(|ui| {
                         if ui.button("Choose…").clicked()
-                            && let Some(p) = rfd::FileDialog::new().pick_file()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .add_filter("Pictures", &PICTURE_EXTENSIONS)
+                                .add_filter("All files", &["*"])
+                                .pick_file()
                         {
+                            // A picture is sent as one unless the box is cleared.
+                            self.picture = is_picture(&p);
                             self.file = Some(p);
                         }
                         ui.label(
@@ -166,6 +418,21 @@ impl TxPanel {
                         );
                     });
                     ui.end_row();
+                    ui.label("As a picture");
+                    ui.checkbox(&mut self.picture, "scale and compress to the air time");
+                    ui.end_row();
+                    if self.picture {
+                        ui.label("Air time");
+                        ui.add(
+                            egui::Slider::new(&mut self.air, 20.0..=900.0)
+                                .suffix(" s a pass")
+                                .logarithmic(true),
+                        );
+                        ui.end_row();
+                        ui.label("Quality at least");
+                        ui.add(egui::Slider::new(&mut self.min_quality, 5..=90));
+                        ui.end_row();
+                    }
                     ui.label("Callsign");
                     ui.text_edit_singleline(&mut self.call);
                     ui.end_row();
@@ -236,6 +503,9 @@ impl TxPanel {
                         .weak()
                         .size(11.0),
                     );
+                }
+                if self.picture {
+                    self.picture_status(ui);
                 }
                 ui.separator();
                 ui.horizontal(|ui| {

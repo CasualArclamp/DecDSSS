@@ -9,6 +9,7 @@ use crate::spectrum::Spectrum;
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_core::Profile;
 use decdsss_link::{Assembler, ReceivedFile};
+use decdsss_phy::framing::PayloadType;
 use decdsss_phy::rx::{Event, MultiReceiver, Snapshot};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -58,6 +59,26 @@ pub struct FileEntry {
     pub path: PathBuf,
 }
 
+/// A picture as far as it has arrived.
+#[derive(Clone, Debug)]
+pub struct PictureView {
+    pub call: String,
+    pub session: u8,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    /// RGBA, transparent where nothing has arrived yet.
+    pub rgba: Vec<u8>,
+    /// Bytes of the file in, without a gap, and the whole file's.
+    pub bytes: usize,
+    pub total: usize,
+    /// Complete JPEG scans decoded.
+    pub scans: usize,
+    pub complete: bool,
+    /// Changes whenever the picture does, so the UI knows to upload it again.
+    pub version: u64,
+}
+
 /// How far a transmission has got, for the progress bars.
 #[derive(Clone, Debug)]
 pub struct Transfer {
@@ -92,6 +113,8 @@ pub struct Shared {
     pub log: VecDeque<String>,
     pub files: Vec<FileEntry>,
     pub transfers: Vec<Transfer>,
+    /// Pictures received or arriving, oldest first.
+    pub pictures: Vec<Arc<PictureView>>,
     pub tx: TxState,
     /// Bumped whenever something the UI draws changed.
     pub version: u64,
@@ -167,6 +190,56 @@ struct Run {
     last_publish: Instant,
     row_version: u64,
     transfers: BTreeMap<(String, u8), Transfer>,
+    /// Pictures by (call, session), oldest first, with the bytes of the file
+    /// they were last drawn from.
+    pictures: Vec<((String, u8), usize, Arc<PictureView>)>,
+    picture_version: u64,
+}
+
+/// Pictures kept on the display.
+const PICTURES_MAX: usize = 8;
+
+/// Redraws a transmission's picture from the front of its file that has
+/// arrived (or from the whole file once it has).
+fn update_picture(r: &mut Run, call: &str, session: u8, finished: Option<&ReceivedFile>) {
+    let (data, name, total, complete) = match finished {
+        Some(f) => (f.data.clone(), f.name.clone(), f.data.len(), true),
+        None => match r.asm.front(call, session) {
+            Some(fr) => (fr.data, fr.name, fr.total, false),
+            None => return,
+        },
+    };
+    let key = (call.to_string(), session);
+    let at = r.pictures.iter().position(|(k, ..)| *k == key);
+    if !complete && at.is_some_and(|i| r.pictures[i].1 == data.len()) {
+        return;
+    }
+    let Some(part) = decdsss_image::decode_partial(&data) else {
+        return;
+    };
+    r.picture_version += 1;
+    let view = Arc::new(PictureView {
+        call: call.to_string(),
+        session,
+        name,
+        width: part.image.width(),
+        height: part.image.height(),
+        rgba: part.image.into_raw(),
+        bytes: data.len(),
+        total,
+        scans: part.scans,
+        complete: complete || part.complete,
+        version: r.picture_version,
+    });
+    match at {
+        Some(i) => r.pictures[i] = (key, data.len(), view),
+        None => {
+            r.pictures.push((key, data.len(), view));
+            if r.pictures.len() > PICTURES_MAX {
+                r.pictures.remove(0);
+            }
+        }
+    }
 }
 
 fn log(shared: &Arc<Mutex<Shared>>, line: String) {
@@ -291,6 +364,7 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
         g.snapshots.clear();
         g.spectrum = None;
         g.transfers.clear();
+        g.pictures.clear();
         g.version += 1;
     }
     log(shared, format!("Listening on {what}, {} Hz", rate as u32));
@@ -306,6 +380,8 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
         last_publish: Instant::now(),
         row_version: 0,
         transfers: BTreeMap::new(),
+        pictures: Vec::new(),
+        picture_version: 0,
     })
 }
 
@@ -430,12 +506,15 @@ fn handle_event(shared: &Arc<Mutex<Shared>>, r: &mut Run, t: f64, profile: Profi
             let finished = r.asm.push(&header, &result);
             // Progress comes from the assembler: distinct frames in against the
             // frames needed (any that many rebuild the file).
-            if let Some(p) = r.asm.progress(&header.call, header.session)
-                && let Some(tr) = r.transfers.get_mut(&(header.call.clone(), header.session))
-            {
-                tr.have = p.have;
-                tr.total = p.need;
-                tr.map = p.data_held;
+            if let Some(p) = r.asm.progress(&header.call, header.session) {
+                if let Some(tr) = r.transfers.get_mut(&(header.call.clone(), header.session)) {
+                    tr.have = p.have;
+                    tr.total = p.need;
+                    tr.map = p.data_held;
+                }
+                if p.ptype == PayloadType::Picture {
+                    update_picture(r, &header.call, header.session, finished.as_ref());
+                }
             }
             if let Some(f) = finished {
                 if let Some(tr) = r.transfers.get_mut(&(f.call.clone(), f.session)) {
@@ -520,10 +599,12 @@ fn publish(shared: &Arc<Mutex<Shared>>, r: &mut Run, force: bool) {
         row_version: r.row_version,
     };
     let transfers: Vec<Transfer> = r.transfers.values().cloned().collect();
+    let pictures: Vec<Arc<PictureView>> = r.pictures.iter().map(|(.., v)| v.clone()).collect();
     let mut g = shared.lock().unwrap();
     g.snapshots = snaps;
     g.spectrum = Some(view);
     g.transfers = transfers;
+    g.pictures = pictures;
     g.seconds = r.samples as f64 / r.rate;
     g.version += 1;
 }

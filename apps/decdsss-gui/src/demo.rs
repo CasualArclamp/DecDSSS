@@ -1,7 +1,7 @@
 // made by CasualArclamp
 //! A built-in demonstration signal: two stations on the same 2.4 kHz channel
-//! on different spreading codes, one DS-PSK and one CSK, the second joining
-//! while the first is still sending, through moderate HF fading, a carrier
+//! on different spreading codes, one DS-PSK sending a picture and one CSK
+//! sending a text file, the second joining while the first is still sending, through moderate HF fading, a carrier
 //! offset and a sound-card clock error. It is what `--demo` feeds the
 //! receiver, so every panel has something to show without a radio.
 
@@ -32,13 +32,48 @@ fn text(tag: &str, bytes: usize) -> Vec<u8> {
     s.into_bytes()
 }
 
+/// A synthetic landscape as a progressive JPEG of at most `budget` bytes.
+fn picture(budget: usize) -> Vec<u8> {
+    let (w, h) = (160u32, 120u32);
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        let (u, v) = (x as f32, y as f32);
+        let t = (v / h as f32).powf(1.5);
+        let mix = |a: f32, b: f32| a + (b - a) * t;
+        // Sky, with a sun and its glow.
+        let d = ((u - 112.0).powi(2) + (v - 62.0).powi(2)).sqrt();
+        let glow = (1.0 - d / 46.0).clamp(0.0, 1.0).powi(2);
+        let mut c = [
+            mix(20.0, 250.0) + 90.0 * glow,
+            mix(40.0, 170.0) + 80.0 * glow,
+            mix(110.0, 90.0) + 20.0 * glow,
+        ];
+        if d < 12.0 {
+            c = [255.0, 244.0, 200.0];
+        }
+        // Two ridges of hills.
+        let far = 70.0 + 14.0 * (u * 0.06).sin() + 8.0 * (u * 0.17 + 1.0).sin();
+        let near = 92.0 + 10.0 * (u * 0.09 + 2.0).sin() + 5.0 * (u * 0.31).sin();
+        if v > near {
+            c = [30.0, 25.0, 45.0];
+        } else if v > far {
+            c = [78.0, 52.0, 96.0];
+        }
+        image::Rgb(c.map(|v| v.clamp(0.0, 255.0) as u8))
+    });
+    decdsss_image::encode_to_fit(&img, budget)
+        .expect("demo picture")
+        .bytes
+}
+
 /// One station's audio, as `lead` seconds of silence then its segments.
+#[allow(clippy::too_many_arguments)]
 fn station(
     call: &str,
     mode: &str,
     depth: usize,
     name: &str,
     data: &[u8],
+    ptype: PayloadType,
     session: u8,
     lead: f64,
 ) -> Vec<f32> {
@@ -48,7 +83,7 @@ fn station(
         depth,
         call: call.into(),
         session,
-        ptype: PayloadType::File,
+        ptype,
         resync_s: 40.0,
         parity: 0.2,
         passes: 1,
@@ -99,8 +134,9 @@ pub fn make() -> Demo {
         "VK2ABC",
         "ds8-1/2",
         2,
-        "demo-ds.txt",
-        &text("DS8", 1100),
+        "landscape.jpg",
+        &picture(2100),
+        PayloadType::Picture,
         11,
         1.0,
     );
@@ -110,6 +146,7 @@ pub fn make() -> Demo {
         1,
         "demo-csk.txt",
         &text("CSK64", 520),
+        PayloadType::File,
         23,
         30.0,
     );
@@ -134,7 +171,7 @@ pub fn make() -> Demo {
     let audio = bandpass(&ch.apply(&mix, f64::from(RATE)), 250.0, 3400.0, 255);
     Demo {
         audio,
-        what: "VK2ABC (DS8 ½) and W1AW (CSK64 ½) on 2.4 kHz, moderate fading, +14 Hz, -15 ppm"
+        what: "VK2ABC (DS8 ½, a picture) and W1AW (CSK64 ½, a file) on 2.4 kHz, moderate fading, +14 Hz, -15 ppm"
             .into(),
     }
 }

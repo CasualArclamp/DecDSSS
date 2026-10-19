@@ -12,3 +12,7 @@ rust-version.workspace = true
 decdsss-core = { path = "../decdsss-core" }
 decdsss-fec = { path = "../decdsss-fec" }
 decdsss-phy = { path = "../decdsss-phy" }
+
+[dev-dependencies]
+decdsss-chan = { path = "../decdsss-chan" }
+decdsss-image = { path = "../decdsss-image" }

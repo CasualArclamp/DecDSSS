@@ -253,9 +253,32 @@ CRC-16 (headers) and CRC-32 (payload frames).
   frames missing, not `K`. A 2400-byte file through slow fading that lost 3–5
   frames of 38 a pass now arrives in one pass with 10 coded frames (4 of 5
   seeds; the fifth lost 13 of 48, more than the code covers).
-- **Pictures** (M3): COFDMtv's pipeline. WebP by default, progressive JPEG as an
-  option, sized by air time, systematic frames first so the picture draws as it
-  arrives.
+- **Pictures** (M3, done): a progressive JPEG, pure Rust (`jpeg-encoder` to write
+  it, `zune-jpeg` through `image` to read it; no C code, unlike COFDMtv's
+  mozjpeg/libwebp route). The picture is scaled (Lanczos) to the largest size of a
+  ladder (√2 steps in pixel count, 256 pixels to 1 M) whose JPEG fits the byte
+  budget at a quality of at least `--min-quality` (default 30), found by
+  bisection; the budget is what `--air` seconds of one pass carry
+  (`max_stream_bytes`, exact: it is the same arithmetic as the sender's plan,
+  tested against the real chip count). It is sent as an ordinary erasure-coded
+  file with the header's payload type set to Picture. The data frames go first
+  and in order, so the front of the file is readable while the rest is on the
+  way, and the receiver draws it after every block (`Assembler::front` gives the
+  bytes held from the start without a gap; `decode_partial` decodes them with the
+  end-of-image marker put on the cut, or up to the last complete scan if the cut
+  one will not decode). A JPEG with 6 scans per component (the DC of each
+  component, then 5 equal bands of AC coefficients; the encoder's script, not
+  tunable) shows the whole picture, blurred, from about a fifth of the file, and
+  sharpens from there. Measured on one 192×144 photograph at quality 40
+  (4198 bytes): PSNR against the original 18.4 dB with 20 % of the file, 19.7 at
+  30 %, 21.3 at 40 %, 22.8 at 50 %, 25.1 at 60 %, 26.9 at 75 %, 28.6 whole; four
+  scans per component would be 6 % smaller and 1.4 dB worse at half the file.
+  Not done: a custom scan script (successive approximation of the DC and
+  low AC first would sharpen the first scans further), and sending only the
+  scans that fit with the rest on a later pass.
+  Examples (a 797×1200 photograph, 120 s a pass, 25 % coded frames): DS4 ¾ on
+  2.4 kHz gives 147×222 at quality 48 in 5319 bytes, DS8 ½ gives 62×93 at 47 in
+  1576 bytes.
 - **Voice** (M4): Codec2 (450 on `2k4`, 700C on `3k`), streamed in PTT overs with
   a short interleaver. Codecs run off the real-time loop (voicemodem's lesson).
   **Open:** the pure-Rust `codec2` crate voicemodem uses (0.3.1) has no 700C or
@@ -288,9 +311,16 @@ hairline frames, one muted hue per quantity.
   - symbol SNR and carrier strips
   - the last codeword's soft bits, and a frame map of the transmission
 - **Files** — the received list (click to open), progress bars, the log.
+- **Pictures** — a strip under the band view with one card per picture (newest
+  first, up to 8): the picture as far as it has arrived, upscaled, with bytes in
+  against bytes in all and the scans decoded; it sharpens as blocks arrive.
 - **Transmit** — file, callsign, profile, mode (with its rate and the SNR it
-  needs), depth, preamble interval, repeat, level, output device; play to the
-  sound card (at that device's own rate) or save a WAV.
+  needs), depth, preamble interval, coded frames, passes, level, output device;
+  play to the sound card (at that device's own rate) or save a WAV. Choosing an
+  image switches on *As a picture*: air time a pass and the lowest quality
+  accepted, and the window shows the picture exactly as it will arrive (decoded
+  from the JPEG that will be sent), its size, quality, bytes and seconds of
+  signal. Compression runs off the UI thread.
 
 Sources: a sound card or virtual cable (stereo is mixed to mono), a WAV file at
 any speed, or the built-in demo (two stations, one DS8 and one CSK64, on one
@@ -313,7 +343,8 @@ silent.
 | `decdsss-fec` | QC-LDPC (design, encoder, layered min-sum), the interleaver, CRCs. |
 | `decdsss-phy` | Codes, framing, the transmitter, the receiver (search, preamble, header, payload, refinement), the end-to-end simulator. |
 | `decdsss-chan` | Channel simulator: AWGN, carrier offset and drift, clock error, Watterson fading with the CCIR presets. |
-| `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes), receive-side assembly. |
+| `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes, air time and byte budget), receive-side assembly (and the readable front of a file still arriving). |
+| `decdsss-image` | Pictures: load, scale and compress to a byte budget as a progressive JPEG; decode one that is cut short. |
 | `decdsss-audio` | Sound-card capture and playback (cpal) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
 | `decdsss-rig` | CAT keying (M4). |
 | `apps/decdsss-cli` | `decdsss`: modes, devices, tx, rx, channel, sweep. |
@@ -331,7 +362,9 @@ silent.
   and received in the GUI and the CLI from CABLE-A Output, byte-identical).
   Erasure-coded frames followed (any `K` distinct frames rebuild a file; see
   Payloads). *Done.* Left for later: a CI smoke test of the window.
-- **M3** — pictures.
+- **M3** — pictures: progressive JPEG sized by air time, drawn as it arrives, in
+  the CLI (`tx --picture --air`, a partial PNG saved by `rx` for a picture that
+  did not finish) and the GUI. *Done* (see Verification).
 - **M4** — voice, VOX/manual PTT, CAT keying.
 - **M5** — ARQ connected mode.
 - **M6** — polish and the first release (portable exes), when Rory says so.
@@ -401,6 +434,26 @@ interleaving, coded frames (`decdsss tx --parity`), further passes
 38-frame file (depth 4, DS8 1/2, 8 dB, drift 0.05 Hz) four of five fading
 seeds delivered the file in one pass; the fifth lost 13 of 48 frames and was
 left 3 short.
+
+### Pictures
+
+A 797×1200 photograph sent with `tx --picture --air 120` (DS8 ½, 2.4 kHz, depth 4,
+25 % coded frames, two segments, 62×93 pixels, 1576 bytes), through moderate
+fading with +8 Hz and 20 ppm: the file arrived byte for byte on all of five fading
+seeds at both 9 dB and 12 dB in-band SNR. In `crates/decdsss-link/tests/picture.rs`
+a 96×72 picture goes through the same chain in the test suite and is drawn after
+every block on the way (the front and the scans grow monotonically).
+
+**A limit found:** the same photograph at DS4 ¾ (147×222, 5319 bytes, two
+segments) through moderate fading was delivered on four of five seeds at 25 dB
+(seeds 1, 2, 4, 5); on the fifth the whole second segment (28 of 68 frames) was
+lost at every SNR from 6 to 25 dB, so it is not noise. The likely cause (not
+confirmed) is the delay spread of the moderate channel, 1 ms or about 2 chips
+at 1920 chip/s, half a DS4 symbol: the rake cannot clear the interference between
+symbols, which puts a floor under the symbol SNR that more signal does not lift
+(the blocks of the lost segment report 0–10 dB symbol SNR at 25 dB in-band). Use
+SF 8 or more, or CSK, on skywave until this is looked into (an equaliser or a
+decision-feedback step would be the cure if the fast modes matter on HF).
 
 ### Not yet measured
 

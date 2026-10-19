@@ -40,6 +40,21 @@ pub fn total_len(head: &[u8]) -> Option<usize> {
     Some(7 + n + u32::from_be_bytes(len) as usize + 4)
 }
 
+/// A container's front: its name, the bytes of data in `head` so far (cut at
+/// the declared length) and the declared length. `None` while the name and
+/// length are not all in.
+pub fn peek(head: &[u8]) -> Option<(String, &[u8], usize)> {
+    if head.len() < 3 || &head[..2] != MAGIC {
+        return None;
+    }
+    let n = usize::from(head[2]);
+    let len: [u8; 4] = head.get(3 + n..7 + n)?.try_into().ok()?;
+    let len = u32::from_be_bytes(len) as usize;
+    let name = std::str::from_utf8(&head[3..3 + n]).ok()?.to_string();
+    let have = &head[7 + n..];
+    Some((name, &have[..have.len().min(len)], len))
+}
+
 /// Unwraps a container (trailing padding is ignored). `None` if it is cut
 /// short, not a container, or fails its CRC.
 pub fn unpack(bytes: &[u8]) -> Option<(String, Vec<u8>)> {
@@ -64,6 +79,21 @@ mod tests {
         c.extend_from_slice(&[0; 40]);
         assert_eq!(total_len(&c[..20]), Some(len));
         assert_eq!(unpack(&c), Some(("holiday.webp".to_string(), data)));
+    }
+
+    #[test]
+    fn peek_gives_the_front_before_the_rest_is_in() {
+        let data: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let c = pack("p.jpg", &data);
+        assert_eq!(peek(&c[..9]), None, "name in, length not yet");
+        let (name, have, len) = peek(&c[..50]).unwrap();
+        assert_eq!((name.as_str(), len), ("p.jpg", 300));
+        assert_eq!(have, &data[..have.len()]);
+        assert_eq!(have.len(), 50 - 12);
+        // The CRC and padding after the data are not data.
+        let mut whole = c.clone();
+        whole.extend_from_slice(&[0; 20]);
+        assert_eq!(peek(&whole).unwrap().1, &data[..]);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 A narrowband spread-spectrum modem for amateur radio. It uses direct-sequence
 (DS-PSK) and code-shift-keyed (CSK) spreading inside an SSB voice channel of
-**500 Hz, 2.4 kHz or 3 kHz**, and carries files (pictures and Codec2 voice are
+**500 Hz, 2.4 kHz or 3 kHz**, and carries files and pictures (Codec2 voice is
 next). A signal can sit 15 dB under the noise in its own bandwidth and still
 decode.
 
@@ -17,13 +17,15 @@ The receiver shows what it is doing, in the style of DecSAT's DVB-CID card:
 - symbol SNR and carrier strips, the soft bits of the last codeword, and which
   frames of a file are in;
 - the audio spectrum and waterfall with the three profiles marked, so you can see
-  the spread signal sitting under the noise floor.
+  the spread signal sitting under the noise floor;
+- pictures, drawn as they arrive: a progressive JPEG shows the whole picture
+  early and sharpens it as more of the file comes in.
 
 ![The GUI decoding two stations at once](docs/gui-demo.png)
 
-*Two stations on one 2.4 kHz channel, on different spreading codes (VK2ABC DS8,
-W1AW CSK64), through moderate HF fading with a 14 Hz carrier offset: the demo
-signal.*
+*Two stations on one 2.4 kHz channel, on different spreading codes (VK2ABC DS8
+sending a picture, W1AW CSK64 sending a file), through moderate HF fading with a
+14 Hz carrier offset: the demo signal, caught while the picture is half in.*
 
 ## How it works
 
@@ -64,14 +66,18 @@ CSK64 on 2.4 kHz).
 cargo run --release -p decdsss-cli -- modes --profile 2k4
 
 # A file to audio, through the HF channel simulator, and back
-cargo run --release -p decdsss-cli -- tx photo.webp --call VK2ABC --mode ds8-1/2 --parity 25 -o tx.wav
+cargo run --release -p decdsss-cli -- tx data.bin --call VK2ABC --mode ds8-1/2 --parity 25 -o tx.wav
 cargo run --release -p decdsss-cli -- channel tx.wav noisy.wav --snr -4 --fading moderate --offset 12 --clock-ppm 25
 cargo run --release -p decdsss-cli -- rx noisy.wav --out-dir received
 
 # Sound cards (a virtual audio cable makes a silent test loop)
 cargo run --release -p decdsss-cli -- devices
 cargo run --release -p decdsss-cli -- rx --device "CABLE-A Output" --out-dir received
-cargo run --release -p decdsss-cli -- tx photo.webp --call VK2ABC --play "CABLE-A Input"
+cargo run --release -p decdsss-cli -- tx data.bin --call VK2ABC --play "CABLE-A Input"
+
+# A picture: scaled and compressed to fit 120 s of signal a pass, as a progressive JPEG
+cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --mode ds8-1/2 --picture --air 120 -o pic.wav
+# rx saves the picture when it is whole, or a partial PNG of what came if it is not
 
 # Measure a mode: frame loss against Eb/N0 through the whole receiver
 cargo run --release -p decdsss-cli -- sweep --mode csk64-1/2 --ebn0 2 6 1 --fading moderate --trials 16

@@ -14,7 +14,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: decdsss-gui [--demo | --wav FILE] [--speed X] [--profile 500,2k4,3k] \
-[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx]";
+[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE]";
 
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
@@ -71,6 +71,7 @@ fn main() -> eframe::Result {
             "--after" => auto.after = value("--after").parse().ok(),
             "--screenshot" => auto.screenshot = Some(PathBuf::from(value("--screenshot"))),
             "--tx" => auto.open_tx = true,
+            "--tx-file" => auto.tx_file = Some(PathBuf::from(value("--tx-file"))),
             "--window-size" => {
                 let v = value("--window-size");
                 if let Some((w, h)) = v.split_once('x')

@@ -1,7 +1,7 @@
 // made by CasualArclamp
 //! The application window.
 
-use crate::engine::{Cmd, Config, Engine, Shared, Source, SpectrumView, Transfer};
+use crate::engine::{Cmd, Config, Engine, PictureView, Shared, Source, SpectrumView, Transfer};
 use crate::prefs::Prefs;
 use crate::scope::{self, HeatTexture, col};
 use crate::tx::TxPanel;
@@ -13,6 +13,7 @@ use eframe::egui::{
     TextureOptions, Ui, pos2, vec2,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,8 @@ pub struct Automation {
     pub after: Option<f64>,
     pub screenshot: Option<PathBuf>,
     pub open_tx: bool,
+    /// Open the transmit window with this file chosen.
+    pub tx_file: Option<PathBuf>,
     pub requested_at: Option<Instant>,
 }
 
@@ -54,6 +57,8 @@ pub struct App {
     /// The last view of each station, kept after its segment ends so the card
     /// does not flicker away between segments: (profile, call, session).
     stations: std::collections::BTreeMap<(usize, String, u8), (ChannelView, Instant)>,
+    /// The texture of each picture on show and the version it was made from.
+    pictures: std::collections::BTreeMap<(String, u8), (u64, TextureHandle)>,
 }
 
 fn default_out_dir() -> PathBuf {
@@ -92,6 +97,9 @@ impl App {
         let mut tx = TxPanel::default();
         tx.open = auto.open_tx;
         tx.restore(&prefs);
+        if let Some(p) = auto.tx_file.clone() {
+            tx.preload(p);
+        }
         let out_dir = out_dir.or_else(|| prefs.get("out_dir").map(PathBuf::from));
         let device_in = initial_device
             .as_deref()
@@ -122,6 +130,7 @@ impl App {
             heat: Default::default(),
             tx,
             stations: Default::default(),
+            pictures: Default::default(),
         }
     }
 
@@ -501,6 +510,83 @@ impl App {
             });
     }
 
+    /// Pictures received or arriving, newest first, each as far as it has come.
+    fn pictures_panel(&mut self, ui: &mut Ui, pictures: &[Arc<PictureView>]) {
+        self.pictures
+            .retain(|k, _| pictures.iter().any(|p| (p.call.clone(), p.session) == *k));
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                for p in pictures.iter().rev() {
+                    self.picture_card(ui, p);
+                }
+            });
+        });
+    }
+
+    fn picture_card(&mut self, ui: &mut Ui, p: &PictureView) {
+        let key = (p.call.clone(), p.session);
+        let tex = match self.pictures.get(&key) {
+            Some((v, t)) if *v == p.version => t.clone(),
+            _ => {
+                let img = ColorImage::from_rgba_unmultiplied(
+                    [p.width as usize, p.height as usize],
+                    &p.rgba,
+                );
+                let t = ui.ctx().load_texture(
+                    format!("picture-{}-{}", p.call, p.session),
+                    img,
+                    TextureOptions::LINEAR,
+                );
+                self.pictures.insert(key, (p.version, t.clone()));
+                t
+            }
+        };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&p.call).strong().color(col::LOCK));
+                    ui.label(RichText::new(&p.name).weak());
+                });
+                // Pictures are small: show them larger, in a box of a fixed height
+                // so cards line up.
+                let (bw, bh) = (300.0f32, 200.0f32);
+                let scale = (bw / p.width as f32).min(bh / p.height as f32).min(8.0);
+                let size = vec2(p.width as f32 * scale, p.height as f32 * scale);
+                let (rect, _) = ui.allocate_exact_size(vec2(bw, bh), Sense::hover());
+                ui.painter().rect_filled(rect, 2.0, Color32::from_gray(24));
+                let image_rect = egui::Rect::from_center_size(rect.center(), size);
+                ui.painter().image(
+                    tex.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                let frac = if p.total > 0 {
+                    p.bytes as f32 / p.total as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(if p.complete { 1.0 } else { frac })
+                        .desired_width(bw)
+                        .text(if p.complete {
+                            format!("complete  ·  {}×{}  ·  {} B", p.width, p.height, p.total)
+                        } else {
+                            format!(
+                                "{} of {} B  ·  {} scan{}  ·  {}×{}",
+                                p.bytes,
+                                p.total,
+                                p.scans,
+                                if p.scans == 1 { "" } else { "s" },
+                                p.width,
+                                p.height
+                            )
+                        }),
+                );
+            });
+        });
+    }
+
     fn files_and_log(&mut self, ui: &mut Ui, sh: &Shared) {
         if !sh.files.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -732,7 +818,19 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         // Take what the engine published, then let go of the lock.
-        let (running, status, seconds, level, snapshots, spectrum, log, files, transfers, tx) = {
+        let (
+            running,
+            status,
+            seconds,
+            level,
+            snapshots,
+            spectrum,
+            log,
+            files,
+            transfers,
+            pictures,
+            tx,
+        ) = {
             let g = self.engine.shared.lock().unwrap();
             (
                 g.running,
@@ -750,6 +848,7 @@ impl eframe::App for App {
                     .collect::<std::collections::VecDeque<_>>(),
                 g.files.clone(),
                 g.transfers.clone(),
+                g.pictures.clone(),
                 g.tx.clone(),
             )
         };
@@ -763,6 +862,7 @@ impl eframe::App for App {
             log,
             files,
             transfers,
+            pictures,
             tx,
             ..Shared::default()
         };
@@ -771,6 +871,11 @@ impl eframe::App for App {
         egui::Panel::bottom("log")
             .resizable(false)
             .show(ui, |ui| self.files_and_log(ui, &sh));
+        if !sh.pictures.is_empty() {
+            egui::Panel::bottom("pictures")
+                .resizable(false)
+                .show(ui, |ui| self.pictures_panel(ui, &sh.pictures));
+        }
         egui::Panel::right("stations")
             .resizable(true)
             .default_size(560.0)

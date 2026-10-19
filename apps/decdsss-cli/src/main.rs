@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_chan::{Channel, Watterson};
 use decdsss_core::{Mode, Profile};
-use decdsss_link::{Assembler, SendSpec, container, plan};
+use decdsss_link::{Assembler, SendSpec, container, max_stream_bytes, plan};
 use decdsss_phy::codes::{normalise_call, own_code};
 use decdsss_phy::framing::{Layout, PayloadType};
 use decdsss_phy::rx::{Event, MultiReceiver};
@@ -61,6 +61,20 @@ enum Command {
         /// Passes to send; each later pass sends new coded frames.
         #[arg(long, default_value_t = 1)]
         repeat: usize,
+        /// Send the file as a picture: scaled and compressed to a progressive JPEG
+        /// that fits --air seconds (a pass), drawn on the receiver as it arrives.
+        #[arg(long)]
+        picture: bool,
+        /// With --picture, seconds of signal one pass may take.
+        #[arg(long, default_value_t = 120.0)]
+        air: f64,
+        /// With --picture, the lowest JPEG quality (1-100) to accept before the
+        /// picture is made smaller instead.
+        #[arg(long, default_value_t = 30)]
+        min_quality: u8,
+        /// With --picture, also write the JPEG as sent to this file.
+        #[arg(long)]
+        save_jpeg: Option<PathBuf>,
         /// Session number 0-63, to tell transmissions apart.
         #[arg(long)]
         session: Option<u8>,
@@ -176,6 +190,10 @@ fn main() -> Result<()> {
             resync,
             parity,
             repeat,
+            picture,
+            air,
+            min_quality,
+            save_jpeg,
             session,
             rate,
             level,
@@ -192,6 +210,11 @@ fn main() -> Result<()> {
             resync,
             parity,
             repeat,
+            picture.then_some(PictureOpts {
+                air,
+                min_quality,
+                save_jpeg,
+            }),
             session,
             rate,
             level,
@@ -316,6 +339,7 @@ fn tx(
     resync: f64,
     parity: f64,
     repeat: usize,
+    picture: Option<PictureOpts>,
     session: Option<u8>,
     rate: u32,
     level: f32,
@@ -335,12 +359,10 @@ fn tx(
     if !decdsss_phy::framing::DEPTHS.contains(&depth) {
         bail!("depth must be 1, 2, 4 or 8");
     }
-    let data = std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?;
-    let name = file
+    let mut name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".into());
-    let stream = container::pack(&name, &data);
     // A session number from the clock unless one is given.
     let session = session.unwrap_or_else(|| {
         let t = std::time::SystemTime::now()
@@ -354,11 +376,24 @@ fn tx(
         depth,
         call: call.clone(),
         session: session & 63,
-        ptype: PayloadType::File,
+        ptype: if picture.is_some() {
+            PayloadType::Picture
+        } else {
+            PayloadType::File
+        },
         resync_s: resync,
         parity: parity / 100.0,
         passes: repeat.max(1),
     };
+    let data = match &picture {
+        Some(opts) => {
+            let (picture_name, jpeg) = prepare_picture(file, &spec, opts)?;
+            name = picture_name;
+            jpeg
+        }
+        None => std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?,
+    };
+    let stream = container::pack(&name, &data);
     let plan = plan(&spec, &stream).map_err(anyhow::Error::msg)?;
     let segs = &plan.segments;
     let layout = Layout::new(profile, mode, depth);
@@ -393,6 +428,56 @@ fn tx(
         play_audio(&audio, rate, dev)?;
     }
     Ok(())
+}
+
+/// What `tx --picture` was asked for.
+struct PictureOpts {
+    air: f64,
+    min_quality: u8,
+    save_jpeg: Option<PathBuf>,
+}
+
+/// Loads a picture and compresses it to the largest progressive JPEG that one
+/// pass of `spec` carries in `opts.air` seconds. Returns the name to send it
+/// under and the JPEG.
+fn prepare_picture(file: &Path, spec: &SendSpec, opts: &PictureOpts) -> Result<(String, Vec<u8>)> {
+    let src = decdsss_image::Source::open(file).map_err(anyhow::Error::msg)?;
+    let stem = file
+        .file_stem()
+        .map_or_else(|| "picture".into(), |s| s.to_string_lossy().into_owned());
+    let name = format!("{stem}.jpg");
+    // The air time of a pass: the container's own bytes come out of the budget.
+    let one_pass = SendSpec {
+        passes: 1,
+        ..spec.clone()
+    };
+    let budget =
+        max_stream_bytes(&one_pass, opts.air).saturating_sub(container::pack(&name, &[]).len());
+    if budget < 200 {
+        bail!(
+            "{:.0} s of {} {} carries only {budget} bytes: ask for more with --air or use a faster mode",
+            opts.air,
+            spec.profile.label(),
+            spec.mode
+        );
+    }
+    let enc = decdsss_image::encode_auto(&src.image, budget, 1 << 20, opts.min_quality)
+        .map_err(anyhow::Error::msg)?;
+    println!(
+        "picture {}×{} → {}×{} progressive JPEG, quality {}, {} bytes (room for {budget} in {:.0} s)",
+        src.image.width(),
+        src.image.height(),
+        enc.width,
+        enc.height,
+        enc.quality,
+        enc.bytes.len(),
+        opts.air
+    );
+    if let Some(path) = &opts.save_jpeg {
+        std::fs::write(path, &enc.bytes)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    Ok((name, enc.bytes))
 }
 
 fn sanitize(name: &str) -> String {
@@ -526,8 +611,14 @@ impl RxRun {
                         match std::fs::write(&path, &f.data) {
                             Ok(()) => {
                                 self.files += 1;
+                                let pic = (f.ptype == PayloadType::Picture)
+                                    .then(|| decdsss_image::decode(&f.data))
+                                    .flatten()
+                                    .map_or(String::new(), |i| {
+                                        format!(", picture {}×{}", i.width(), i.height())
+                                    });
                                 println!(
-                                    "[{t:7.1}s] FILE {} ({} bytes) from {} → {}",
+                                    "[{t:7.1}s] FILE {} ({} bytes{pic}) from {} → {}",
                                     f.name,
                                     f.data.len(),
                                     f.call,
@@ -556,6 +647,24 @@ impl RxRun {
                     "{call} session {session}: {} of the {} frames needed, not complete",
                     p.have, p.need
                 );
+                // A picture so far: what has arrived, drawn as far as it goes.
+                if p.ptype == PayloadType::Picture
+                    && let Some(front) = self.asm.front(call, *session)
+                    && let Some(part) = decdsss_image::decode_partial(&front.data)
+                    && part.scans > 0
+                {
+                    let path = unique(&self.out_dir, &format!("{call}-{session}-partial.png"));
+                    match decdsss_image::save_png(&part.image, &path) {
+                        Ok(()) => println!(
+                            "  its picture so far ({} of {} bytes, {} scans) → {}",
+                            front.data.len(),
+                            front.total,
+                            part.scans,
+                            path.display()
+                        ),
+                        Err(e) => println!("  cannot write the partial picture: {e}"),
+                    }
+                }
             }
         }
     }

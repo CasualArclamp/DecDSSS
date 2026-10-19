@@ -5,7 +5,7 @@
 use crate::container;
 use crate::erasure::Decoder;
 use crate::send::FRAME_META;
-use decdsss_phy::framing::Header;
+use decdsss_phy::framing::{Header, PayloadType};
 use decdsss_phy::rx::payload::BlockResult;
 use std::collections::BTreeMap;
 
@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 pub struct ReceivedFile {
     pub call: String,
     pub session: u8,
+    pub ptype: PayloadType,
     pub name: String,
     pub data: Vec<u8>,
 }
@@ -27,11 +28,23 @@ pub struct Progress {
     pub need: usize,
     /// Which data frames are held as themselves.
     pub data_held: Vec<bool>,
+    pub ptype: PayloadType,
+}
+
+/// The front of a file that has not all arrived: what its first frames carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Front {
+    pub name: String,
+    /// The file's bytes so far, from the first, with no gap.
+    pub data: Vec<u8>,
+    /// The file's length once complete.
+    pub total: usize,
 }
 
 struct Transfer {
     decoder: Decoder,
     done: bool,
+    ptype: PayloadType,
 }
 
 /// Gathers frames by (callsign, session).
@@ -70,6 +83,7 @@ impl Assembler {
                     Transfer {
                         decoder: Decoder::new(count, shard.len()),
                         done: false,
+                        ptype: header.ptype,
                     },
                 );
             }
@@ -89,6 +103,7 @@ impl Assembler {
                     finished = Some(ReceivedFile {
                         call: header.call.clone(),
                         session: header.session,
+                        ptype: t.ptype,
                         name,
                         data: file,
                     });
@@ -112,7 +127,23 @@ impl Assembler {
                 have: t.decoder.have().min(t.decoder.count()),
                 need: t.decoder.count(),
                 data_held: t.decoder.data_held(),
+                ptype: t.ptype,
             })
+    }
+
+    /// The front of a transmission's file that has arrived without a gap, if the
+    /// container's name and length are in: enough for a picture to be drawn
+    /// as far as it goes. The data frames come first in a pass, so the front
+    /// grows as they arrive.
+    pub fn front(&self, call: &str, session: u8) -> Option<Front> {
+        let t = self.transfers.get(&(call.to_string(), session))?;
+        let prefix = t.decoder.prefix();
+        let (name, data, total) = container::peek(&prefix)?;
+        Some(Front {
+            name,
+            data: data.to_vec(),
+            total,
+        })
     }
 
     /// True once the file of a transmission has been delivered.
@@ -205,6 +236,30 @@ mod tests {
             done = done.or(asm.push(header, &block(vec![Some(f.clone())])));
         }
         assert!(done.is_some(), "{:?}", asm.progress("VK2ABC", 9));
+    }
+
+    #[test]
+    fn the_front_of_a_file_reads_before_the_rest_is_in() {
+        let data: Vec<u8> = (0..1500u32).map(|i| (i * 11) as u8).collect();
+        let stream = container::pack("p.jpg", &data);
+        let p = plan(&spec(0.3, 1), &stream).unwrap();
+        let all = frames_of(&p);
+        let header = &p.segments[0].header;
+        let mut asm = Assembler::new();
+        assert_eq!(asm.front("VK2ABC", 9), None);
+        asm.push(header, &block(vec![Some(all[0].clone())]));
+        let f = asm
+            .front("VK2ABC", 9)
+            .expect("name and length are in frame 0");
+        assert_eq!((f.name.as_str(), f.total), ("p.jpg", 1500));
+        assert_eq!(f.data, &data[..f.data.len()]);
+        let one = f.data.len();
+        // Frame 2 without frame 1: a gap, so the front does not grow.
+        asm.push(header, &block(vec![Some(all[2].clone())]));
+        assert_eq!(asm.front("VK2ABC", 9).unwrap().data.len(), one);
+        asm.push(header, &block(vec![Some(all[1].clone())]));
+        assert!(asm.front("VK2ABC", 9).unwrap().data.len() > one);
+        assert_eq!(asm.progress("VK2ABC", 9).unwrap().ptype, PayloadType::File);
     }
 
     #[test]

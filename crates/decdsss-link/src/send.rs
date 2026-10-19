@@ -16,7 +16,7 @@
 use crate::erasure::{self, MAX_BLOCKS};
 use decdsss_core::{Mode, Profile};
 use decdsss_phy::framing::{Header, Layout, PayloadType};
-use decdsss_phy::tx::Segment;
+use decdsss_phy::tx::{Segment, lead_chips};
 
 /// Bytes of frame data ahead of the shard: the ident and the shard count.
 pub const FRAME_META: usize = 4;
@@ -72,16 +72,26 @@ fn frame(ident: u16, count: usize, shard: &[u8]) -> Vec<u8> {
     f
 }
 
-/// Cuts `stream` (a container, or any bytes) into coded frames and the frames
-/// into segments.
-pub fn plan(spec: &SendSpec, stream: &[u8]) -> Result<Plan, String> {
+/// The arithmetic of a plan, without the frames.
+struct Shape {
+    layout: Layout,
+    shard_bytes: usize,
+    /// Data frames.
+    k: usize,
+    /// Coded frames in the first pass.
+    p: usize,
+    passes: usize,
+    per_pass: usize,
+    total: usize,
+}
+
+fn shape(spec: &SendSpec, stream_len: usize) -> Result<Shape, String> {
     let layout = Layout::new(spec.profile, spec.mode, spec.depth);
-    let fb = layout.frame_bytes();
-    let shard_bytes = fb - FRAME_META;
-    if stream.is_empty() {
+    let shard_bytes = layout.frame_bytes() - FRAME_META;
+    if stream_len == 0 {
         return Err("nothing to send".into());
     }
-    let k = stream.len().div_ceil(shard_bytes);
+    let k = stream_len.div_ceil(shard_bytes);
     if k > MAX_BLOCKS {
         return Err(format!(
             "{k} frames is more than a transmission can number: use a faster mode or a smaller file"
@@ -96,6 +106,63 @@ pub fn plan(spec: &SendSpec, stream: &[u8]) -> Result<Plan, String> {
             "{total} frames is more than the {MAX_FRAMES} one transmission can number: fewer passes, less parity, a faster mode or a smaller file"
         ));
     }
+    Ok(Shape {
+        layout,
+        shard_bytes,
+        k,
+        p,
+        passes,
+        per_pass,
+        total,
+    })
+}
+
+/// Blocks a segment carries at most, from the resync interval.
+fn blocks_per_segment(spec: &SendSpec, layout: &Layout) -> usize {
+    ((spec.resync_s / layout.seconds()).floor() as usize).clamp(1, 4095)
+}
+
+/// Seconds of signal a `stream_len`-byte stream takes to send under `spec`:
+/// every block, and the preamble and header of every segment.
+pub fn air_seconds(spec: &SendSpec, stream_len: usize) -> Result<f64, String> {
+    let sh = shape(spec, stream_len)?;
+    let blocks = sh.total.div_ceil(spec.depth);
+    let segments = blocks.div_ceil(blocks_per_segment(spec, &sh.layout));
+    let lead = lead_chips(spec.profile) as f64 / f64::from(spec.profile.chip_rate());
+    Ok(blocks as f64 * sh.layout.seconds() + segments as f64 * lead)
+}
+
+/// The longest stream (container included) that goes in `seconds` of signal
+/// under `spec`; 0 if not even one frame does.
+pub fn max_stream_bytes(spec: &SendSpec, seconds: f64) -> usize {
+    let fits = |n: usize| air_seconds(spec, n).is_ok_and(|t| t <= seconds);
+    if !fits(1) {
+        return 0;
+    }
+    let (mut lo, mut hi) = (1usize, 8usize << 20);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Cuts `stream` (a container, or any bytes) into coded frames and the frames
+/// into segments.
+pub fn plan(spec: &SendSpec, stream: &[u8]) -> Result<Plan, String> {
+    let Shape {
+        layout,
+        shard_bytes,
+        k,
+        p,
+        passes,
+        per_pass,
+        total,
+    } = shape(spec, stream.len())?;
     let mut data = stream.to_vec();
     data.resize(k * shard_bytes, 0);
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(total);
@@ -115,7 +182,7 @@ pub fn plan(spec: &SendSpec, stream: &[u8]) -> Result<Plan, String> {
 
     let block_frames = spec.depth;
     let blocks_total = frames.len().div_ceil(block_frames);
-    let per_segment = ((spec.resync_s / layout.seconds()).floor() as usize).clamp(1, 4095);
+    let per_segment = blocks_per_segment(spec, &layout);
     let mut segments = Vec::new();
     let mut block = 0;
     while block < blocks_total {
@@ -225,6 +292,27 @@ mod tests {
         idents.sort_unstable();
         idents.dedup();
         assert_eq!(idents.len(), n, "every frame of every pass is different");
+    }
+
+    #[test]
+    fn air_time_matches_the_signal_and_the_budget_inverts_it() {
+        let sp = spec(30.0, 0.25, 1);
+        let stream = vec![5u8; 4000];
+        let p = plan(&sp, &stream).unwrap();
+        // The chips of the real segments: the same seconds.
+        let chips: usize = p
+            .segments
+            .iter()
+            .map(|s| decdsss_phy::tx::segment_chips(s).unwrap().len())
+            .sum();
+        let secs = chips as f64 / f64::from(sp.profile.chip_rate());
+        let est = air_seconds(&sp, stream.len()).unwrap();
+        assert!((secs - est).abs() < 1e-6, "{secs} vs {est}");
+        // The largest stream that fits is within one frame of the budget.
+        let n = max_stream_bytes(&sp, 100.0);
+        assert!(air_seconds(&sp, n).unwrap() <= 100.0);
+        assert!(air_seconds(&sp, n + p.shard_bytes).unwrap() > 100.0);
+        assert_eq!(max_stream_bytes(&sp, 0.1), 0);
     }
 
     #[test]

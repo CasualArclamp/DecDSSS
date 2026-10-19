@@ -1,0 +1,16 @@
+# made by CasualArclamp
+[package]
+name = "decdsss-image"
+description = "DecDSSS pictures: scaling and compressing to an air-time budget, progressive JPEG, decoding a picture as it arrives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Decoders for the pictures to send, the received JPEG (zune-jpeg, which decodes a
+# file cut short as far as it goes), the PNG encoder, and scaling. No C code.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif", "tiff"] }
+# Progressive JPEG encoder, pure Rust.
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"] }
