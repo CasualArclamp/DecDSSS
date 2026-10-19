@@ -151,14 +151,24 @@ pub struct App {
     /// `--live-for` has keyed up, and let go.
     live_started: bool,
     live_stopped: bool,
-    /// The last view of each station, kept after its segment ends so the card
-    /// does not flicker away between segments: (profile, call, session).
+    /// The last view of each station, kept for [`STATION_LINGER`] after its
+    /// segment ends so the card does not flicker away between close segments:
+    /// (profile, call, session).
     stations: std::collections::BTreeMap<(usize, String, u8), (ChannelView, Instant)>,
+    /// Channels still open when *Clear decoders* was pressed, as (profile, channel
+    /// id): their cards stay hidden until the channel closes. Ids are not reused,
+    /// so the station's next segment shows again.
+    hidden: std::collections::HashSet<(usize, usize)>,
     /// What the two plots of every station card show (left, right).
     card_plots: [Plot; 2],
     /// The texture of each picture on show and the version it was made from.
     pictures: std::collections::BTreeMap<(String, u8), (u64, TextureHandle)>,
 }
+
+/// How long a station's card stays after its channel closes with the transfer
+/// still incomplete. A finished transfer (every frame in, or the postamble heard)
+/// goes at once.
+const STATION_LINGER: Duration = Duration::from_secs(5);
 
 fn default_out_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")
@@ -287,6 +297,7 @@ impl App {
             live_started: false,
             live_stopped: false,
             stations: Default::default(),
+            hidden: Default::default(),
             card_plots,
             pictures: Default::default(),
         };
@@ -946,19 +957,35 @@ impl App {
                     attempt_card(ui, a, w);
                 }
                 // Open channels, live; stations whose segment has just ended, dimmed.
-                for c in &snap.channels {
+                // A channel cleared while open stays hidden until it closes.
+                self.hidden
+                    .retain(|&(i, id)| i != index || snap.channels.iter().any(|c| c.id == id));
+                let shown: Vec<&ChannelView> = snap
+                    .channels
+                    .iter()
+                    .filter(|c| !self.hidden.contains(&(index, c.id)))
+                    .collect();
+                for c in &shown {
                     self.stations.insert(
                         (index, c.header.call.clone(), c.header.session),
-                        (c.clone(), Instant::now()),
+                        ((*c).clone(), Instant::now()),
                     );
                 }
-                let live: Vec<(String, u8)> = snap
-                    .channels
+                let live: Vec<(String, u8)> = shown
                     .iter()
                     .map(|c| (c.header.call.clone(), c.header.session))
                     .collect();
-                self.stations
-                    .retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(150));
+                // A closed channel's card goes once its transfer is finished, or
+                // when nothing more has come for `STATION_LINGER`.
+                self.stations.retain(|(i, call, session), (_, seen)| {
+                    if *i != index || live.contains(&(call.clone(), *session)) {
+                        return true;
+                    }
+                    let finished = transfers
+                        .iter()
+                        .any(|t| t.call == *call && t.session == *session && (t.done || t.ended));
+                    !finished && seen.elapsed() < STATION_LINGER
+                });
                 let keep: Vec<(ChannelView, bool)> = self
                     .stations
                     .iter()
@@ -1345,6 +1372,21 @@ impl App {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if sh.snapshots.is_empty() {
                         ui.label(RichText::new("Nothing is being received.").weak());
+                    }
+                    // Empties the panel: closed stations go, and open channels are
+                    // hidden until they close (the receiver goes on decoding them).
+                    if ui
+                        .add_enabled(
+                            !self.stations.is_empty(),
+                            egui::Button::new("Clear decoders"),
+                        )
+                        .on_hover_text("Remove every station card; a station shows again when its next segment starts")
+                        .clicked()
+                    {
+                        for ((i, _, _), (v, _)) in &self.stations {
+                            self.hidden.insert((*i, v.id));
+                        }
+                        self.stations.clear();
                     }
                     let snaps = sh.snapshots.clone();
                     for (i, s) in snaps.iter().enumerate() {
