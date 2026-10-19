@@ -3,8 +3,7 @@
 
 A narrowband spread-spectrum modem for amateur radio. It uses direct-sequence
 (DS-PSK) and code-shift-keyed (CSK) spreading inside an SSB voice channel of
-**500 Hz, 2.4 kHz or 3 kHz**, and carries files and pictures (Codec2 voice is
-next). A signal can sit 15 dB under the noise in its own bandwidth and still
+**500 Hz, 2.4 kHz or 3 kHz**, and carries files, pictures and Codec2 speech. A signal can sit 15 dB under the noise in its own bandwidth and still
 decode.
 
 The receiver shows what it is doing, in the style of DecSAT's DVB-CID card:
@@ -78,6 +77,10 @@ cargo run --release -p decdsss-cli -- tx data.bin --call VK2ABC --play "CABLE-A 
 # A picture: scaled and compressed to fit 120 s of signal a pass, as a progressive JPEG
 cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --mode ds8-1/2 --picture --air 120 -o pic.wav
 # rx saves the picture when it is whole, or a partial PNG of what came if it is not
+
+# Speech: a WAV, as Codec2 450 (2k4) or 700C (3k), in the profile's voice mode
+cargo run --release -p decdsss-cli -- tx speech.wav --call VK2ABC --profile 2k4 --voice -o voice.wav
+# rx writes CALL-SESSION.wav (8 kHz speech), or a -partial.wav if frames are missing
 
 # Measure a mode: frame loss against Eb/N0 through the whole receiver
 cargo run --release -p decdsss-cli -- sweep --mode csk64-1/2 --ebn0 2 6 1 --fading moderate --trials 16

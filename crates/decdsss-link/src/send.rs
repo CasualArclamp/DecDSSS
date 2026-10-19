@@ -74,7 +74,6 @@ fn frame(ident: u16, count: usize, shard: &[u8]) -> Vec<u8> {
 
 /// The arithmetic of a plan, without the frames.
 struct Shape {
-    layout: Layout,
     shard_bytes: usize,
     /// Data frames.
     k: usize,
@@ -107,7 +106,6 @@ fn shape(spec: &SendSpec, stream_len: usize) -> Result<Shape, String> {
         ));
     }
     Ok(Shape {
-        layout,
         shard_bytes,
         k,
         p,
@@ -117,19 +115,32 @@ fn shape(spec: &SendSpec, stream_len: usize) -> Result<Shape, String> {
     })
 }
 
-/// Blocks a segment carries at most, from the resync interval.
-fn blocks_per_segment(spec: &SendSpec, layout: &Layout) -> usize {
-    ((spec.resync_s / layout.seconds()).floor() as usize).clamp(1, 4095)
+/// Seconds of signal `total_frames` frames take: every block, and the preamble
+/// and header of every segment.
+pub(crate) fn air_time(p: &Frames, total_frames: usize) -> f64 {
+    let layout = Layout::new(p.profile, p.mode, p.depth);
+    let blocks = total_frames.div_ceil(p.depth);
+    let per_segment = ((p.resync_s / layout.seconds()).floor() as usize).clamp(1, 4095);
+    let segments = blocks.div_ceil(per_segment);
+    let lead = lead_chips(p.profile) as f64 / f64::from(p.profile.chip_rate());
+    blocks as f64 * layout.seconds() + segments as f64 * lead
 }
 
-/// Seconds of signal a `stream_len`-byte stream takes to send under `spec`:
-/// every block, and the preamble and header of every segment.
+/// Seconds of signal a `stream_len`-byte stream takes to send under `spec`.
 pub fn air_seconds(spec: &SendSpec, stream_len: usize) -> Result<f64, String> {
     let sh = shape(spec, stream_len)?;
-    let blocks = sh.total.div_ceil(spec.depth);
-    let segments = blocks.div_ceil(blocks_per_segment(spec, &sh.layout));
-    let lead = lead_chips(spec.profile) as f64 / f64::from(spec.profile.chip_rate());
-    Ok(blocks as f64 * sh.layout.seconds() + segments as f64 * lead)
+    Ok(air_time(
+        &Frames {
+            profile: spec.profile,
+            mode: spec.mode,
+            depth: spec.depth,
+            ptype: spec.ptype,
+            call: &spec.call,
+            session: spec.session,
+            resync_s: spec.resync_s,
+        },
+        sh.total,
+    ))
 }
 
 /// The longest stream (container included) that goes in `seconds` of signal
@@ -151,11 +162,53 @@ pub fn max_stream_bytes(spec: &SendSpec, seconds: f64) -> usize {
     lo
 }
 
+/// What goes in the header of every segment of a transmission.
+pub(crate) struct Frames<'a> {
+    pub profile: Profile,
+    pub mode: Mode,
+    pub depth: usize,
+    pub ptype: PayloadType,
+    pub call: &'a str,
+    pub session: u8,
+    pub resync_s: f64,
+}
+
+/// Cuts frames into segments of whole blocks, a segment lasting about
+/// `resync_s` seconds.
+pub(crate) fn cut_segments(p: &Frames, frames: &[Vec<u8>]) -> Vec<Segment> {
+    let layout = Layout::new(p.profile, p.mode, p.depth);
+    let block_frames = p.depth;
+    let blocks_total = frames.len().div_ceil(block_frames);
+    let per_segment = ((p.resync_s / layout.seconds()).floor() as usize).clamp(1, 4095);
+    let mut segments = Vec::new();
+    let mut block = 0;
+    while block < blocks_total {
+        let n = per_segment.min(blocks_total - block);
+        let from = block * block_frames;
+        let to = ((block + n) * block_frames).min(frames.len());
+        segments.push(Segment {
+            header: Header {
+                profile: p.profile,
+                mode: p.mode,
+                depth: p.depth,
+                ptype: p.ptype,
+                call: p.call.to_string(),
+                session: p.session,
+                frame0: from as u16,
+                nblocks: n as u16,
+                total_frames: frames.len() as u16,
+            },
+            frames: frames[from..to].to_vec(),
+        });
+        block += n;
+    }
+    segments
+}
+
 /// Cuts `stream` (a container, or any bytes) into coded frames and the frames
 /// into segments.
 pub fn plan(spec: &SendSpec, stream: &[u8]) -> Result<Plan, String> {
     let Shape {
-        layout,
         shard_bytes,
         k,
         p,
@@ -180,31 +233,18 @@ pub fn plan(spec: &SendSpec, stream: &[u8]) -> Result<Plan, String> {
     }
     debug_assert_eq!(frames.len(), total);
 
-    let block_frames = spec.depth;
-    let blocks_total = frames.len().div_ceil(block_frames);
-    let per_segment = blocks_per_segment(spec, &layout);
-    let mut segments = Vec::new();
-    let mut block = 0;
-    while block < blocks_total {
-        let n = per_segment.min(blocks_total - block);
-        let from = block * block_frames;
-        let to = ((block + n) * block_frames).min(frames.len());
-        segments.push(Segment {
-            header: Header {
-                profile: spec.profile,
-                mode: spec.mode,
-                depth: spec.depth,
-                ptype: spec.ptype,
-                call: spec.call.clone(),
-                session: spec.session,
-                frame0: from as u16,
-                nblocks: n as u16,
-                total_frames: frames.len() as u16,
-            },
-            frames: frames[from..to].to_vec(),
-        });
-        block += n;
-    }
+    let segments = cut_segments(
+        &Frames {
+            profile: spec.profile,
+            mode: spec.mode,
+            depth: spec.depth,
+            ptype: spec.ptype,
+            call: &spec.call,
+            session: spec.session,
+            resync_s: spec.resync_s,
+        },
+        &frames,
+    );
     Ok(Plan {
         segments,
         data_frames: k,

@@ -5,12 +5,14 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_chan::{Channel, Watterson};
+use decdsss_codec2::Mode as Codec;
 use decdsss_core::{Mode, Profile};
-use decdsss_link::{Assembler, SendSpec, container, max_stream_bytes, plan};
+use decdsss_link::voice::default_codec;
+use decdsss_link::{Assembler, SendSpec, VoiceSpec, container, max_stream_bytes, plan, plan_voice};
 use decdsss_phy::codes::{normalise_call, own_code};
 use decdsss_phy::framing::{Layout, PayloadType};
 use decdsss_phy::rx::{Event, MultiReceiver};
-use decdsss_phy::tx::{chips_to_audio, segment_chips};
+use decdsss_phy::tx::{Segment, chips_to_audio, segment_chips};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -45,8 +47,9 @@ enum Command {
         #[arg(long, default_value = "2k4")]
         profile: String,
         /// Mode, for example ds8-1/2, ds4-2/3, csk64-1/2 (see `decdsss modes`).
-        #[arg(long, default_value = "ds8-1/2")]
-        mode: String,
+        /// Default ds8-1/2; for --voice, the voice mode of the profile.
+        #[arg(long)]
+        mode: Option<String>,
         /// Codewords per block: 1, 2, 4 or 8. Deeper rides out longer fades.
         #[arg(long, default_value_t = 4)]
         depth: usize,
@@ -63,8 +66,14 @@ enum Command {
         repeat: usize,
         /// Send the file as a picture: scaled and compressed to a progressive JPEG
         /// that fits --air seconds (a pass), drawn on the receiver as it arrives.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "voice")]
         picture: bool,
+        /// Send a WAV recording as speech: Codec2 450 on 2k4, 700C on 3k.
+        #[arg(long)]
+        voice: bool,
+        /// With --voice, the Codec2 mode: 450 or 700C (default from the profile).
+        #[arg(long)]
+        codec: Option<String>,
         /// With --picture, seconds of signal one pass may take.
         #[arg(long, default_value_t = 120.0)]
         air: f64,
@@ -191,6 +200,8 @@ fn main() -> Result<()> {
             parity,
             repeat,
             picture,
+            voice,
+            codec,
             air,
             min_quality,
             save_jpeg,
@@ -205,16 +216,22 @@ fn main() -> Result<()> {
             &file,
             &call,
             &profile,
-            &mode,
+            mode.as_deref(),
             depth,
             resync,
             parity,
             repeat,
-            picture.then_some(PictureOpts {
-                air,
-                min_quality,
-                save_jpeg,
-            }),
+            if voice {
+                Payload::Voice(VoiceOpts { codec })
+            } else if picture {
+                Payload::Picture(PictureOpts {
+                    air,
+                    min_quality,
+                    save_jpeg,
+                })
+            } else {
+                Payload::File
+            },
             session,
             rate,
             level,
@@ -334,12 +351,12 @@ fn tx(
     file: &Path,
     call: &str,
     profile: &str,
-    mode: &str,
+    mode: Option<&str>,
     depth: usize,
     resync: f64,
     parity: f64,
     repeat: usize,
-    picture: Option<PictureOpts>,
+    payload: Payload,
     session: Option<u8>,
     rate: u32,
     level: f32,
@@ -352,7 +369,13 @@ fn tx(
         bail!("give -o FILE.wav to write the audio and/or --play DEVICE to play it");
     }
     let profile = parse_profile(profile)?;
-    let mode = Mode::from_name(mode).with_context(|| format!("unknown mode {mode:?}"))?;
+    let mode = match (mode, &payload) {
+        (Some(m), _) => Mode::from_name(m).with_context(|| format!("unknown mode {m:?}"))?,
+        (None, Payload::Voice(_)) => {
+            Mode::voice(profile).context("500 Hz is too slow for voice: use --profile 2k4 or 3k")?
+        }
+        (None, _) => Mode::from_name("ds8-1/2").expect("the default mode exists"),
+    };
     let call = normalise_call(call).with_context(|| {
         format!("{call:?} is not a callsign this modem can send (A-Z, 0-9 and /, up to 9)")
     })?;
@@ -370,51 +393,85 @@ fn tx(
             .map_or(0, |d| d.as_secs());
         (t % 64) as u8
     });
-    let spec = SendSpec {
-        profile,
-        mode,
-        depth,
-        call: call.clone(),
-        session: session & 63,
-        ptype: if picture.is_some() {
-            PayloadType::Picture
-        } else {
-            PayloadType::File
-        },
-        resync_s: resync,
-        parity: parity / 100.0,
-        passes: repeat.max(1),
-    };
-    let data = match &picture {
-        Some(opts) => {
-            let (picture_name, jpeg) = prepare_picture(file, &spec, opts)?;
-            name = picture_name;
-            jpeg
-        }
-        None => std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?,
-    };
-    let stream = container::pack(&name, &data);
-    let plan = plan(&spec, &stream).map_err(anyhow::Error::msg)?;
-    let segs = &plan.segments;
     let layout = Layout::new(profile, mode, depth);
+    let (segs, summary): (Vec<Segment>, String) = if let Payload::Voice(v) = &payload {
+        let codec = match &v.codec {
+            Some(c) => Codec::from_name(c)
+                .with_context(|| format!("unknown Codec2 mode {c:?}: use 450 or 700C"))?,
+            None => default_codec(profile)
+                .context("500 Hz is too slow for voice: use --profile 2k4 or 3k")?,
+        };
+        let speech = load_speech(file)?;
+        let vs = VoiceSpec {
+            profile,
+            mode,
+            depth,
+            call: call.clone(),
+            session: session & 63,
+            codec,
+            resync_s: resync,
+        };
+        let p = plan_voice(&vs, &speech).map_err(anyhow::Error::msg)?;
+        let summary = format!(
+            "{name}: {:.1} s of speech as Codec2 {codec} → {} frames of {} bytes ({} codec frames each), {} segment(s), {:.0} s of signal; the payload runs at {:.2}× the codec's rate, {} {} depth {depth}",
+            p.speech_seconds,
+            p.frames,
+            layout.frame_bytes(),
+            p.per_frame,
+            p.segments.len(),
+            p.air_seconds,
+            p.throughput_ratio,
+            profile.label(),
+            mode,
+        );
+        (p.segments, summary)
+    } else {
+        let spec = SendSpec {
+            profile,
+            mode,
+            depth,
+            call: call.clone(),
+            session: session & 63,
+            ptype: if matches!(payload, Payload::Picture(_)) {
+                PayloadType::Picture
+            } else {
+                PayloadType::File
+            },
+            resync_s: resync,
+            parity: parity / 100.0,
+            passes: repeat.max(1),
+        };
+        let data = match &payload {
+            Payload::Picture(opts) => {
+                let (picture_name, jpeg) = prepare_picture(file, &spec, opts)?;
+                name = picture_name;
+                jpeg
+            }
+            _ => std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?,
+        };
+        let stream = container::pack(&name, &data);
+        let plan = plan(&spec, &stream).map_err(anyhow::Error::msg)?;
+        let summary = format!(
+            "{}: {} bytes → {} data + {} coded frames in the first pass ({} pass(es), {} frames of {} bytes in all, {} segment(s)), {} {} depth {depth}",
+            name,
+            data.len(),
+            plan.data_frames,
+            plan.coded_first_pass,
+            plan.passes,
+            plan.frames(),
+            layout.frame_bytes(),
+            plan.segments.len(),
+            profile.label(),
+            mode,
+        );
+        (plan.segments, summary)
+    };
     let mut chips = Vec::new();
-    for s in segs {
+    for s in &segs {
         chips.extend(segment_chips(s).context("cannot build the header")?);
     }
     let audio = chips_to_audio(&chips, profile, f64::from(rate), level, lead, tail);
-    println!(
-        "{}: {} bytes → {} data + {} coded frames in the first pass ({} pass(es), {} frames of {} bytes in all, {} segment(s)), {} {} depth {depth}",
-        name,
-        data.len(),
-        plan.data_frames,
-        plan.coded_first_pass,
-        plan.passes,
-        plan.frames(),
-        layout.frame_bytes(),
-        segs.len(),
-        profile.label(),
-        mode,
-    );
+    println!("{summary}");
     let secs = audio.len() as f64 / f64::from(rate);
     if let Some(output) = output {
         let peak = wav::write(output, &audio, rate)?;
@@ -428,6 +485,40 @@ fn tx(
         play_audio(&audio, rate, dev)?;
     }
     Ok(())
+}
+
+/// What `tx` sends.
+enum Payload {
+    File,
+    Picture(PictureOpts),
+    Voice(VoiceOpts),
+}
+
+/// What `tx --voice` was asked for.
+struct VoiceOpts {
+    codec: Option<String>,
+}
+
+/// Loads a recording as 8 kHz mono speech, its peak brought to 80 % of full scale
+/// (at most 30 dB of gain, so a silent file stays quiet).
+fn load_speech(file: &Path) -> Result<Vec<i16>> {
+    let (audio, rate) =
+        wav::read(file).with_context(|| format!("cannot read {}", file.display()))?;
+    let x = decdsss_dsp::resample::resample_real(&audio, f64::from(rate), 8000.0, 3500.0, 4000.0);
+    let peak = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    if peak < 1e-4 {
+        bail!("{} is silent", file.display());
+    }
+    let gain = (0.8 / peak).min(31.6);
+    Ok(x.iter().map(|&v| (v * gain * 32767.0) as i16).collect())
+}
+
+/// Writes 8 kHz speech as a WAV in `dir` under a name not already taken.
+fn write_speech(dir: &Path, name: &str, speech: &[i16]) -> Result<PathBuf> {
+    let path = unique(dir, name);
+    let audio: Vec<f32> = speech.iter().map(|&v| f32::from(v) / 32768.0).collect();
+    wav::write(&path, &audio, 8000)?;
+    Ok(path)
 }
 
 /// What `tx --picture` was asked for.
@@ -606,7 +697,27 @@ impl RxRun {
                             result.freq_hz
                         );
                     }
-                    if let Some(f) = self.asm.push(&header, &result) {
+                    let file = self.asm.push(&header, &result);
+                    for v in self.asm.take_voice() {
+                        match write_speech(
+                            &self.out_dir,
+                            &format!("{}-{}.wav", v.call, v.session),
+                            &v.speech,
+                        ) {
+                            Ok(path) => {
+                                self.files += 1;
+                                println!(
+                                    "[{t:7.1}s] VOICE from {} ({:.1} s of Codec2 {} speech) → {}",
+                                    v.call,
+                                    v.speech.len() as f64 / 8000.0,
+                                    v.codec,
+                                    path.display()
+                                );
+                            }
+                            Err(e) => println!("cannot write the speech: {e}"),
+                        }
+                    }
+                    if let Some(f) = file {
                         let path = unique(&self.out_dir, &sanitize(&f.name));
                         match std::fs::write(&path, &f.data) {
                             Ok(()) => {
@@ -640,6 +751,27 @@ impl RxRun {
             self.headers, self.frames_ok, self.frames_bad, self.files
         );
         for (call, session) in &self.open {
+            if let Some(vp) = self.asm.voice_progress(call, *session)
+                && vp.have < vp.total
+                && let Some((speech, _)) = self.asm.voice_speech(call, *session)
+            {
+                println!(
+                    "{call} session {session}: {} of the {} speech frames, not complete",
+                    vp.have, vp.total
+                );
+                match write_speech(
+                    &self.out_dir,
+                    &format!("{call}-{session}-partial.wav"),
+                    &speech,
+                ) {
+                    Ok(path) => println!(
+                        "  the speech so far ({:.1} s, silence where frames are missing) → {}",
+                        speech.len() as f64 / 8000.0,
+                        path.display()
+                    ),
+                    Err(e) => println!("  cannot write the partial speech: {e}"),
+                }
+            }
             if let Some(p) = self.asm.progress(call, *session)
                 && p.have < p.need
             {

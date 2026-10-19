@@ -1,0 +1,13 @@
+# made by CasualArclamp
+[package]
+name = "decdsss-codec2"
+description = "Codec2 (David Rowe, LGPL-2.1) vendored C core, with a safe wrapper: 700C and 450 for narrowband voice"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later AND LGPL-2.1-only"
+repository.workspace = true
+rust-version.workspace = true
+links = "codec2"
+
+[build-dependencies]
+cc = "1"

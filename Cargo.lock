@@ -621,10 +621,19 @@ dependencies = [
  "clap",
  "decdsss-audio",
  "decdsss-chan",
+ "decdsss-codec2",
  "decdsss-core",
+ "decdsss-dsp",
  "decdsss-image",
  "decdsss-link",
  "decdsss-phy",
+]
+
+[[package]]
+name = "decdsss-codec2"
+version = "0.0.1"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -677,6 +686,7 @@ name = "decdsss-link"
 version = "0.0.1"
 dependencies = [
  "decdsss-chan",
+ "decdsss-codec2",
  "decdsss-core",
  "decdsss-fec",
  "decdsss-image",

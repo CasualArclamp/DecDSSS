@@ -5,6 +5,8 @@
 use crate::container;
 use crate::erasure::Decoder;
 use crate::send::FRAME_META;
+use crate::voice;
+use decdsss_codec2::Mode as Codec;
 use decdsss_phy::framing::{Header, PayloadType};
 use decdsss_phy::rx::payload::BlockResult;
 use std::collections::BTreeMap;
@@ -47,10 +49,42 @@ struct Transfer {
     ptype: PayloadType,
 }
 
+/// A speech transmission that has arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedVoice {
+    pub call: String,
+    pub session: u8,
+    pub codec: Codec,
+    /// 8 kHz mono speech; the frames that never came are silence.
+    pub speech: Vec<i16>,
+    /// Frames of the transmission that never came.
+    pub lost: usize,
+}
+
+/// How far a speech transmission has got.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceProgress {
+    pub codec: Codec,
+    pub have: usize,
+    pub total: usize,
+    /// Which frames are in, by frame number.
+    pub map: Vec<bool>,
+}
+
+struct VoiceTransfer {
+    codec: Codec,
+    total: usize,
+    /// Data of each frame that has arrived, by frame number.
+    frames: BTreeMap<usize, Vec<u8>>,
+    done: bool,
+}
+
 /// Gathers frames by (callsign, session).
 #[derive(Default)]
 pub struct Assembler {
     transfers: BTreeMap<(String, u8), Transfer>,
+    voices: BTreeMap<(String, u8), VoiceTransfer>,
+    finished_voice: Vec<ReceivedVoice>,
 }
 
 impl Assembler {
@@ -58,8 +92,14 @@ impl Assembler {
         Assembler::default()
     }
 
-    /// Takes a decoded block; returns the file if this block completed it.
+    /// Takes a decoded block; returns the file if this block completed it. A
+    /// speech transmission is gathered too, and handed over by
+    /// [`Assembler::take_voice`] when it is whole.
     pub fn push(&mut self, header: &Header, block: &BlockResult) -> Option<ReceivedFile> {
+        if let Some(codec) = voice::codec_of(header.ptype) {
+            self.push_voice(header, block, codec);
+            return None;
+        }
         let key = (header.call.clone(), header.session);
         let mut finished = None;
         for data in block.frames.iter().flatten() {
@@ -117,6 +157,78 @@ impl Assembler {
             }
         }
         finished
+    }
+
+    fn push_voice(&mut self, header: &Header, block: &BlockResult, codec: Codec) {
+        let key = (header.call.clone(), header.session);
+        let total = usize::from(header.total_frames);
+        // A different transmission under the same call and session starts over.
+        if self
+            .voices
+            .get(&key)
+            .is_some_and(|v| v.total != total || v.codec != codec)
+        {
+            self.voices.remove(&key);
+        }
+        let v = self
+            .voices
+            .entry(key.clone())
+            .or_insert_with(|| VoiceTransfer {
+                codec,
+                total,
+                frames: BTreeMap::new(),
+                done: false,
+            });
+        for (k, f) in block.frames.iter().enumerate() {
+            let at = block.first_frame + k;
+            if let Some(data) = f
+                && at < total
+            {
+                v.frames.entry(at).or_insert_with(|| data.clone());
+            }
+        }
+        if !v.done && v.frames.len() == total {
+            v.done = true;
+            let (speech, lost) = Self::render(v);
+            self.finished_voice.push(ReceivedVoice {
+                call: key.0,
+                session: key.1,
+                codec,
+                speech,
+                lost,
+            });
+        }
+    }
+
+    fn render(v: &VoiceTransfer) -> (Vec<i16>, usize) {
+        let frames: Vec<Option<&[u8]>> = (0..v.total)
+            .map(|i| v.frames.get(&i).map(Vec::as_slice))
+            .collect();
+        voice::render_speech(v.codec, &frames)
+    }
+
+    /// Speech transmissions that have become whole since the last call.
+    pub fn take_voice(&mut self) -> Vec<ReceivedVoice> {
+        std::mem::take(&mut self.finished_voice)
+    }
+
+    /// Progress of a speech transmission, if any frame of it has arrived.
+    pub fn voice_progress(&self, call: &str, session: u8) -> Option<VoiceProgress> {
+        let v = self.voices.get(&(call.to_string(), session))?;
+        Some(VoiceProgress {
+            codec: v.codec,
+            have: v.frames.len(),
+            total: v.total,
+            map: (0..v.total).map(|i| v.frames.contains_key(&i)).collect(),
+        })
+    }
+
+    /// The speech of a transmission so far, with silence for the frames that
+    /// have not arrived (and for those after the last one that has), and how
+    /// many frames are missing.
+    pub fn voice_speech(&self, call: &str, session: u8) -> Option<(Vec<i16>, usize)> {
+        let v = self.voices.get(&(call.to_string(), session))?;
+        Some(Self::render(v))
     }
 
     /// Progress of a transmission, if any frame of it has arrived.

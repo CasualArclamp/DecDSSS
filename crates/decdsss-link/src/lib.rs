@@ -10,6 +10,8 @@ pub mod assemble;
 pub mod container;
 pub mod erasure;
 pub mod send;
+pub mod voice;
 
-pub use assemble::{Assembler, Front, Progress, ReceivedFile};
+pub use assemble::{Assembler, Front, Progress, ReceivedFile, ReceivedVoice, VoiceProgress};
 pub use send::{Plan, SendSpec, air_seconds, max_stream_bytes, plan, segments};
+pub use voice::{VoicePlan, VoiceSpec, plan_voice};

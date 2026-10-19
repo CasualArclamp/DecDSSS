@@ -215,6 +215,45 @@ mod tests {
         }
     }
 
+    /// DS4 on the moderate channel loses a block now and then at any SNR: hunts
+    /// the seeds.
+    #[test]
+    #[ignore]
+    fn debug_ds4_floor() {
+        let mode = std::env::var("DEBUG_MODE").unwrap_or_else(|_| "ds4-2/3".into());
+        let base = Scenario {
+            profile: Profile::W2400,
+            mode: Mode::from_name(&mode).unwrap(),
+            depth: 2,
+            nblocks: 4,
+            segments: 1,
+            ebn0_db: 30.0,
+            fading: Some(Watterson::MODERATE),
+            offset_hz: 5.0,
+            clock_ppm: 10.0,
+            seed: 1000,
+        };
+        let mut found = 0;
+        for t in 0..200usize {
+            let mut s = base.clone();
+            s.seed = base.seed + t as u64;
+            s.offset_hz = base.offset_hz + (t % 7) as f64 * 2.0 - 6.0;
+            s.clock_ppm = base.clock_ppm + (t % 5) as f64 * 15.0 - 30.0;
+            let o = run(&s);
+            if o.frames_ok < o.frames_total {
+                println!(
+                    "trial {t}: seed {} offset {} clock {}: {}/{}",
+                    s.seed, s.offset_hz, s.clock_ppm, o.frames_ok, o.frames_total
+                );
+                run_verbose(&s);
+                found += 1;
+                if found == 3 {
+                    break;
+                }
+            }
+        }
+    }
+
     fn run_verbose(sc: &Scenario) {
         let layout = Layout::new(sc.profile, sc.mode, sc.depth);
         let n = usize::from(sc.nblocks) * sc.depth;

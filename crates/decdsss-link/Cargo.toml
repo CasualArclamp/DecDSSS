@@ -1,7 +1,7 @@
 # made by CasualArclamp
 [package]
 name = "decdsss-link"
-description = "DecDSSS link layer: file container, sender planning and receive-side assembly"
+description = "DecDSSS link layer: file container, voice framing, sender planning and receive-side assembly"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+decdsss-codec2 = { path = "../decdsss-codec2" }
 decdsss-core = { path = "../decdsss-core" }
 decdsss-fec = { path = "../decdsss-fec" }
 decdsss-phy = { path = "../decdsss-phy" }

@@ -279,13 +279,37 @@ CRC-16 (headers) and CRC-32 (payload frames).
   Examples (a 797×1200 photograph, 120 s a pass, 25 % coded frames): DS4 ¾ on
   2.4 kHz gives 147×222 at quality 48 in 5319 bytes, DS8 ½ gives 62×93 at 47 in
   1576 bytes.
-- **Voice** (M4): Codec2 (450 on `2k4`, 700C on `3k`), streamed in PTT overs with
-  a short interleaver. Codecs run off the real-time loop (voicemodem's lesson).
-  **Open:** the pure-Rust `codec2` crate voicemodem uses (0.3.1) has no 700C or
-  450 modes; its slowest is 1200 bit/s. The options are to build the C
-  libcodec2 (LGPL-2.1, CMake, as a submodule like DecSAT's libopus), to port
-  700C/450 to Rust, or to run Codec2 1200 at SF 2 (≈3 dB processing gain).
-  Rory's call before M4.
+- **Voice** (M4, link layer and CLI done): Codec2 450 on `2k4`, 700C on `3k`, in
+  the mode `Mode::voice` names (DS4 ⅔ and DS4 ¾), as store-and-forward "overs": a
+  recording is compressed, sent, and the receiver rebuilds the speech.
+  - *Codec.* The pure-Rust `codec2` crate (0.3.1) has no 700C or 450 and upstream
+    removed 450 in July 2023, so `decdsss-codec2` vendors the C core of the last
+    commit that had it (9f5e2de), compiled with `cc` (no CMake, MSVC and gcc),
+    with variable-length arrays turned into a portable macro (MSVC has none) and
+    the codebooks pre-generated (README in the crate, `vendor_codec2.py` to
+    redo it). LGPL-2.1, linked into a GPL-3.0-or-later program; relinking is
+    possible since it builds from source. Modes 3200–1200 are there too.
+  - *Framing.* The payload type says the codec (`Voice` = 700C, `Voice450`). The
+    codec's frames are packed back to back as bits, a whole number to a modem
+    frame (92 bytes at DS4 ⅔ hold 40 frames of 450, 18 bits each; 104 bytes at
+    DS4 ¾ hold 29 frames of 700C), so a modem frame that does not decode is a
+    silent gap of known length (1.6 s at 450, 1.2 s at 700C) and the next one
+    starts on a codec frame. The header's frame number puts a frame in time, so a
+    listener who joins at a later segment hears the rest. No erasure coding or
+    ARQ for voice: LDPC and the interleaver only.
+  - *Rate.* A modem frame carries 720 bits of speech in 1.37 s of signal at DS4 ⅔
+    on 2.4 kHz, 1.17 times the codec's 450 bit/s (1.05 at 700C on 3 kHz, 29 × 28
+    bits per 1.10 s block of DS4 ¾). The payload therefore keeps up with the
+    speech, but only just, and a 12 s preamble and header come first: a live
+    stream would need a listener's buffer of about a minute to ride out one
+    resync. So this is store-and-forward: a 10 s recording is 23 s of signal
+    (12 s of preamble and header, then the payload).
+  - *Receive.* `Assembler` gathers voice by (call, session) like files; the speech
+    so far can be rendered at any time (`voice_speech`: silence where frames are
+    missing) and the whole is handed over when every frame is in (`take_voice`).
+    The CLI writes `CALL-SESSION.wav` (8 kHz) and a `-partial.wav` for a
+    transmission that did not finish.
+  - *Not yet:* live (streamed) voice, GUI record/play, VOX tone and CAT keying.
 - **ARQ** (M5): a connected mode for files on both stations' own codes, with
   selective repeat and ACK bitmaps sent at a robust mode.
 
@@ -344,6 +368,7 @@ silent.
 | `decdsss-phy` | Codes, framing, the transmitter, the receiver (search, preamble, header, payload, refinement), the end-to-end simulator. |
 | `decdsss-chan` | Channel simulator: AWGN, carrier offset and drift, clock error, Watterson fading with the CCIR presets. |
 | `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes, air time and byte budget), receive-side assembly (and the readable front of a file still arriving). |
+| `decdsss-codec2` | Codec2 (vendored C core, LGPL-2.1) with a safe wrapper: modes 3200 … 450, bit-exact frame packing. |
 | `decdsss-image` | Pictures: load, scale and compress to a byte budget as a progressive JPEG; decode one that is cut short. |
 | `decdsss-audio` | Sound-card capture and playback (cpal) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
 | `decdsss-rig` | CAT keying (M4). |
@@ -365,7 +390,8 @@ silent.
 - **M3** — pictures: progressive JPEG sized by air time, drawn as it arrives, in
   the CLI (`tx --picture --air`, a partial PNG saved by `rx` for a picture that
   did not finish) and the GUI. *Done* (see Verification).
-- **M4** — voice, VOX/manual PTT, CAT keying.
+- **M4** — voice, VOX/manual PTT, CAT keying. Link layer and CLI (`tx --voice`,
+  `rx` writes the speech) *done*; GUI, VOX and CAT to do.
 - **M5** — ARQ connected mode.
 - **M6** — polish and the first release (portable exes), when Rory says so.
 
@@ -454,6 +480,31 @@ symbols, which puts a floor under the symbol SNR that more signal does not lift
 (the blocks of the lost segment report 0–10 dB symbol SNR at 25 dB in-band). Use
 SF 8 or more, or CSK, on skywave until this is looked into (an equaliser or a
 decision-feedback step would be the cure if the fast modes matter on HF).
+
+### Voice
+
+An 11.2 s clip of real speech (Codec2's `ve9qrp_10s` sample) sent with
+`tx --voice` at DS4 ⅔ on 2.4 kHz, depth 2: 7 frames, 23 s of signal; received
+through AWGN at 6 dB in-band with all frames, as speech of the same length. Both
+voice modes (450 on 2.4 kHz, 700C on 3 kHz) run through the simulator with noise,
+offset and clock error in `crates/decdsss-link/tests/voice.rs`.
+
+On the Watterson channels (12 and 20 dB in-band SNR, six seeds each): *good*
+12 of 12 transmissions complete; *moderate* 10 of 12 (seed 5 lost one block, two
+frames, at both SNRs).
+
+**The DS4 floor.** The loss at high SNR is not noise. Over 64 transmissions at
+24 and at 30 dB Eb/N0 on the moderate channel (`decdsss sweep … --trials 64`),
+DS4 ⅔ lost 0.39 % of its frames (one block, at either SNR), DS4 ¾ 0.59 %, and DS8 ½
+nothing. The payload's symbol SNR on that channel is 2–12 dB even where the
+header reads 22–26 dB: two comparable paths 2 chips apart at spreading factor 4
+interfere with each other (about 1/SF of a path's power lands in the other's
+despreading window as noise, so the symbol SNR cannot pass roughly SF/ρ, 6–9 dB
+for two paths of power ratio ρ ≈ 0.5–1), and rate-⅔ LDPC needs about 4 dB. More
+power does not lift it; a chip-level equaliser or multipath interference
+cancellation would. That is next, because voice needs the fast modes.
+(`cargo test --release -p decdsss-phy debug_ds4_floor -- --ignored --nocapture`
+finds failing seeds.)
 
 ### Not yet measured
 

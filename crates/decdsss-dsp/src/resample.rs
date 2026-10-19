@@ -67,6 +67,11 @@ impl Resampler {
         }
     }
 
+    /// Input samples of zeros that flush the last output samples out.
+    pub fn tail_len(&self) -> usize {
+        self.half + 1
+    }
+
     /// Delay through the filter, output samples.
     pub fn delay_out(&self) -> f64 {
         self.half as f64 / self.step
@@ -104,6 +109,29 @@ impl Resampler {
             }
         }
     }
+}
+
+/// Resamples real audio from `in_rate` to `out_rate`, passing up to `pass_hz` and
+/// stopping from `stop_hz` (both below the lower of the two Nyquist rates). The
+/// output is as long as the input is, in time, and lines up with it.
+pub fn resample_real(
+    x: &[f32],
+    in_rate: f64,
+    out_rate: f64,
+    pass_hz: f64,
+    stop_hz: f64,
+) -> Vec<f32> {
+    if (in_rate - out_rate).abs() < 1e-9 {
+        return x.to_vec();
+    }
+    let mut r = Resampler::new(in_rate, out_rate, pass_hz, stop_hz);
+    let mut out: Vec<Iq> = Vec::new();
+    let input: Vec<Iq> = x.iter().map(|&v| Iq::new(v, 0.0)).collect();
+    r.process(&input, &mut out);
+    r.process(&vec![Iq::new(0.0, 0.0); r.tail_len()], &mut out);
+    let want = (x.len() as f64 * out_rate / in_rate).round() as usize;
+    out.truncate(want);
+    out.into_iter().map(|c| c.re).collect()
 }
 
 /// Modified Bessel function of the first kind, order 0 (power series).
