@@ -56,6 +56,37 @@ pub enum Event {
     SegmentEnd { channel: usize },
 }
 
+/// What one open payload channel shows.
+#[derive(Clone, Debug)]
+pub struct ChannelView {
+    pub id: usize,
+    pub header: Header,
+    pub blocks_done: usize,
+    pub live: payload::Live,
+    pub carrier_hz: f64,
+}
+
+/// What a candidate preamble shows.
+#[derive(Clone, Debug)]
+pub struct AttemptView {
+    pub freq_hz: f64,
+    /// True once the preamble has ended and the header is being decoded.
+    pub header_stage: bool,
+    /// Per-period correlation power of A and of B (once the preamble ended).
+    pub periods: Vec<(f32, f32)>,
+}
+
+/// Everything a display needs from one receiver.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub profile: Profile,
+    pub samples_in: u64,
+    /// The acquisition search surface, if the search has seen a window.
+    pub search: Option<acq::Surface>,
+    pub attempts: Vec<AttemptView>,
+    pub channels: Vec<ChannelView>,
+}
+
 /// Events with the profile they came from.
 #[derive(Clone, Debug)]
 pub struct Tagged {
@@ -124,6 +155,38 @@ impl Receiver {
     /// Open payload channels.
     pub fn channels(&self) -> usize {
         self.channels.len()
+    }
+
+    /// The state for a display; cheap enough to take a few times a second.
+    pub fn snapshot(&self, search_cols: usize) -> Snapshot {
+        Snapshot {
+            profile: self.profile,
+            samples_in: self.samples_in,
+            search: self.acq.preview(search_cols),
+            attempts: self
+                .attempts
+                .iter()
+                .map(|a| AttemptView {
+                    freq_hz: a.freq_hz,
+                    header_stage: matches!(a.step, Step::Header(_)),
+                    periods: match &a.step {
+                        Step::Header(l) => l.periods.clone(),
+                        Step::Preamble(_) => Vec::new(),
+                    },
+                })
+                .collect(),
+            channels: self
+                .channels
+                .iter()
+                .map(|c| ChannelView {
+                    id: c.id,
+                    header: c.rx.header.clone(),
+                    blocks_done: c.rx.blocks_done(),
+                    live: c.rx.live().clone(),
+                    carrier_hz: c.rx.track.freq,
+                })
+                .collect(),
+        }
     }
 
     /// Feeds audio; returns the events it caused.
@@ -276,6 +339,10 @@ impl MultiReceiver {
                 .map(|&p| Receiver::new(p, sample_rate))
                 .collect(),
         }
+    }
+
+    pub fn snapshots(&self, search_cols: usize) -> Vec<Snapshot> {
+        self.rx.iter().map(|r| r.snapshot(search_cols)).collect()
     }
 
     pub fn push(&mut self, audio: &[f32]) -> Vec<Tagged> {

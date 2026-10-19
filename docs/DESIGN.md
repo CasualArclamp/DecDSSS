@@ -148,18 +148,53 @@ stronger than the processing gain masks a weak one.
 
 ### Receiver chain
 
-Audio at the device rate goes through a resampler to complex baseband at 4
-samples/chip around the profile centre. Every profile is searched at once.
+One receiver per profile, all on the same audio. The front end mixes the audio
+down by the profile's centre, resamples to four samples a chip (a polyphase
+sinc, 70 dB down at the mixing image) and applies the root-raised-cosine matched
+filter, normalised so a chip comes out at its own amplitude.
 
-1. **Acquisition** — FFT circular correlation of the call-code preambles across
-   frequency bins (±100 Hz on `2k4`/`3k`, ±25 Hz on `500`), noncoherent
-   accumulation over periods, and a CFAR threshold.
-2. **Tracking** — a code DLL (early/prompt/late), carrier frequency tracking from
-   pilots (DS) or from successive CSK peaks, and rake fingers on the paths the
-   channel profile shows.
-3. **Demodulation and decoding** — header decode, then per-channel payload
-   demodulation, deinterleaving, LDPC decoding (normalised min-sum) and the
-   payload layer.
+1. **Search** (never stops, whatever else is open) — FFT circular correlation of
+   the preamble's sequence A across frequency (half-bin steps, ±100 Hz, the
+   half-bin ones from a second FFT of the window times e^{-jπn/N}), each window
+   scaled by its own median, the last three to eight summed, a gamma-tail
+   threshold from a false-alarm rate of 10⁻⁴ a window, and two more windows
+   allowed to settle after the first crossing. Normalising each window matters:
+   a fading signal changes the level between windows and, unnormalised,
+   fattened the sum's tail to six false alarms a minute on payload alone.
+2. **Candidates** — up to four preamble candidates in flight at once; a false
+   alarm dies on its own and cannot block a real preamble. Each period of the
+   preamble is correlated coherently with A and B at early, prompt and late
+   timing; a loop follows the boundary, periods with no signal in them are
+   ignored (the search window starts early), the pattern A…A B B is found from a
+   per-period score that needs no noise estimate, and a line through the period
+   boundaries gives the clock and the header start.
+3. **Header** — 64 CSK256 symbols on the call code, the rake fingers from the
+   preamble's delay profile, a log-Bessel noncoherent metric, de-interleave, LDPC.
+   Once decoded, its chips are known exactly, and they are used to refine timing,
+   clock and carrier (a quarter second at a time over a fine lag grid, following
+   the timing from segment to segment) and to place the fingers from the profile
+   of the header's tail, on the same reference as the end position.
+4. **Payload** — one channel per decoded header, on that station's own code,
+   several at once. Each block starts with a pre-pass: the delay profile from
+   the first pilots (DS-PSK) or from the Walsh peaks of the first symbols
+   (CSK), fingers placed on its peaks by deconvolution (CLEAN, with the
+   raised-cosine pulse response), reference moved onto the strongest path.
+   Then symbol by symbol as samples arrive: rake despreading; an early/late
+   timing loop on the sum over all fingers; a carrier loop from pilot gains or
+   successive CSK peaks, updated only when the phase steps agree and limited in
+   step and excursion; and, every six seconds, a conservative searcher that moves
+   the reference only to a path a third of a chip away and 1.8 dB stronger.
+   At the end of the block: DS-PSK combines with smoothed, interpolated pilot
+   gains shrunk by power subtraction where a finger is not clearly above its
+   estimation noise; CSK sums a log-Bessel metric over fingers; then
+   de-interleave and LDPC. A block whose codewords all decode is re-modulated and
+   the refinement above runs on it, so the clock and carrier are re-learned
+   every block.
+
+Why not one early/late loop on one finger: with two paths a chip or so apart the
+late arm picks up the next path's correlation tail, and the loop settles
+between the paths or walks off them. This was found, not guessed: a stretch of
+blocks lost at high SNR on a two-path channel traced to it.
 
 ### FEC
 
@@ -265,12 +300,15 @@ silent.
 
 ## Milestones
 
-- **M0** — scaffold, this document, CI, private GitHub repo. `decdsss modes`.
+- **M0** — scaffold, this document, CI, private GitHub repo. `decdsss modes`. *Done.*
 - **M1** — modem core: codes, TX, channel simulator, acquisition, tracking, rake,
-  DS-PSK and CSK demod, LDPC and interleaver, header; `decdsss tx/rx` through
-  WAV; measured Eb/N0 thresholds per mode on AWGN and Watterson channels.
+  DS-PSK and CSK demod, LDPC and interleaver, header; `decdsss tx/rx/channel/sweep`
+  through WAV; thresholds measured on AWGN and Watterson channels. *Done* (see
+  Verification).
 - **M2** — GUI with every receiver panel, live sound card RX/TX, one-way files.
-  Checked through VB-Audio cable A.
+  Checked through VB-Audio cable A. *Next:* the demodulator is already
+  incremental and publishes the data behind the scopes (`rx::payload::Live`,
+  `Receiver::snapshot`).
 - **M3** — pictures.
 - **M4** — voice, VOX/manual PTT, CAT keying.
 - **M5** — ARQ connected mode.
@@ -278,7 +316,71 @@ silent.
 
 ## Verification
 
-The channel simulator is the reference: every mode's threshold is measured on
-AWGN and on the three Watterson channels, with frequency offset and drift. The
-results go in this file and in README. Heavy sweeps run on CI, not on Rory's
-machine. Live radio tests are Rory's.
+The channel simulator is the reference. `decdsss sweep` runs whole transmissions
+(preamble, header, payload blocks) through it and the real receiver, so a
+threshold here includes acquisition, the preamble, the header and the payload
+together, with the carrier offset (±6 Hz) and the clock error (±30 ppm) spread
+over the trials. Eb/N0 is per information bit of a codeword (its CRC counted),
+with the energy of the pilots and padding counted as air time. Heavy sweeps run
+on CI or by hand, not as default tests; live radio tests are Rory's.
+
+### AWGN, full receiver (2026-10-19)
+
+The lowest Eb/N0, in 0.5 dB steps, at which every one of at least 56 frames
+(14 transmissions) arrived. The in-band SNR is in the profile's occupied width.
+LDPC alone (BPSK, same codewords) needs 1.85 dB for 1 % at rate ½, so the whole
+modem is about 2 dB above its code.
+
+| Profile | Mode | Eb/N0 for no loss | In-band SNR |
+|---|---|---|---|
+| 2.4 kHz | DS4 ½ | 4.0 dB | −3.6 dB |
+| | DS8 ½ | 4.5 dB | −6.1 dB |
+| | DS16 ½ | 4.0 dB | −9.6 dB |
+| | DS32 ½ | 4.5 dB | −12.1 dB |
+| | DS64 ½ | 4.0 dB | −15.6 dB |
+| | DS4 ¾ | 5.0 dB | −0.8 dB |
+| | DS16 ¾ | 4.5 dB | −7.3 dB |
+| | CSK32 ½ | 4.0 dB | −8.0 dB |
+| | CSK64 ½ | 4.0 dB | −10.3 dB |
+| | CSK128 ½ | 4.0 dB | −12.6 dB |
+| | CSK256 ½ | 4.0 dB | −15.0 dB |
+| | CSK32 ¾ | 4.0 dB | −6.3 dB |
+| | CSK64 ¾ | 3.5 dB | −9.0 dB |
+| 3 kHz | DS8 ½ | 4.0 dB | −6.6 dB |
+| | CSK64 ½ | 4.0 dB | −10.3 dB |
+| | CSK256 ½ | 4.0 dB | −15.0 dB |
+| 500 Hz | DS8 ½ | 4.0 dB | −6.6 dB |
+| | CSK64 ½ | 6.0 dB (one frame of 14 lost at 4–5 dB) | −8.3 dB |
+
+The header, a rate-¼ CSK256 codeword, decodes 12 of 12 times from −15 dB to
++5 dB in-band on AWGN and 9 of 12 at −17 dB (the preamble search finds the
+preamble at −17 dB with a 50 ppm clock error and 55 Hz offset, and makes no false
+detection in a minute of noise or of strong payload).
+
+### Watterson fading (2.4 kHz, ½ rate, depth 4, two blocks, 24 transmissions a point)
+
+Frame loss against Eb/N0. The paths are equal-power Rayleigh with Gaussian
+Doppler spectra: *good* 0.5 ms and 0.1 Hz spread, *moderate* 1 ms and 0.5 Hz,
+*poor* 2 ms and 1 Hz.
+
+| Channel | Mode | 9 dB | 13 dB | 17 dB | 21 dB |
+|---|---|---|---|---|---|
+| good | DS8 | 21 % | 7.8 % | 1.0 % | 0 % |
+| | CSK64 | 37 % | 6.3 % | 2.1 % | 0 % |
+| moderate | DS8 | 2.1 % | 0 | 0 | 0 |
+| | CSK64 | 18.8 % | 0 | 0 | 0 |
+| poor | DS8 | 0 | 0 | 0 | 0 |
+| | CSK64 | 6.3 % | 0 | 0 | 0 |
+
+The slow *good* channel is the hard one: its fades last seconds, so a block (11 s
+for DS8, 25 s for CSK64 at depth 4) can lose a codeword to one. Deeper
+interleaving, repeating the transmission (`decdsss tx --repeat`) and, later,
+erasure-coded extra frames and ARQ are the remedies; a repeated pass fills a file's gaps
+(tested end to end).
+
+### Not yet measured
+
+The 3 kHz and 500 Hz profiles on fading; flutter fading; voice modes (no
+Codec2 yet); the effect of in-band interference; two stations at once beyond
+the functional test in `rx::tests` (equal levels, different codes, 12 s
+apart).

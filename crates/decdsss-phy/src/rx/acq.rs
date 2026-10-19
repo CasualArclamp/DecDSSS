@@ -130,6 +130,45 @@ impl Acquirer {
         }
     }
 
+    /// The accumulated search surface for display, reduced to at most `cols`
+    /// columns by taking the maximum of the code phases that fall in each, and
+    /// scaled to the noise (1.0 is the noise mean; a detection fires well above). `None` until a window has been seen.
+    pub fn preview(&self, cols: usize) -> Option<Surface> {
+        if self.sum.is_empty() || self.ring.is_empty() {
+            return None;
+        }
+        let rows = self.rows();
+        // Every window is already scaled to a unit noise mean, so the noise
+        // mean of the sum is the number of windows in it.
+        let norm = self.ring.len() as f32;
+        let cols = cols.clamp(8, self.n);
+        let per = self.n.div_ceil(cols);
+        let mut data = vec![0.0f32; rows * cols];
+        let mut peak = (0.0f32, 0usize, 0usize);
+        for r in 0..rows {
+            for c in 0..self.n {
+                let v = self.sum[r * self.n + c] / norm;
+                let cc = c / per;
+                if v > data[r * cols + cc] {
+                    data[r * cols + cc] = v;
+                }
+                if v > peak.0 {
+                    peak = (v, r, cc);
+                }
+            }
+        }
+        Some(Surface {
+            rows,
+            cols,
+            data,
+            freq0_hz: -(self.half as f64) * self.step_hz,
+            freq_step_hz: self.step_hz,
+            phase0: 0,
+            peak_row: peak.1,
+            peak_col: peak.2,
+        })
+    }
+
     pub fn window(&self) -> usize {
         self.n
     }

@@ -1,20 +1,22 @@
 // made by CasualArclamp
 //! The payload demodulator: one station's blocks, decoded in order.
 //!
-//! A block is processed in two passes. The first walks the symbols once,
-//! despreading each rake finger and keeping what the second needs: for CSK the
-//! Walsh correlations, for DS-PSK the despread symbols and the pilot gains.
-//! The second turns that into bit LLRs (a noncoherent Bessel metric for CSK,
-//! pilot-aided maximal-ratio combining for DS-PSK), de-interleaves, and
-//! LDPC-decodes each codeword.
+//! A block is processed in two passes, and the first runs as the samples
+//! arrive. It walks the symbols once, despreading each rake finger and keeping
+//! what the second needs: for CSK the Walsh correlations, for DS-PSK the
+//! despread symbols and the pilot gains. At the end of the block the second
+//! turns that into bit LLRs (a noncoherent Bessel metric for CSK, pilot-aided
+//! maximal-ratio combining for DS-PSK), de-interleaves, and LDPC-decodes each
+//! codeword. While it works it publishes [`Live`], the data behind the
+//! scopes: constellation, correlator bank, early/prompt/late, strips.
 //!
-//! Timing is kept by a *searcher*, not an early/late loop. Every few seconds
-//! the delay profile is measured again from what is known (the pilots, or the
-//! symbols just decided), the reference is moved onto the strongest path and
-//! the fingers are placed on the peaks; the shifts also teach the clock error.
-//! An early/late loop on one finger cannot be trusted with several paths a chip
-//! or so apart: the late arm picks up the next path's correlation tail and the
-//! loop settles between the two.
+//! Timing is held by an early/late loop driven by the sum over all fingers
+//! (one finger's late arm picks up the next path's correlation tail and the
+//! loop settles between the two paths), backed by a *searcher*: at the start
+//! of every block, and conservatively every few seconds inside it, the delay
+//! profile is measured again from what is known (the pilots, or the symbols
+//! just decided), the reference moves onto the strongest path and the fingers
+//! are placed on the peaks by deconvolution.
 
 use super::despread::{Track, csk_bit_llrs, despread, ln_i0, sum, walsh_correlate, walsh_one};
 use super::frontend::Buf;
@@ -72,6 +74,16 @@ const FREQ_COHERENCE: f32 = 0.4;
 const FREQ_MAX_STEP: f64 = 0.3;
 /// The carrier is kept within this many Hz of where the header found it.
 const FREQ_MAX_EXCURSION: f64 = 10.0;
+/// Samples ahead of a symbol the buffer must hold: the longest finger lag the
+/// profile grid allows, the late arm and the interpolation.
+const AHEAD_CHIPS: f64 = 24.0;
+
+/// Points the live scatter plots keep.
+pub const LIVE_POINTS: usize = 384;
+/// Points in the SNR and carrier strips.
+pub const LIVE_STRIP: usize = 192;
+/// Rows of the correlator-bank display.
+pub const LIVE_ROWS: usize = 40;
 
 /// The carrier correction from `acc`, a sum of successive-measurement
 /// products (`norm` the sum of their magnitudes) taken `interval_s` apart;
@@ -102,6 +114,45 @@ pub struct BlockResult {
     pub snr_db: f64,
 }
 
+/// The data behind the instrument panels, updated as the demodulator works.
+#[derive(Clone, Debug, Default)]
+pub struct Live {
+    /// DS-PSK: recent data symbols after rake combining, scaled to unit
+    /// amplitude (the constellation).
+    pub symbols: Vec<Iq>,
+    /// Each symbol times the conjugate of the one before: tight when the
+    /// channel and the carrier are steady.
+    pub diffs: Vec<Iq>,
+    /// The timing loop's early, prompt and late magnitudes, prompt = 1.
+    pub epl: [f32; 3],
+    /// Symbol-rate SNR (dB), about one point every half second.
+    pub snr_db: Vec<f32>,
+    /// The carrier offset (Hz) at the same points.
+    pub freq_hz: Vec<f32>,
+    /// CSK: the correlator bank, one row per recent symbol, power of the main
+    /// finger against Walsh code number, each row scaled to its maximum.
+    pub bank: Vec<Vec<f32>>,
+    /// The last symbol's chips as received (carrier off, scrambler still on) and
+    /// after the scrambler is taken off.
+    pub raw_chips: Vec<Iq>,
+    pub despread_chips: Vec<Iq>,
+    /// The latest delay profile, power against lag, and the fingers it gave.
+    pub profile: Vec<f32>,
+    pub fingers: Vec<Finger>,
+    /// LLRs of the last codeword that went to the decoder.
+    pub soft: Vec<f32>,
+    pub block: usize,
+    pub symbol: usize,
+    pub symbols_in_block: usize,
+}
+
+fn push_cap<T>(v: &mut Vec<T>, x: T, cap: usize) {
+    if v.len() >= cap {
+        v.remove(0);
+    }
+    v.push(x);
+}
+
 /// Loop gains of a second-order loop with ζ = 0.707.
 fn loop_gains(bn_hz: f64, update_s: f64) -> (f64, f64) {
     let zeta = 0.707;
@@ -125,6 +176,8 @@ struct Dll {
     n: usize,
     /// Integrator: chips of correction per update.
     rate: f64,
+    /// The last group's early and late sums, for the display.
+    last: (f64, f64),
 }
 
 impl Dll {
@@ -143,6 +196,7 @@ impl Dll {
             l: 0.0,
             n: 0,
             rate: 0.0,
+            last: (0.0, 0.0),
         }
     }
 
@@ -172,12 +226,66 @@ impl Dll {
         // it is about 1.33 times the error in chips.
         let d = (self.l - self.e) / (self.l + self.e).max(1e-30);
         let err = d / 1.33;
+        self.last = (self.e, self.l);
         self.e = 0.0;
         self.l = 0.0;
         self.n = 0;
         self.rate += self.ki * err;
         Some(self.kp * err + self.rate)
     }
+}
+
+/// A CSK block in progress.
+struct CskWork {
+    scr: Vec<Iq>,
+    start: Track,
+    step0: f64,
+    t: Track,
+    s: usize,
+    s_count: usize,
+    /// W rows for every symbol and finger, flat, with where each symbol's rows
+    /// start and how many fingers it had.
+    w: Vec<Iq>,
+    index: Vec<(usize, usize)>,
+    decisions: Vec<usize>,
+    peak_prev: Option<Iq>,
+    freq_acc: Iq,
+    freq_norm: f32,
+    /// Track at the start of the searcher's chunk, and its first symbol.
+    tc: Track,
+    s_lo: usize,
+    u: Vec<Iq>,
+    ue: Vec<Iq>,
+    ul: Vec<Iq>,
+}
+
+/// A DS-PSK block in progress.
+struct DsWork {
+    scr: Vec<Iq>,
+    start: Track,
+    step0: f64,
+    t: Track,
+    s: usize,
+    s_count: usize,
+    /// y[s][f]: the despread symbol per finger slot; zero for unused slots.
+    y: Vec<[Iq; SLOTS]>,
+    /// g[k][f]: pilot gain estimates.
+    g: Vec<[Iq; SLOTS]>,
+    pilot_no: usize,
+    freq_acc: Iq,
+    freq_norm: f32,
+    tc: Track,
+    s_lo: usize,
+    u: Vec<Iq>,
+    ue: Vec<Iq>,
+    ul: Vec<Iq>,
+    /// The previous displayed symbol, for the differential plot.
+    prev_z: Option<Iq>,
+}
+
+enum Work {
+    Csk(Box<CskWork>),
+    Ds(Box<DsWork>),
 }
 
 pub struct PayloadRx {
@@ -192,6 +300,10 @@ pub struct PayloadRx {
     next_block: usize,
     dll: Dll,
     rate: f64,
+    work: Option<Work>,
+    live: Live,
+    /// Symbols since the last strip point.
+    strip_count: usize,
     /// The last block's interleaved LLRs (kept for the tests).
     #[cfg(test)]
     pub last_llrs: Vec<f32>,
@@ -213,6 +325,12 @@ impl PayloadRx {
             next_block: 0,
             dll: Dll::new(symbol_s),
             rate,
+            work: None,
+            live: Live {
+                fingers: h.fingers.clone(),
+                ..Live::default()
+            },
+            strip_count: 0,
             #[cfg(test)]
             last_llrs: Vec::new(),
         })
@@ -230,34 +348,132 @@ impl PayloadRx {
         self.next_block
     }
 
-    /// Earliest sample still needed (the earliest finger's lag, with margin).
-    pub fn oldest_needed(&self) -> i64 {
-        let min_lag = self.fingers.iter().map(|f| f.lag).fold(0.0f64, f64::min);
-        (self.track.pos + (min_lag - 8.0) * self.track.step) as i64
+    /// What the instrument panels show.
+    pub fn live(&self) -> &Live {
+        &self.live
     }
 
-    /// Decodes the next block if the buffer holds all of it.
+    /// Earliest sample still needed: the block in progress needs its start for
+    /// the known-chip refinement at its end.
+    pub fn oldest_needed(&self) -> i64 {
+        let min_lag = self.fingers.iter().map(|f| f.lag).fold(0.0f64, f64::min);
+        let from = match &self.work {
+            Some(Work::Csk(w)) => w.start,
+            Some(Work::Ds(w)) => w.start,
+            None => self.track,
+        };
+        (from.pos + (min_lag - 10.0) * from.step) as i64
+    }
+
+    /// Works on the block in progress with the samples there are; returns it
+    /// when it is complete.
     pub fn step(&mut self, buf: &Buf) -> Option<BlockResult> {
         if self.done() {
             return None;
         }
-        // The searcher may reach 20 chips past the reference.
-        let need = self.track.pos
-            + (self.layout.chips() as f64 + DelayProfile::lag(DelayProfile::LAGS - 1) + 6.0)
-                * self.track.step
-            + 16.0;
-        if need > buf.end() as f64 {
-            return None;
+        if self.work.is_none() {
+            // Start a block once the pre-pass has its first seconds.
+            let l = f64::from(self.header.mode.spread);
+            let cr = f64::from(self.header.profile.chip_rate());
+            let span = (PREPASS_S + 1.0)
+                .max(PREPASS_MIN as f64 * 8.0 * l / cr)
+                .min(self.layout.seconds());
+            let need = self.track.pos + (span * cr + AHEAD_CHIPS) * self.track.step + 16.0;
+            if need > buf.end() as f64 {
+                return None;
+            }
+            self.begin_block(buf);
         }
-        let cr = f64::from(self.header.profile.chip_rate());
-        self.dll.set_wide((self.chip0 as f64) / cr < DLL_WIDE_S);
-        let result = match self.layout.mode.family {
-            Family::Csk => self.block_csk(buf),
-            Family::DsPsk => self.block_ds(buf),
-        };
+        let work = self.work.take()?;
+        match work {
+            Work::Csk(mut w) => {
+                if self.advance_csk(buf, &mut w) {
+                    let r = self.finish_csk(buf, *w);
+                    self.end_block();
+                    Some(r)
+                } else {
+                    self.work = Some(Work::Csk(w));
+                    None
+                }
+            }
+            Work::Ds(mut w) => {
+                if self.advance_ds(buf, &mut w) {
+                    let r = self.finish_ds(buf, *w);
+                    self.end_block();
+                    Some(r)
+                } else {
+                    self.work = Some(Work::Ds(w));
+                    None
+                }
+            }
+        }
+    }
+
+    fn end_block(&mut self) {
         self.chip0 += self.layout.chips();
         self.next_block += 1;
-        Some(result)
+    }
+
+    fn begin_block(&mut self, buf: &Buf) {
+        let cr = f64::from(self.header.profile.chip_rate());
+        self.dll.set_wide((self.chip0 as f64) / cr < DLL_WIDE_S);
+        let l = usize::from(self.header.mode.spread);
+        let s_count = self.layout.symbols();
+        let scr = self.scr.chips(self.chip0, s_count * l);
+        self.live.block = self.next_block;
+        self.live.symbol = 0;
+        self.live.symbols_in_block = s_count;
+        let blank = || vec![Iq::new(0.0, 0.0); l];
+        match self.layout.mode.family {
+            Family::Csk => {
+                self.csk_prepass(buf, &scr);
+                let start = self.track;
+                self.work = Some(Work::Csk(Box::new(CskWork {
+                    scr,
+                    start,
+                    step0: start.step,
+                    t: start,
+                    s: 0,
+                    s_count,
+                    w: Vec::with_capacity(s_count * SLOTS * l),
+                    index: Vec::with_capacity(s_count),
+                    decisions: Vec::with_capacity(s_count),
+                    peak_prev: None,
+                    freq_acc: Iq::new(0.0, 0.0),
+                    freq_norm: 0.0,
+                    tc: start,
+                    s_lo: 0,
+                    u: blank(),
+                    ue: blank(),
+                    ul: blank(),
+                })));
+            }
+            Family::DsPsk => {
+                self.ds_prepass(buf, &scr);
+                let start = self.track;
+                let pilots = s_count / PILOT_INTERVAL as usize + 1;
+                self.work = Some(Work::Ds(Box::new(DsWork {
+                    scr,
+                    start,
+                    step0: start.step,
+                    t: start,
+                    s: 0,
+                    s_count,
+                    y: vec![[Iq::new(0.0, 0.0); SLOTS]; s_count],
+                    g: vec![[Iq::new(0.0, 0.0); SLOTS]; pilots],
+                    pilot_no: 0,
+                    freq_acc: Iq::new(0.0, 0.0),
+                    freq_norm: 0.0,
+                    tc: start,
+                    s_lo: 0,
+                    u: blank(),
+                    ue: blank(),
+                    ul: blank(),
+                    prev_z: None,
+                })));
+            }
+        }
+        self.live.fingers = self.fingers.clone();
     }
 
     /// LDPC-decodes the interleaved block LLRs into frames.
@@ -286,11 +502,17 @@ impl PayloadRx {
         {
             self.last_llrs = llrs.to_vec();
         }
+        // The last codeword's soft bits, for the display.
+        let n = self.layout.code().n();
+        let coded =
+            Interleaver::new(self.layout.coded_bits()).invert(&llrs[..self.layout.coded_bits()]);
+        self.live.soft = coded[coded.len() - n..].to_vec();
         let (frames, iterations) = self.decode(llrs);
         let first_frame = usize::from(self.header.frame0) + self.next_block * self.layout.depth;
         if frames.iter().all(Option::is_some) {
             self.refresh_fingers(buf, &frames, block_start);
         }
+        self.live.fingers = self.fingers.clone();
         BlockResult {
             index: self.next_block,
             first_frame,
@@ -335,6 +557,7 @@ impl PayloadRx {
     /// Re-places the reference and the fingers from a measured profile, if the
     /// profile has a clear peak; returns the chips the reference moved.
     fn adopt(&mut self, profile: &DelayProfile) -> Option<f64> {
+        self.live.profile = profile.power.clone();
         let mut p = profile.power.clone();
         p.sort_by(f32::total_cmp);
         let median = p[p.len() / 2].max(1e-30);
@@ -344,6 +567,7 @@ impl PayloadRx {
         }
         let (fingers, shift) = super::refine::fingers_from_profile(profile);
         self.fingers = fingers;
+        self.live.fingers = self.fingers.clone();
         Some(shift)
     }
 
@@ -351,6 +575,7 @@ impl PayloadRx {
     /// clearly better path; the fingers keep their places relative to it.
     /// Returns the chips moved.
     fn adopt_track(&mut self, profile: &DelayProfile) -> Option<f64> {
+        self.live.profile = profile.power.clone();
         let mut sorted = profile.power.clone();
         sorted.sort_by(f32::total_cmp);
         let median = sorted[sorted.len() / 2].max(1e-30);
@@ -366,6 +591,7 @@ impl PayloadRx {
         for f in &mut self.fingers {
             f.lag -= lag;
         }
+        self.live.fingers = self.fingers.clone();
         Some(lag)
     }
 
@@ -503,97 +729,140 @@ impl PayloadRx {
         }
     }
 
-    fn block_csk(&mut self, buf: &Buf) -> BlockResult {
+    /// Adds a strip point (SNR and carrier) about twice a second.
+    fn strip(&mut self, snr_db: f32, freq: f64, sym_s: f64) {
+        self.strip_count += 1;
+        if self.strip_count as f64 * sym_s >= 0.5 {
+            self.strip_count = 0;
+            push_cap(&mut self.live.snr_db, snr_db, LIVE_STRIP);
+            push_cap(&mut self.live.freq_hz, freq as f32, LIVE_STRIP);
+        }
+    }
+
+    /// Processes CSK symbols while the buffer holds them; true when the block
+    /// is done.
+    fn advance_csk(&mut self, buf: &Buf, wk: &mut CskWork) -> bool {
         let l = usize::from(self.header.mode.spread);
-        let bits = l.trailing_zeros() as usize;
-        let s_count = self.layout.symbols();
-        let scr = self.scr.chips(self.chip0, s_count * l);
-        self.csk_prepass(buf, &scr);
-        let start = self.track;
-        let step0 = start.step;
-        let mut t = self.track;
-        let mut u = vec![Iq::new(0.0, 0.0); l];
-        let mut ue = u.clone();
-        let mut ul = u.clone();
-        // W rows for every symbol and finger, flat, with where each symbol's
-        // rows start and how many fingers it had.
-        let mut w: Vec<Iq> = Vec::with_capacity(s_count * SLOTS * l);
-        let mut index: Vec<(usize, usize)> = Vec::with_capacity(s_count);
-        let mut decisions = Vec::with_capacity(s_count);
-        let t_sym = l as f64 * t.step / t.rate;
+        let t_sym = l as f64 * wk.t.step / wk.t.rate;
         let freq_every = ((FREQ_UPDATE_S / t_sym).ceil() as usize).max(4);
-        let chunk = (((SEARCH_S / t_sym).ceil() as usize).max(SEARCH_MIN_SYMBOLS)).min(s_count);
-        let mut peak_prev: Option<Iq> = None;
-        let mut freq_acc = Iq::new(0.0, 0.0);
-        let mut freq_norm = 0.0f32;
-        let (mut tc, mut s_lo) = (t, 0usize);
-        for s in 0..s_count {
-            let sc = &scr[s * l..(s + 1) * l];
+        let chunk = (((SEARCH_S / t_sym).ceil() as usize).max(SEARCH_MIN_SYMBOLS)).min(wk.s_count);
+        while wk.s < wk.s_count {
+            if wk.t.pos + (l as f64 + AHEAD_CHIPS) * wk.t.step + 16.0 > buf.end() as f64 {
+                return false;
+            }
+            let s = wk.s;
+            let sc = &wk.scr[s * l..(s + 1) * l];
             let nf = self.fingers.len();
-            let at = w.len();
-            index.push((at, nf));
-            for f in &self.fingers {
-                despread(buf, &t, sc, f.lag, &mut u);
-                w.extend(walsh_correlate(&u));
+            let at = wk.w.len();
+            wk.index.push((at, nf));
+            for (fi, f) in self.fingers.iter().enumerate() {
+                despread(buf, &wk.t, sc, f.lag, &mut wk.u);
+                if fi == 0 {
+                    self.live.despread_chips = wk.u.clone();
+                }
+                wk.w.extend(walsh_correlate(&wk.u));
             }
             // Decision: the code with the most weighted power over fingers.
             let mut best = (0usize, -1.0f32);
             for m in 0..l {
                 let p: f32 = (0..nf)
-                    .map(|f| self.fingers[f].power * w[at + f * l + m].norm_sqr())
+                    .map(|f| self.fingers[f].power * wk.w[at + f * l + m].norm_sqr())
                     .sum();
                 if p > best.1 {
                     best = (m, p);
                 }
             }
             let m = best.0;
-            decisions.push(m);
+            wk.decisions.push(m);
             // Early and late arms of every finger, at the decided code.
-            let (mut e_sum, mut l_sum) = (0.0f64, 0.0f64);
+            let (mut e_sum, mut l_sum, mut p_sum) = (0.0f64, 0.0f64, 0.0f64);
             for f in &self.fingers {
-                despread(buf, &t, sc, f.lag - 0.25, &mut ue);
-                despread(buf, &t, sc, f.lag + 0.25, &mut ul);
-                e_sum += f64::from(walsh_one(&ue, m).norm());
-                l_sum += f64::from(walsh_one(&ul, m).norm());
+                despread(buf, &wk.t, sc, f.lag - 0.25, &mut wk.ue);
+                despread(buf, &wk.t, sc, f.lag + 0.25, &mut wk.ul);
+                e_sum += f64::from(walsh_one(&wk.ue, m).norm());
+                l_sum += f64::from(walsh_one(&wk.ul, m).norm());
+            }
+            for (fi, _) in self.fingers.iter().enumerate() {
+                p_sum += f64::from(wk.w[at + fi * l + m].norm());
             }
             if let Some(c) = self.dll.push(e_sum, l_sum) {
-                t.pos += c * t.step;
+                wk.t.pos += c * wk.t.step;
+                let p = p_sum.max(1e-30) as f32 * (self.dll.group as f32);
+                self.live.epl = [
+                    (self.dll.last.0 as f32 / p).min(2.0),
+                    1.0,
+                    (self.dll.last.1 as f32 / p).min(2.0),
+                ];
             }
-            // The strongest finger carries the carrier measurement.
-            let peak = w[at + m];
-            if let Some(p) = peak_prev {
-                freq_acc += peak * p.conj();
-                freq_norm += peak.norm() * p.norm();
+            // The main finger's peak carries the carrier measurement.
+            let peak = wk.w[at + m];
+            if let Some(p) = wk.peak_prev {
+                wk.freq_acc += peak * p.conj();
+                wk.freq_norm += peak.norm() * p.norm();
             }
-            peak_prev = Some(peak);
-            t.advance(l);
-            if (s + 1) % freq_every == 0 {
-                t.freq += freq_correction(freq_acc, freq_norm, t_sym);
-                t.freq = t
-                    .freq
-                    .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
-                freq_acc = Iq::new(0.0, 0.0);
-                freq_norm = 0.0;
+            wk.peak_prev = Some(peak);
+            // Live: the correlator bank row, the chips, the SNR strip.
+            let row: Vec<f32> = wk.w[at..at + l].iter().map(|z| z.norm_sqr()).collect();
+            let mx = row.iter().copied().fold(1e-30f32, f32::max);
+            let noise = (row.iter().sum::<f32>() - row[m]) / (l as f32 - 1.0);
+            push_cap(
+                &mut self.live.bank,
+                row.iter().map(|v| v / mx).collect(),
+                LIVE_ROWS,
+            );
+            self.strip(
+                10.0 * (((row[m] - noise).max(1e-30)) / noise.max(1e-30)).log10(),
+                wk.t.freq,
+                t_sym,
+            );
+            // The chips as received, carrier off, scrambler on.
+            if s.is_multiple_of(4) {
+                let dphi = wk.t.dphase();
+                self.live.raw_chips = (0..l)
+                    .map(|k| {
+                        let (sn, c) = (wk.t.phase + k as f64 * dphi).sin_cos();
+                        buf.at(wk.t.pos + k as f64 * wk.t.step) * Iq::new(c as f32, -(sn as f32))
+                    })
+                    .collect();
+            }
+            wk.t.advance(l);
+            if (s + 1).is_multiple_of(freq_every) {
+                wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, t_sym);
+                wk.t.freq =
+                    wk.t.freq
+                        .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
+                wk.freq_acc = Iq::new(0.0, 0.0);
+                wk.freq_norm = 0.0;
             }
             // The searcher: at the end of each chunk (not the last: the
             // known-chip refinement after the block does that better).
-            if (s + 1 - s_lo) >= chunk && s + 1 < s_count {
-                let profile = self.profile_csk(buf, &tc, &scr, s_lo, &decisions[s_lo..=s]);
+            if (s + 1 - wk.s_lo) >= chunk && s + 1 < wk.s_count {
+                let profile =
+                    self.profile_csk(buf, &wk.tc, &wk.scr, wk.s_lo, &wk.decisions[wk.s_lo..=s]);
                 if let Some(shift) = self.adopt_track(&profile) {
-                    self.apply_shift(&mut t, shift, ((s + 1 - s_lo) * l) as f64, step0);
+                    let (step0, chips) = (wk.step0, ((s + 1 - wk.s_lo) * l) as f64);
+                    self.apply_shift(&mut wk.t, shift, chips, step0);
                 }
-                tc = t;
-                s_lo = s + 1;
+                wk.tc = wk.t;
+                wk.s_lo = s + 1;
             }
+            wk.s += 1;
+            self.live.symbol = wk.s;
         }
-        self.track = t;
+        true
+    }
 
-        // Pass two: per-finger noise and amplitude, then the metric.
+    /// Pass two of a CSK block: per-finger noise and amplitude, then the
+    /// metric, then the decoders.
+    fn finish_csk(&mut self, buf: &Buf, wk: CskWork) -> BlockResult {
+        let l = usize::from(self.header.mode.spread);
+        let bits = l.trailing_zeros() as usize;
+        self.track = wk.t;
         let (mut sigma2, mut amp2, mut cnt) = ([0.0f64; SLOTS], [0.0f64; SLOTS], [0usize; SLOTS]);
-        for (s, &m) in decisions.iter().enumerate() {
-            let (off, nf) = index[s];
+        for (s, &m) in wk.decisions.iter().enumerate() {
+            let (off, nf) = wk.index[s];
             for f in 0..nf {
-                let row = &w[off + f * l..off + (f + 1) * l];
+                let row = &wk.w[off + f * l..off + (f + 1) * l];
                 let total: f64 = row.iter().map(|z| f64::from(z.norm_sqr())).sum();
                 let pk = f64::from(row[m].norm_sqr());
                 sigma2[f] += (total - pk) / (l as f64 - 1.0);
@@ -609,91 +878,139 @@ impl PayloadRx {
                 kappa[f] = 2.0 * amp2[f].sqrt() / sigma2[f].max(1e-30);
             }
         }
-        let mut llrs = Vec::with_capacity(s_count * bits);
+        let mut llrs = Vec::with_capacity(wk.s_count * bits);
         let mut metric = vec![0.0f64; l];
-        for &(off, nf) in &index {
+        for &(off, nf) in &wk.index {
             for (m, v) in metric.iter_mut().enumerate() {
                 *v = (0..nf)
-                    .map(|f| ln_i0(kappa[f] * f64::from(w[off + f * l + m].norm())))
+                    .map(|f| ln_i0(kappa[f] * f64::from(wk.w[off + f * l + m].norm())))
                     .sum();
             }
             csk_bit_llrs(&metric, bits, &mut llrs);
         }
         let snr = 10.0 * (amp2[0] / sigma2[0].max(1e-30)).log10();
-        self.finish(buf, &llrs, snr, start)
+        self.finish(buf, &llrs, snr, wk.start)
     }
 
-    fn block_ds(&mut self, buf: &Buf) -> BlockResult {
+    /// Processes DS-PSK symbols while the buffer holds them; true when the
+    /// block is done.
+    fn advance_ds(&mut self, buf: &Buf, wk: &mut DsWork) -> bool {
         let l = usize::from(self.header.mode.spread);
-        let s_count = self.layout.symbols();
         let per = PILOT_INTERVAL as usize;
-        let scr = self.scr.chips(self.chip0, s_count * l);
-        self.ds_prepass(buf, &scr);
-        let start = self.track;
-        let step0 = start.step;
-        let mut t = self.track;
-        let mut u = vec![Iq::new(0.0, 0.0); l];
-        let mut ue = u.clone();
-        let mut ul = u.clone();
-        // y[s][f]: the despread symbol per finger slot; zero for unused slots.
-        let mut y = vec![[Iq::new(0.0, 0.0); SLOTS]; s_count];
-        let pilots = s_count / per + 1;
-        // g[k][f]: pilot gain estimates.
-        let mut g = vec![[Iq::new(0.0, 0.0); SLOTS]; pilots];
-        let t_sym = l as f64 * t.step / t.rate;
+        let t_sym = l as f64 * wk.t.step / wk.t.rate;
         let t_pilot = per as f64 * t_sym;
         let freq_every = ((FREQ_UPDATE_S / t_pilot).ceil() as usize).max(3);
         let chunk_pilots = ((SEARCH_S / t_pilot).ceil() as usize).max(SEARCH_MIN_PILOTS);
         let chunk = chunk_pilots * per;
-        let mut freq_acc = Iq::new(0.0, 0.0);
-        let mut freq_norm = 0.0f32;
-        let mut pilot_no = 0;
-        let (mut tc, mut s_lo) = (t, 0usize);
-        for s in 0..s_count {
-            let sc = &scr[s * l..(s + 1) * l];
-            let (mut e_sum, mut l_sum) = (0.0f64, 0.0f64);
+        while wk.s < wk.s_count {
+            if wk.t.pos + (l as f64 + AHEAD_CHIPS) * wk.t.step + 16.0 > buf.end() as f64 {
+                return false;
+            }
+            let s = wk.s;
+            let sc = &wk.scr[s * l..(s + 1) * l];
+            let (mut e_sum, mut l_sum, mut p_sum) = (0.0f64, 0.0f64, 0.0f64);
             for (fi, f) in self.fingers.iter().enumerate().take(SLOTS) {
-                despread(buf, &t, sc, f.lag, &mut u);
-                y[s][fi] = sum(&u);
-                despread(buf, &t, sc, f.lag - 0.25, &mut ue);
-                despread(buf, &t, sc, f.lag + 0.25, &mut ul);
-                e_sum += f64::from(sum(&ue).norm());
-                l_sum += f64::from(sum(&ul).norm());
+                despread(buf, &wk.t, sc, f.lag, &mut wk.u);
+                wk.y[s][fi] = sum(&wk.u);
+                if fi == 0 {
+                    self.live.despread_chips = wk.u.clone();
+                }
+                p_sum += f64::from(wk.y[s][fi].norm());
+                despread(buf, &wk.t, sc, f.lag - 0.25, &mut wk.ue);
+                despread(buf, &wk.t, sc, f.lag + 0.25, &mut wk.ul);
+                e_sum += f64::from(sum(&wk.ue).norm());
+                l_sum += f64::from(sum(&wk.ul).norm());
             }
             if let Some(c) = self.dll.push(e_sum, l_sum) {
-                t.pos += c * t.step;
+                wk.t.pos += c * wk.t.step;
+                let p = p_sum.max(1e-30) as f32 * (self.dll.group as f32);
+                self.live.epl = [
+                    (self.dll.last.0 as f32 / p).min(2.0),
+                    1.0,
+                    (self.dll.last.1 as f32 / p).min(2.0),
+                ];
             }
             if self.layout.is_pilot(s) {
-                let p = pilot_symbol(pilot_no).conj();
+                let p = pilot_symbol(wk.pilot_no).conj();
                 for fi in 0..SLOTS {
-                    g[pilot_no][fi] = y[s][fi] * p;
+                    wk.g[wk.pilot_no][fi] = wk.y[s][fi] * p;
                 }
-                if pilot_no > 0 {
-                    freq_acc += g[pilot_no][0] * g[pilot_no - 1][0].conj();
-                    freq_norm += g[pilot_no][0].norm() * g[pilot_no - 1][0].norm();
+                if wk.pilot_no > 0 {
+                    let (a, b) = (wk.g[wk.pilot_no][0], wk.g[wk.pilot_no - 1][0]);
+                    wk.freq_acc += a * b.conj();
+                    wk.freq_norm += a.norm() * b.norm();
                 }
-                pilot_no += 1;
-                if pilot_no % freq_every == 0 {
-                    t.freq += freq_correction(freq_acc, freq_norm, t_pilot);
-                    t.freq = t
-                        .freq
-                        .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
-                    freq_acc = Iq::new(0.0, 0.0);
-                    freq_norm = 0.0;
+                wk.pilot_no += 1;
+                if wk.pilot_no.is_multiple_of(freq_every) {
+                    wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, t_pilot);
+                    wk.t.freq =
+                        wk.t.freq
+                            .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
+                    wk.freq_acc = Iq::new(0.0, 0.0);
+                    wk.freq_norm = 0.0;
+                }
+            } else if wk.pilot_no > 0 {
+                // A data symbol for the display, rotated by the latest pilot's
+                // gain (the estimate the decoder will refine) and scaled to unit
+                // amplitude.
+                let mut z = Iq::new(0.0, 0.0);
+                let mut pw = 0.0f32;
+                for fi in 0..SLOTS {
+                    let h = wk.g[wk.pilot_no - 1][fi];
+                    z += h.conj() * wk.y[s][fi];
+                    pw += h.norm_sqr();
+                }
+                if pw > 0.0 {
+                    let z = z / pw;
+                    push_cap(&mut self.live.symbols, z, LIVE_POINTS);
+                    if let Some(p) = wk.prev_z {
+                        push_cap(&mut self.live.diffs, z * p.conj(), LIVE_POINTS);
+                    }
+                    wk.prev_z = Some(z);
+                    let snr = if wk.pilot_no > 1 {
+                        let a = wk.g[wk.pilot_no - 1][0];
+                        let b = wk.g[wk.pilot_no - 2][0];
+                        let noise = ((a - b).norm_sqr() * 0.5).max(1e-30);
+                        10.0 * (a.norm_sqr() / noise).max(1e-3).log10()
+                    } else {
+                        0.0
+                    };
+                    self.strip(snr, wk.t.freq, t_sym);
                 }
             }
-            t.advance(l);
-            if (s + 1 - s_lo) >= chunk && s + 1 < s_count {
-                let profile = self.profile_ds(buf, &tc, &scr, s_lo, s + 1);
+            if s.is_multiple_of(8) {
+                let dphi = wk.t.dphase();
+                self.live.raw_chips = (0..l)
+                    .map(|k| {
+                        let (sn, c) = (wk.t.phase + k as f64 * dphi).sin_cos();
+                        buf.at(wk.t.pos + k as f64 * wk.t.step) * Iq::new(c as f32, -(sn as f32))
+                    })
+                    .collect();
+            }
+            wk.t.advance(l);
+            if (s + 1 - wk.s_lo) >= chunk && s + 1 < wk.s_count {
+                let profile = self.profile_ds(buf, &wk.tc, &wk.scr, wk.s_lo, s + 1);
                 if let Some(shift) = self.adopt_track(&profile) {
-                    self.apply_shift(&mut t, shift, ((s + 1 - s_lo) * l) as f64, step0);
+                    let (step0, chips) = (wk.step0, ((s + 1 - wk.s_lo) * l) as f64);
+                    self.apply_shift(&mut wk.t, shift, chips, step0);
                 }
-                tc = t;
-                s_lo = s + 1;
+                wk.tc = wk.t;
+                wk.s_lo = s + 1;
             }
+            wk.s += 1;
+            self.live.symbol = wk.s;
         }
-        self.track = t;
-        debug_assert_eq!(pilot_no, pilots);
+        true
+    }
+
+    /// Pass two of a DS-PSK block: smoothed, shrunk and interpolated pilot
+    /// gains, maximal-ratio combining, then the decoders.
+    fn finish_ds(&mut self, buf: &Buf, wk: DsWork) -> BlockResult {
+        let per = PILOT_INTERVAL as usize;
+        self.track = wk.t;
+        let (y, g) = (&wk.y, &wk.g);
+        let (s_count, pilots) = (wk.s_count, g.len());
+        debug_assert_eq!(wk.pilot_no, pilots);
 
         // Smooth the pilot gains ([1 2 1]/4, shorter at the ends) and
         // interpolate linearly to the data symbols.
@@ -758,7 +1075,7 @@ impl PayloadRx {
             llrs.push(4.0 * z.re);
             llrs.push(4.0 * z.im);
         }
-        self.finish(buf, &llrs, snr, start)
+        self.finish(buf, &llrs, snr, wk.start)
     }
 }
 
