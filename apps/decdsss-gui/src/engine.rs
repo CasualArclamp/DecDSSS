@@ -89,6 +89,8 @@ pub struct Message {
     /// The band it was heard in (the 500 Hz slot, for that profile).
     pub band: String,
     pub text: String,
+    /// A CQ packet (a header with the callsign), not a text message.
+    pub packet: bool,
 }
 
 /// Messages kept for the display.
@@ -720,6 +722,10 @@ fn handle_event(
         ),
         Event::Lost(why) if r.details => log(shared, format!("[{t:6.1}s] {p}: lost it: {why}")),
         Event::Acquired(_) | Event::PreambleLocked(_) | Event::Lost(_) => {}
+        Event::Header { header, snr_db, .. } if decdsss_link::cq::is_cq(&header) => {
+            // The header is the whole message: no transfer to follow.
+            heard_cq(shared, r, t, &p, &header, snr_db);
+        }
         Event::Header { header, snr_db, .. } => {
             log(
                 shared,
@@ -874,16 +880,65 @@ fn unique(dir: &Path, name: &str) -> PathBuf {
 /// A received message goes to the message list and the log, and is appended to
 /// `messages.log` in the output folder, not saved as a file.
 fn save_text(shared: &Arc<Mutex<Shared>>, r: &Run, t: f64, band: &str, f: &ReceivedFile) {
-    use std::io::Write;
     let text = decdsss_link::text::read(f).unwrap_or_default();
     log(
         shared,
         format!("[{t:6.1}s] TEXT from {} ({band}): {text}", f.call),
     );
+    let m = Message {
+        at_s: t,
+        call: f.call.clone(),
+        session: f.session,
+        band: band.to_string(),
+        text,
+        packet: false,
+    };
+    push_message(shared, r, m);
+}
+
+/// A CQ packet was heard: a message "CQ de CALL", once however many copies arrive
+/// (copies of one CQ share the station and session).
+fn heard_cq(
+    shared: &Arc<Mutex<Shared>>,
+    r: &Run,
+    t: f64,
+    band: &str,
+    header: &decdsss_phy::framing::Header,
+    snr_db: f64,
+) {
+    log(
+        shared,
+        format!(
+            "[{t:6.1}s] {band}: {}",
+            decdsss_link::cq::describe(header, snr_db)
+        ),
+    );
+    let again = shared.lock().unwrap().messages.iter().rev().any(|m| {
+        m.call == header.call && m.session == header.session && m.packet && t - m.at_s < 300.0
+    });
+    if !again {
+        let text = format!("CQ de {} (CQ packet)", header.call);
+        let m = Message {
+            at_s: t,
+            call: header.call.clone(),
+            session: header.session,
+            band: band.to_string(),
+            text,
+            packet: true,
+        };
+        push_message(shared, r, m);
+    }
+}
+
+/// Adds a message to the list and to `messages.log`.
+fn push_message(shared: &Arc<Mutex<Shared>>, r: &Run, m: Message) {
+    use std::io::Write;
     let line = format!(
-        "[{t:7.1}s] {} ({band}): {}\n",
-        f.call,
-        text.replace('\n', " / ")
+        "[{:7.1}s] {} ({}): {}\n",
+        m.at_s,
+        m.call,
+        m.band,
+        m.text.replace('\n', " / ")
     );
     let wrote = std::fs::OpenOptions::new()
         .create(true)
@@ -894,13 +949,7 @@ fn save_text(shared: &Arc<Mutex<Shared>>, r: &Run, t: f64, band: &str, f: &Recei
         log(shared, format!("cannot write messages.log: {e}"));
     }
     let mut g = shared.lock().unwrap();
-    g.messages.push(Message {
-        at_s: t,
-        call: f.call.clone(),
-        session: f.session,
-        band: band.to_string(),
-        text,
-    });
+    g.messages.push(m);
     if g.messages.len() > MESSAGES_MAX {
         g.messages.remove(0);
     }

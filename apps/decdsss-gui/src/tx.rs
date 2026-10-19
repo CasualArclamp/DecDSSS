@@ -56,6 +56,11 @@ struct PicJob {
     rx: mpsc::Receiver<(Option<Arc<Source>>, PicResult)>,
 }
 
+/// What the message box shows for a CQ packet (the packet itself is only the callsign).
+fn cq_label(call: &str) -> String {
+    format!("CQ de {call}")
+}
+
 fn is_picture(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| PICTURE_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str()))
@@ -140,6 +145,9 @@ pub struct TxPanel {
     /// Send a text message (a CQ call, chat) instead of a file.
     text: bool,
     message: String,
+    /// The message is a CQ packet (the callsign in a header-only transmission), not
+    /// text: set by the CQ button, cleared as soon as the message is edited.
+    cq_packet: bool,
     vp: VoicePanel,
     /// The Codec2 mode; `None` is the profile's own (450 on 2.4 kHz, 700C on 3 kHz).
     codec: Option<Codec>,
@@ -181,6 +189,7 @@ impl Default for TxPanel {
             voice: false,
             text: false,
             message: String::new(),
+            cq_packet: false,
             vp: VoicePanel::default(),
             codec: None,
             vox: false,
@@ -332,8 +341,9 @@ impl TxPanel {
         self.text = true;
         self.picture = false;
         self.voice = false;
-        self.message = if msg.eq_ignore_ascii_case("cq") {
-            decdsss_link::text::cq(&normalise_call(&self.call).unwrap_or_default())
+        self.cq_packet = msg.eq_ignore_ascii_case("cq");
+        self.message = if self.cq_packet {
+            cq_label(&normalise_call(&self.call).unwrap_or_default())
         } else {
             msg
         };
@@ -422,10 +432,20 @@ impl TxPanel {
         let rate = self.device_rate(devices_out);
         match self.build(rate) {
             Ok(plan) => {
-                self.note = format!(
-                    "{} frames in {} segment(s), {:.0} s of audio",
-                    plan.frames, plan.segments, plan.seconds
-                );
+                self.note = if plan.frames == 0 {
+                    // A CQ packet is headers only.
+                    format!(
+                        "CQ packet, {} cop{}, {:.0} s of audio",
+                        plan.segments,
+                        if plan.segments == 1 { "y" } else { "ies" },
+                        plan.seconds
+                    )
+                } else {
+                    format!(
+                        "{} frames in {} segment(s), {:.0} s of audio",
+                        plan.frames, plan.segments, plan.seconds
+                    )
+                };
                 engine.send(Cmd::Transmit {
                     audio: plan.audio,
                     rate,
@@ -441,23 +461,34 @@ impl TxPanel {
         }
     }
 
-    /// The message box with a CQ button that writes a CQ call from the callsign.
+    /// The message box with a CQ button that sets up a CQ packet from the callsign.
     fn message_editor(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
-            ui.add(
+            let edit = ui.add(
                 egui::TextEdit::multiline(&mut self.message)
                     .desired_rows(3)
                     .desired_width(300.0)
                     .hint_text("type a message, or press CQ"),
             );
+            if edit.changed() {
+                // Typing over a CQ makes it an ordinary message again.
+                self.cq_packet = false;
+            }
             ui.horizontal(|ui| {
                 if ui
                     .button("CQ")
-                    .on_hover_text("Fill in a CQ call from your callsign")
+                    .on_hover_text(
+                        "A CQ packet: your callsign alone in the most robust header the modem \
+                         has, sent in two copies. It decodes far below the noise where a text \
+                         CQ would not.",
+                    )
                     .clicked()
                 {
                     match normalise_call(&self.call) {
-                        Some(call) => self.message = decdsss_link::text::cq(&call),
+                        Some(call) => {
+                            self.message = cq_label(&call);
+                            self.cq_packet = true;
+                        }
                         None => {
                             self.note =
                                 "enter your callsign (letters, digits and /, up to 9)".into();
@@ -466,16 +497,25 @@ impl TxPanel {
                 }
                 if ui.button("Clear").clicked() {
                     self.message.clear();
+                    self.cq_packet = false;
                 }
-                let bytes = decdsss_link::text::tidy(&self.message).len();
-                ui.label(
-                    RichText::new(format!(
-                        "{bytes} / {} bytes",
-                        decdsss_link::text::MAX_TEXT_BYTES
-                    ))
-                    .weak()
-                    .size(11.0),
-                );
+                if self.cq_packet {
+                    ui.label(
+                        RichText::new("CQ packet: only the callsign is sent")
+                            .weak()
+                            .size(11.0),
+                    );
+                } else {
+                    let bytes = decdsss_link::text::tidy(&self.message).len();
+                    ui.label(
+                        RichText::new(format!(
+                            "{bytes} / {} bytes",
+                            decdsss_link::text::MAX_TEXT_BYTES
+                        ))
+                        .weak()
+                        .size(11.0),
+                    );
+                }
             });
         });
     }
@@ -839,6 +879,25 @@ impl TxPanel {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs())
             % 64) as u8;
+        if self.text && self.cq_packet {
+            // Header only: the mode, depth and parity do not apply (`link::cq`).
+            let segs = decdsss_link::cq::plan_cq(
+                self.profile,
+                &call,
+                session,
+                self.repeat.max(decdsss_link::cq::DEFAULT_COPIES),
+            )?;
+            let chips = transmission_chips(&segs).ok_or("cannot build the header")?;
+            let audio =
+                chips_to_audio_at(&chips, self.band(), f64::from(rate), self.level, 1.0, 1.0);
+            let audio = self.with_vox(rate, audio);
+            return Ok(Plan {
+                frames: 0,
+                segments: segs.len(),
+                seconds: audio.len() as f64 / f64::from(rate),
+                audio,
+            });
+        }
         if self.text {
             let mode = Mode::from_name(&self.mode).ok_or("choose a mode")?;
             let spec = SendSpec {

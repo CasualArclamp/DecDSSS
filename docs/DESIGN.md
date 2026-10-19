@@ -14,7 +14,7 @@ milestones. Update it when a decision changes.
 
 | Question | Answer |
 |---|---|
-| Payloads | Digital voice (Codec2), SSTV-style pictures, files. (Text was left out at first; a text mode for CQ calls and chat was added on Rory's request later the same day.) |
+| Payloads | Digital voice (Codec2), SSTV-style pictures, files. (Text was left out at first; a text mode for chat and a header-only CQ packet were added on Rory's request later the same day.) |
 | Spreading | Both families as modes: DS-PSK with a spreading-factor ladder, and M-ary code-shift keying (CSK). |
 | Channels | HF SSB skywave; sound card / virtual cable first. |
 | Bandwidths | 2.4 kHz (300–2700 Hz) and 3 kHz (300–3300 Hz), plus a 500 Hz weak-signal profile. |
@@ -337,6 +337,29 @@ CRC-16 (headers) and CRC-32 (payload frames).
 
 ## Payloads and link layer
 
+- **CQ packet** (done): a CQ is only a header. The header already carries the
+  callsign (rate-¼ LDPC, CRC-16, CSK on the call code), so a CQ is a preamble and a
+  header with `nblocks` 0 and `PayloadType::Cq`: no frames, no container, nothing
+  after the header that has to decode too (`link::cq`; the receiver already treated a
+  header announcing no blocks as complete). It always uses the long CSK256 header (the
+  mode field is fixed at DS64 1/2, which is what picks it) whatever mode is set, and
+  is sent in 2 copies by default (`--copies`, up to 8), each decodable alone, so a
+  fade or a burst that takes one leaves the other; `frame0` is the copy number and
+  `total_frames` the copies. Two copies on 2.4 kHz are 25.5 s of signal (the CLI's count; two
+  preambles and headers and the 1 s postamble; `cq::tests` checks the estimate against
+  the real chips). The receiver reports it on the header event (`CQ from CALL` in the
+  CLI and the GUI's Messages panel, once however many copies arrive). The GUI's CQ
+  button sets this up; `tx --cq` is the CLI. *Measured* (`tests/cq.rs::cq_curve`,
+  ignored; 2.4 kHz, 24 trials a point, carrier offset and clock error, in-band SNR,
+  number of trials in which the call was heard): on AWGN one copy was heard in 24 of
+  24 down to −14 dB and in 24 of 24 for two copies down to −16 dB; on moderate fading
+  one copy 21 of 24 at −12 dB, two copies 24 of 24 at −12, 19 at −14 and 5 at −16.
+  The text column counts only the header of a text CQ (DS8 1/2) being decoded, which
+  flatters it: its data frame has to decode as well. Even so it lost
+  the header on AWGN at −16 dB (1 of 24) and on fading at −12 dB (13 of 24, against
+  24 for the packet). Not done: soft-combining the copies' headers (each is decoded
+  alone today, so two copies help by chance, not by adding up), and a CQ carrying
+  anything beyond the callsign (grid, a reply request).
 - **Text** (done): a CQ call or a few lines of chat, up to 1000 bytes of UTF-8, as
   a payload of its own (`PayloadType::Text`, `link::text`). It rides the file
   machinery (the container with no file name, erasure-coded frames, `--parity` and
@@ -344,10 +367,10 @@ CRC-16 (headers) and CRC-32 (payload frames).
   (the GUI's Messages panel, `TEXT from …` in the CLI, and a line in `messages.log`
   in the output folder) instead of saving a file. It always goes out at depth 1: a
   message is a frame or two, and a deeper block would pad it with empty frames and
-  take that many times the air time. `tx --cq` (CLI) and the CQ button (GUI) write
-  "CQ CQ CQ de CALL CALL CALL pse K"; the callsign is in every header as well. The
+  take that many times the air time. A CQ used to be sent as text ("CQ CQ CQ de CALL CALL CALL pse K");
+  that is still `tx --text`, but the CQ button and `tx --cq` now send the CQ packet above. The
   start-up (preamble and header, 6.6 s or more) is most of the air time of a short
-  message, so a robust mode costs little extra: a CQ at DS8 1/2 on 2.4 kHz is 17 s of
+  message, so a robust mode costs little extra: a text CQ at DS8 1/2 on 2.4 kHz is 17 s of
   audio including the postamble. Any bandwidth and any 500 Hz slot (checked end to
   end through the simulator on 2.4 kHz and in the +500 Hz slot, `tests/text.rs`, and
   through the cables in the GUI).

@@ -9,7 +9,8 @@ use decdsss_codec2::Mode as Codec;
 use decdsss_core::{Band, Mode, Profile, Slot};
 use decdsss_link::voice::default_codec;
 use decdsss_link::{
-    Assembler, SendSpec, VoiceSpec, container, max_stream_bytes, plan, plan_text, plan_voice, text,
+    Assembler, SendSpec, VoiceSpec, container, cq::plan_cq, max_stream_bytes, plan, plan_text,
+    plan_voice, text,
 };
 use decdsss_phy::codes::{normalise_call, own_code};
 use decdsss_phy::framing::{Layout, PayloadType};
@@ -62,9 +63,15 @@ enum Command {
         /// Send this text instead of a file: a message the receiver shows as text.
         #[arg(long, conflicts_with_all = ["file", "picture", "voice", "cq"])]
         text: Option<String>,
-        /// Send a CQ call from --call (as text): "CQ CQ CQ de CALL CALL CALL pse K".
+        /// Send a CQ packet from --call: a preamble and a header carrying the callsign
+        /// and nothing else, in the most robust header the modem has (--mode, --depth,
+        /// --parity and --resync do not apply). For a CQ as text, use --text.
         #[arg(long, conflicts_with_all = ["file", "picture", "voice"])]
         cq: bool,
+        /// With --cq, copies of the packet sent back to back (1-8); each decodes on
+        /// its own, so more copies get through a worse channel.
+        #[arg(long, default_value_t = decdsss_link::cq::DEFAULT_COPIES)]
+        copies: usize,
         /// Your callsign (also picks the spreading code your data rides on).
         #[arg(long)]
         call: String,
@@ -235,6 +242,7 @@ fn main() -> Result<()> {
             file,
             text,
             cq,
+            copies,
             call,
             profile,
             slot,
@@ -268,9 +276,9 @@ fn main() -> Result<()> {
             parity,
             repeat,
             if cq {
-                Payload::Text(None)
+                Payload::Cq(copies)
             } else if let Some(t) = text {
-                Payload::Text(Some(t))
+                Payload::Text(t)
             } else if voice {
                 Payload::Voice(VoiceOpts { codec })
             } else if picture {
@@ -496,9 +504,19 @@ fn tx(
         (t % 64) as u8
     });
     let layout = Layout::new(profile, mode, depth);
-    let (segs, summary): (Vec<Segment>, String) = if let Payload::Text(msg) = &payload {
+    let (segs, summary): (Vec<Segment>, String) = if let Payload::Cq(copies) = &payload {
+        // The header is the message; the mode, depth and parity do not apply.
+        let segs = plan_cq(profile, &call, session & 63, *copies).map_err(anyhow::Error::msg)?;
+        let summary = format!(
+            "CQ packet from {call}: {} header-only cop{} in the long header, {} (about {:.0} s of signal)",
+            segs.len(),
+            if segs.len() == 1 { "y" } else { "ies" },
+            band.label(),
+            decdsss_link::cq::air_seconds(profile, segs.len()),
+        );
+        (segs, summary)
+    } else if let Payload::Text(msg) = &payload {
         // A message: always depth 1 (see `decdsss_link::text`).
-        let msg = msg.clone().unwrap_or_else(|| text::cq(&call));
         let spec = SendSpec {
             profile,
             mode,
@@ -510,10 +528,10 @@ fn tx(
             parity: parity / 100.0,
             passes: repeat.max(1),
         };
-        let plan = plan_text(&spec, &msg).map_err(anyhow::Error::msg)?;
+        let plan = plan_text(&spec, msg).map_err(anyhow::Error::msg)?;
         let summary = format!(
             "text {:?}: {} data + {} coded frames in the first pass ({} pass(es), {} frames of {} bytes in all, {} segment(s)), {} {} depth 1",
-            text::tidy(&msg),
+            text::tidy(msg),
             plan.data_frames,
             plan.coded_first_pass,
             plan.passes,
@@ -625,8 +643,10 @@ fn tx(
 
 /// What `tx` sends.
 enum Payload {
-    /// A message; `None` is a CQ call from the callsign.
-    Text(Option<String>),
+    /// A message.
+    Text(String),
+    /// A CQ packet of this many copies (see `decdsss_link::cq`).
+    Cq(usize),
     File,
     Picture(PictureOpts),
     Voice(VoiceOpts),
@@ -756,6 +776,8 @@ struct RxRun {
     frames_ok: usize,
     frames_bad: usize,
     open: std::collections::BTreeSet<(String, u8)>,
+    /// CQ packets already logged, by station and session (a CQ has several copies).
+    cq_heard: std::collections::BTreeSet<(String, u8)>,
 }
 
 impl RxRun {
@@ -773,6 +795,7 @@ impl RxRun {
             frames_ok: 0,
             frames_bad: 0,
             open: Default::default(),
+            cq_heard: Default::default(),
         }
     }
 
@@ -802,6 +825,19 @@ impl RxRun {
                 Event::Lost(why) => {
                     if self.verbose {
                         println!("[{t:7.1}s] {p}: lost it: {why}");
+                    }
+                }
+                Event::Header { header, snr_db, .. } if decdsss_link::cq::is_cq(&header) => {
+                    // A CQ packet is its header: nothing follows to open or wait for.
+                    self.headers += 1;
+                    println!(
+                        "[{t:7.1}s] {p}: {}",
+                        decdsss_link::cq::describe(&header, snr_db)
+                    );
+                    // Copies of one CQ are logged once.
+                    if self.cq_heard.insert((header.call.clone(), header.session)) {
+                        self.messages += 1;
+                        append_message(&self.out_dir, t, &header.call, &p, "CQ (CQ packet)");
                     }
                 }
                 Event::Header { header, snr_db, .. } => {

@@ -5,7 +5,7 @@
 
 A narrowband spread-spectrum modem for amateur radio. It uses direct-sequence
 (DS-PSK) and code-shift-keyed (CSK) spreading inside an SSB voice channel of
-**500 Hz, 2.4 kHz or 3 kHz**, and carries files, pictures, Codec2 speech and text (CQ calls and chat). A signal can sit 15 dB under the noise in its own bandwidth and still
+**500 Hz, 2.4 kHz or 3 kHz**, and carries files, pictures, Codec2 speech and text (CQ packets and chat). A signal can sit 15 dB under the noise in its own bandwidth and still
 decode.
 
 The receiver shows what it is doing, in the style of DecSAT's DVB-CID card:
@@ -90,8 +90,9 @@ cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --mode ds8-1/2 
 # Speech: a WAV, as Codec2 450 (2k4) or 700C (3k), in the profile's voice mode
 cargo run --release -p decdsss-cli -- tx speech.wav --call VK2ABC --profile 2k4 --voice -o voice.wav
 # rx writes CALL-SESSION.wav (8 kHz speech), or a -partial.wav if frames are missing
-# Text: a CQ call, or a message (up to 1000 bytes); rx prints it and adds it to messages.log
-cargo run --release -p decdsss-cli -- tx --cq --call VK2ABC --mode ds8-1/2 -o cq.wav
+# CQ: a header-only packet carrying the callsign, two copies; rx prints "CQ from ..."
+cargo run --release -p decdsss-cli -- tx --cq --call VK2ABC -o cq.wav
+# Text: a message (up to 1000 bytes); rx prints it and adds it to messages.log
 cargo run --release -p decdsss-cli -- tx --text "Hello, 73" --call VK2ABC --profile 500 --slot +500 -o chat.wav
 
 # Measure a mode: frame loss against Eb/N0 through the whole receiver

@@ -8,6 +8,7 @@
 
 pub mod assemble;
 pub mod container;
+pub mod cq;
 pub mod erasure;
 pub mod live;
 pub mod send;

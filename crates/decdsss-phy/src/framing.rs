@@ -34,6 +34,9 @@ pub enum PayloadType {
     Voice450 = 4,
     /// A text message (see `decdsss-link`'s text module).
     Text = 5,
+    /// A CQ call: the header is the whole message (see `decdsss-link`'s cq module),
+    /// so there are no payload blocks.
+    Cq = 6,
 }
 
 impl PayloadType {
@@ -45,6 +48,7 @@ impl PayloadType {
             3 => Some(PayloadType::Voice),
             4 => Some(PayloadType::Voice450),
             5 => Some(PayloadType::Text),
+            6 => Some(PayloadType::Cq),
             _ => None,
         }
     }
