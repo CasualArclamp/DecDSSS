@@ -281,6 +281,9 @@ struct DsWork {
     ul: Vec<Iq>,
     /// The previous displayed symbol, for the differential plot.
     prev_z: Option<Iq>,
+    /// Running mean of the squared distance of a displayed symbol from its
+    /// nearest QPSK point: 1/this is the symbol-rate SNR.
+    err2: f32,
 }
 
 enum Work {
@@ -470,6 +473,7 @@ impl PayloadRx {
                     ue: blank(),
                     ul: blank(),
                     prev_z: None,
+                    err2: 0.5,
                 })));
             }
         }
@@ -967,14 +971,12 @@ impl PayloadRx {
                         push_cap(&mut self.live.diffs, z * p.conj(), LIVE_POINTS);
                     }
                     wk.prev_z = Some(z);
-                    let snr = if wk.pilot_no > 1 {
-                        let a = wk.g[wk.pilot_no - 1][0];
-                        let b = wk.g[wk.pilot_no - 2][0];
-                        let noise = ((a - b).norm_sqr() * 0.5).max(1e-30);
-                        10.0 * (a.norm_sqr() / noise).max(1e-3).log10()
-                    } else {
-                        0.0
-                    };
+                    // The error against the nearest QPSK point, averaged: its
+                    // inverse is the SNR of a symbol after combining.
+                    let k = std::f32::consts::FRAC_1_SQRT_2;
+                    let e = (z.re.abs() - k).powi(2) + (z.im.abs() - k).powi(2);
+                    wk.err2 += 0.02 * (e - wk.err2);
+                    let snr = -10.0 * wk.err2.max(1e-4).log10();
                     self.strip(snr, wk.t.freq, t_sym);
                 }
             }

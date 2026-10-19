@@ -144,8 +144,9 @@ impl Acquirer {
         // Every window is already scaled to a unit noise mean, so the noise
         // mean of the sum is the number of windows in it.
         let norm = self.ring.len() as f32;
-        let cols = cols.clamp(8, self.n);
-        let per = self.n.div_ceil(cols);
+        let per = self.n.div_ceil(cols.clamp(8, self.n));
+        // The columns that really exist after grouping `per` code phases each.
+        let cols = self.n.div_ceil(per);
         let mut data = vec![0.0f32; rows * cols];
         let mut peak = (0.0f32, 0usize, 0usize);
         for r in 0..rows {
