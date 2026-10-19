@@ -1,0 +1,14 @@
+# made by CasualArclamp
+/target
+/target-portable
+# Reference clones and specs — never committed.
+/reference
+# User captures, recordings and run output.
+/samples
+/captures
+/out
+# Portable builds; the exes are published on GitHub releases instead.
+/exe/*.exe
+*.wav
+*.cf32
+*.cs16

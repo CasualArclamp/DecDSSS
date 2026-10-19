@@ -1,0 +1,232 @@
+<!-- made by CasualArclamp -->
+# DecDSSS — design
+
+A narrowband spread-spectrum modem for amateur radio: direct-sequence and
+code-shift-keyed spreading inside an SSB voice channel (500 Hz, 2.4 kHz or
+3 kHz), carrying digital voice, pictures and files, with a receiver that shows
+everything it is doing — acquisition surface, chip-phase correlation, rake
+fingers, code tracking, constellations — in the style of DecSAT's DVB-CID card.
+
+This file holds the agreed scope, the air interface, the crate layout and the
+milestones. Update it when a decision changes.
+
+## Decisions (Rory, 2026-10-19)
+
+| Question | Answer |
+|---|---|
+| Payloads | Digital voice (Codec2), SSTV-style pictures, files. No text/chat mode. |
+| Spreading | Both families as modes: DS-PSK with a spreading-factor ladder, and M-ary code-shift keying (CSK). |
+| Channels | HF SSB skywave; sound card / virtual cable first. |
+| Bandwidths | 2.4 kHz (300–2700 Hz) and 3 kHz (300–3300 Hz), plus a 500 Hz weak-signal profile. |
+| Station ID | Callsign in the header only (no CW ID). |
+| Code use | CDMA: a common *call code* for preambles and headers, then data on a code derived from the station's callsign; the receiver despreads every station it finds at once. |
+| Radio I/O | Sound card with VOX/manual PTT; CAT keying for IC-7300 / FT-710 (from voicemodem); WAV and IQ files in and out. |
+| Receiver panels | DVB-CID's set, plus acquisition heatmap, rake/multipath profile, waterfall + PSD against the noise floor, chip scope. |
+| Link | Both: one-way broadcast with FEC, and an ARQ connected mode for files. |
+| FEC | LDPC with a time interleaver. |
+| First | The modem and its panels, proven on file transfer through WAV and VB-Audio cables; then pictures; then voice. |
+| GitHub | `CasualArclamp/DecDSSS`, private for now. |
+| Stack | Rust workspace like DecSAT: egui GUI + CLI, portable exes, CI on Actions, GPL-3.0-or-later. |
+
+**Licence conditions are Rory's call.** Some administrations restrict spread
+spectrum below VHF (US Part 97 allows SS emissions only on 222 MHz and up,
+§97.305(c)). DecDSSS never keys a transmitter on its own.
+
+## Air interface
+
+### Profiles
+
+Chips are root-raised-cosine shaped with roll-off α = 0.25, so a profile
+occupies exactly `chip rate × 1.25`. The chip rates divide 48 kHz, so a
+transmitter at 48 kHz runs an integer number of samples per chip.
+
+| Profile | Chip rate | Centre | Occupies | Samples/chip @ 48 kHz | Chip length |
+|---|---|---|---|---|---|
+| `500` | 400 chip/s | 1500 Hz | 1250–1750 Hz | 120 | 2.5 ms |
+| `2k4` | 1920 chip/s | 1500 Hz | 300–2700 Hz | 25 | 0.52 ms |
+| `3k` | 2400 chip/s | 1800 Hz | 300–3300 Hz | 20 | 0.42 ms |
+
+On `2k4` and `3k`, a chip is short against HF delay spreads (0.5–3 ms), so
+multipath resolves into separate paths a rake receiver can combine. On `500`,
+it mostly does not (flat fading).
+
+### Chips and codes
+
+The transmitted chip stream is complex: every chip is the modulation symbol
+times a QPSK scrambling chip `(±1 ± j)/√2` drawn from two Gold sequences, one
+for I and one for Q. A Gold family of degree 15 gives 32 769 sequences.
+Index 0 is the **call code**, shared by everyone. A station's **own code** is
+picked by a hash of its callsign. The scrambler restarts at each frame
+boundary, so a receiver that has the frame timing also has the code phase.
+
+Over the scrambler, the two families modulate differently:
+
+- **DS-PSK** — a QPSK data symbol held for SF chips, with SF in {4, 8, 16, 32,
+  64}. Coherent detection with time-multiplexed pilots: one known symbol in
+  every 8 (`PILOT_INTERVAL`). The rake estimates each path's gain from the pilots
+  and combines them by maximal ratio.
+- **CSK** — cyclic code-shift keying, as in JTIDS: an L-chip base sequence with
+  near-ideal periodic autocorrelation, cyclically shifted by the symbol value,
+  so a symbol carries log₂L bits. L is in {32, 64, 128, 256}. Detection is
+  noncoherent: one FFT circular correlation per symbol, with the argmax shift as
+  the symbol. Bit LLRs come by max-log from the correlation powers, and the
+  rake adds the powers at each path's delay. No pilots are needed, and the phase
+  only has to hold for one symbol, which suits HF fading at the robust end.
+
+Base sequences are binary (an m-sequence extended by one chip), not
+Zadoff–Chu: ZC's delay–Doppler ridge turns a residual frequency error into a
+code-phase shift, which for CSK means a wrong symbol.
+
+### Rates
+
+`decdsss modes` prints the full table. On `2k4`, with rate-½ LDPC:
+
+| Mode | Symbols/s | Coded bit/s | Info bit/s @ r=½ |
+|---|---|---|---|
+| DS4 | 480 | 840 | 420 |
+| DS8 | 240 | 420 | 210 |
+| DS16 | 120 | 210 | 105 |
+| DS32 | 60 | 105 | 52.5 |
+| DS64 | 30 | 52.5 | 26.3 |
+| CSK32 | 60 | 300 | 150 |
+| CSK64 | 30 | 180 | 90 |
+| CSK128 | 15 | 105 | 52.5 |
+| CSK256 | 7.5 | 60 | 30 |
+
+`3k` is 1.25× these rates and `500` is 0.208×. FEC rates are ½, ⅔ and ¾. The
+in-band SNR a mode needs is `Eb/N0 + 10·log₁₀(Rb / B)`, where B is the profile's
+occupied width. The CLI prints that offset per mode. The Eb/N0 thresholds
+themselves are measured in M1 on the channel simulator, not assumed.
+
+Voice uses the fast end, and that is the price of spreading in 2.4 kHz:
+
+- **Voice on `2k4`:** DS4 ⅔ gives 560 bit/s, enough for Codec2 450.
+- **Voice on `3k`:** DS4 ¾ gives 787 bit/s, enough for Codec2 700C.
+- **`500`:** no voice.
+
+Processing gain against narrowband interference is then about 6 dB. Pictures
+and files can use the deep end.
+
+### Over structure
+
+An *over* (one transmission) is:
+
+1. **Preamble** — K periods of an m-sequence on the call code, repeated so the
+   receiver can search code phase × frequency with FFT circular correlation.
+   There are two preamble sequences. One announces a *fast* header (CSK64), for
+   DS modes and CSK32/64. The other announces a *robust* header (CSK256), for
+   CSK128/256. The receiver searches for both.
+2. **Header** — CSK on the call code, carrying a short LDPC codeword with a CRC.
+   It holds the version, profile, mode, payload type, callsign (base-37 packed),
+   payload length or "stream", the session ID and, for ARQ, the destination.
+3. **Payload frames** — on the station's own code, in the header's mode,
+   LDPC-coded and time-interleaved, with depth set per payload: short for voice,
+   long for files.
+4. **Resync blocks** — every ~15 s of air time, a short preamble and a header on
+   the call code with the frame number, so late joiners can lock and receivers
+   can recover after a deep fade.
+5. **End of over** — a marker block on the call code.
+
+Several stations may transmit at once: their preambles overlap only by
+coincidence, their payloads sit on different codes, and the receiver opens one
+decoding channel per detected header. Near–far is the limit: a station far
+stronger than the processing gain masks a weak one.
+
+### Receiver chain
+
+Audio at the device rate goes through a resampler to complex baseband at 4
+samples/chip around the profile centre. Every profile is searched at once.
+
+1. **Acquisition** — FFT circular correlation of the call-code preambles across
+   frequency bins (±100 Hz on `2k4`/`3k`, ±25 Hz on `500`), noncoherent
+   accumulation over periods, and a CFAR threshold.
+2. **Tracking** — a code DLL (early/prompt/late), carrier frequency tracking from
+   pilots (DS) or from successive CSK peaks, and rake fingers on the paths the
+   channel profile shows.
+3. **Demodulation and decoding** — header decode, then per-channel payload
+   demodulation, deinterleaving, LDPC decoding (normalised min-sum) and the
+   payload layer.
+
+### FEC
+
+DecDSSS's own quasi-cyclic LDPC codes: IRA (dual-diagonal parity) so encoding is
+linear-time. Base matrices are built by a deterministic, seeded girth-
+conditioned search (offline, `decdsss ldpc-design`), frozen as tables in
+source, and verified by tests (girth, rank, simulated FER). Codeword lengths
+are chosen in M1 to fit voice latency (short) and file throughput (long). A
+convolutional block interleaver spans HF fades. Frame CRCs are CRC-16/32.
+
+## Payloads and link layer
+
+- **Files** (M2): one-way, split into frames. Extra frames are erasure-coded
+  (Cauchy Reed–Solomon across frames, as in COFDMtv), so any large enough
+  subset rebuilds the file.
+- **Pictures** (M3): COFDMtv's pipeline. WebP by default, progressive JPEG as an
+  option, sized by air time, systematic frames first so the picture draws as it
+  arrives.
+- **Voice** (M4): Codec2 (450 on `2k4`, 700C on `3k`), streamed in PTT overs with
+  a short interleaver. Codecs run off the real-time loop (voicemodem's lesson).
+- **ARQ** (M5): a connected mode for files on both stations' own codes, with
+  selective repeat and ACK bitmaps sent at a robust mode.
+
+## Receiver panels (GUI)
+
+DecSAT's instrument-panel look: dark faces, hairline frames, one muted hue per
+quantity.
+
+- **Band view** — waterfall and spectrum of the audio passband with the three
+  profiles marked; PSD against the estimated noise floor, so you can see the
+  spread signal sitting under the noise beside its despread SNR.
+- **Per station** (one card per decoding channel):
+  - acquisition heatmap (code phase × frequency, peak marked)
+  - chip-phase correlation profile around the prompt
+  - rake / multipath profile (path delays and strengths in chips, fingers marked)
+  - E/P/L code tracking
+  - despread constellation, and the symbol × previous symbol constellation
+  - chip scope (raw chips against the local replica, chip eye)
+  - despread SNR and frequency strips
+  - soft bits, frame sync, and LDPC iterations / FER
+- **Payload views** — picture as it arrives, file list, voice level.
+- **Transmit** — profile, mode, payload, callsign, PTT (VOX/manual/CAT).
+
+## Radio I/O
+
+Sound card in and out (cpal), with VOX or manual PTT. CAT keying for the IC-7300
+and FT-710 comes from voicemodem's `rig` crate. Files: WAV (mono audio, or
+stereo as I/Q) and raw `cf32`. Live tests go through VB-Audio cable A, which is
+silent.
+
+## Crate layout
+
+| Crate | Role |
+|---|---|
+| `decdsss-core` | Profiles, modes, rates — the fixed numbers. |
+| `decdsss-dsp` | NCO, RRC, resamplers, FFT correlation, AGC (M1). |
+| `decdsss-fec` | QC-LDPC, interleaver, CRC, erasure code (M1–M2). |
+| `decdsss-phy` | Codes, TX modulator, acquisition, tracking, rake, demod, over framing (M1). |
+| `decdsss-chan` | Channel simulator: AWGN, frequency offset and drift, Watterson HF fading (ITU-R F.1487 good/moderate/poor) (M1). |
+| `decdsss-audio` | Sound card and WAV/IQ file I/O (M2). |
+| `decdsss-link` | Files, pictures, voice, ARQ (M2–M5). |
+| `decdsss-rig` | CAT keying (M4). |
+| `apps/decdsss-cli` | `decdsss` CLI: modes, tx/rx to WAV, simulate, measure. |
+| `apps/decdsss-gui` | egui GUI (M2). |
+
+## Milestones
+
+- **M0** — scaffold, this document, CI, private GitHub repo. `decdsss modes`.
+- **M1** — modem core: codes, TX, channel simulator, acquisition, tracking, rake,
+  DS-PSK and CSK demod, LDPC and interleaver, header; `decdsss tx/rx` through
+  WAV; measured Eb/N0 thresholds per mode on AWGN and Watterson channels.
+- **M2** — GUI with every receiver panel, live sound card RX/TX, one-way files.
+  Checked through VB-Audio cable A.
+- **M3** — pictures.
+- **M4** — voice, VOX/manual PTT, CAT keying.
+- **M5** — ARQ connected mode.
+- **M6** — polish and the first release (portable exes), when Rory says so.
+
+## Verification
+
+The channel simulator is the reference: every mode's threshold is measured on
+AWGN and on the three Watterson channels, with frequency offset and drift. The
+results go in this file and in README. Heavy sweeps run on CI, not on Rory's
+machine. Live radio tests are Rory's.

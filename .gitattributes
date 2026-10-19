@@ -1,0 +1,17 @@
+# made by CasualArclamp
+# Normalise text in the repository to LF; Git checks it out native on Windows.
+* text=auto
+
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+
+# Recordings and binaries are never diffed or line-ending converted.
+*.wav binary
+*.cf32 binary
+*.cs16 binary
+*.png binary
+*.exe binary

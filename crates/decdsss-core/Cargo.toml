@@ -1,0 +1,11 @@
+# made by CasualArclamp
+[package]
+name = "decdsss-core"
+description = "DecDSSS air-interface constants: bandwidth profiles, the mode ladder and their rates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
