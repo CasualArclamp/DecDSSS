@@ -138,6 +138,8 @@ pub struct App {
     /// The last view of each station, kept after its segment ends so the card
     /// does not flicker away between segments: (profile, call, session).
     stations: std::collections::BTreeMap<(usize, String, u8), (ChannelView, Instant)>,
+    /// What the two plots of every station card show (left, right).
+    card_plots: [Plot; 2],
     /// The texture of each picture on show and the version it was made from.
     pictures: std::collections::BTreeMap<(String, u8), (u64, TextureHandle)>,
 }
@@ -209,6 +211,16 @@ impl App {
             .get("monitor_volume")
             .and_then(|v| v.parse().ok())
             .map_or(1.0, |v: f32| v.clamp(0.0, 4.0));
+        let card_plots = [
+            prefs
+                .get("card_left")
+                .and_then(Plot::from_key)
+                .unwrap_or(Plot::Symbols),
+            prefs
+                .get("card_right")
+                .and_then(Plot::from_key)
+                .unwrap_or(Plot::Delay),
+        ];
         let mut app = App {
             engine: Engine::spawn(),
             source,
@@ -246,6 +258,7 @@ impl App {
             live_started: false,
             live_stopped: false,
             stations: Default::default(),
+            card_plots,
             pictures: Default::default(),
         };
         if let Some(hint) = app.auto.listen.clone() {
@@ -720,11 +733,20 @@ impl App {
                         (v.clone(), live.contains(&(call.clone(), *session)))
                     })
                     .collect();
+                // Every card shares one choice of plots: a tab clicked on any
+                // card changes them all, and is remembered.
+                let mut plots = self.card_plots;
                 for (c, is_live) in &keep {
                     let tr = transfers
                         .iter()
                         .find(|t| t.call == c.header.call && t.session == c.header.session);
-                    channel_card(ui, c, tr, w, *is_live);
+                    channel_card(ui, c, tr, w, *is_live, &mut plots);
+                }
+                if plots != self.card_plots {
+                    self.card_plots = plots;
+                    self.prefs.set("card_left", plots[0].key());
+                    self.prefs.set("card_right", plots[1].key());
+                    self.prefs.save();
                 }
             });
     }
@@ -1059,109 +1081,262 @@ fn attempt_card(ui: &mut Ui, a: &AttemptView, w: f32) {
     }
     // The header is a stretch of its own, 2.9 to 8.5 s on 2k4: its symbols as
     // they come in, in the alphabet being tried (the shortest first, a longer one
-    // if that does not decode), laid out like a CSK station's card.
+    // if that does not decode), plots side by side as on a station card.
     if let Some(h) = a.header.as_ref().filter(|_| a.header_stage) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
+            let inner = w - 24.0;
             let gap = ui.spacing().item_spacing.x;
-            let side = ((w - 2.0 * gap - 24.0) / 3.0).clamp(90.0, 170.0);
-            ui.horizontal(|ui| {
+            let half = ((inner - gap) / 2.0).floor();
+            ui.horizontal_top(|ui| {
+                let size = vec2(half, half.min(CARD_PLOT_H));
                 scope::constellation(
                     ui,
                     "Symbol × previous",
                     &h.points,
                     &[(1.0, 0.0)],
-                    side,
+                    size,
                     col::TRACE,
                 );
-                scope::bank(ui, &h.bank, side);
-                scope::epl(ui, h.epl, side);
+                scope::bank(ui, &h.bank, size);
             });
-            scope::header_symbols(
-                ui,
-                h,
-                a.header_since_s,
-                a.header_needs_s,
-                vec2(w - 24.0, 72.0),
-            );
-            scope::rake(ui, &h.profile, &h.fingers, vec2(w - 24.0, 80.0));
+            scope::header_symbols(ui, h, a.header_since_s, a.header_needs_s, vec2(inner, 72.0));
+            ui.horizontal_top(|ui| {
+                scope::rake(ui, &h.profile, &h.fingers, vec2(half, 96.0));
+                scope::epl(ui, h.epl, vec2(half, 96.0));
+            });
         });
     }
 }
 
-fn channel_card(ui: &mut Ui, c: &ChannelView, tr: Option<&Transfer>, w: f32, is_live: bool) {
+/// What one of a station card's two plots shows. `Symbols` and `Detail`
+/// depend on the family: the Walsh bank and the last symbol's bars for CSK,
+/// the despread constellation and symbol × previous for DS-PSK.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Plot {
+    Symbols,
+    Detail,
+    Timing,
+    Delay,
+    Chips,
+    Soft,
+    Snr,
+    Carrier,
+}
+
+impl Plot {
+    const ALL: [Plot; 8] = [
+        Plot::Symbols,
+        Plot::Detail,
+        Plot::Timing,
+        Plot::Delay,
+        Plot::Chips,
+        Plot::Soft,
+        Plot::Snr,
+        Plot::Carrier,
+    ];
+
+    /// The tab's name.
+    fn label(self, family: Family) -> &'static str {
+        match (self, family) {
+            (Plot::Symbols, Family::Csk) => "Walsh",
+            (Plot::Symbols, Family::DsPsk) => "Const",
+            (Plot::Detail, Family::Csk) => "Bars",
+            (Plot::Detail, Family::DsPsk) => "Sym×prev",
+            (Plot::Timing, _) => "Timing",
+            (Plot::Delay, _) => "Delay",
+            (Plot::Chips, _) => "Chips",
+            (Plot::Soft, _) => "LLR",
+            (Plot::Snr, _) => "SNR",
+            (Plot::Carrier, _) => "Carrier",
+        }
+    }
+
+    /// The name it is saved under.
+    fn key(self) -> &'static str {
+        match self {
+            Plot::Symbols => "symbols",
+            Plot::Detail => "detail",
+            Plot::Timing => "timing",
+            Plot::Delay => "delay",
+            Plot::Chips => "chips",
+            Plot::Soft => "soft",
+            Plot::Snr => "snr",
+            Plot::Carrier => "carrier",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<Plot> {
+        // Rust note: `into_iter().find` walks the array by value and stops at
+        // the first match.
+        Plot::ALL.into_iter().find(|p| p.key() == s)
+    }
+}
+
+/// Height of a station card's two plots, px.
+const CARD_PLOT_H: f32 = 190.0;
+
+/// The symbol SNR over the last three strip points (about 1.5 s), averaged as
+/// powers; `None` with no points yet.
+fn recent_snr_db(v: &[f32]) -> Option<f32> {
+    let tail = &v[v.len().saturating_sub(3)..];
+    if tail.is_empty() {
+        return None;
+    }
+    let p = tail.iter().map(|d| 10f32.powf(d / 10.0)).sum::<f32>() / tail.len() as f32;
+    Some(10.0 * p.log10())
+}
+
+/// One station: who and where, the mode and its link margin, the numbers that
+/// matter, two plots chosen by tabs (`plots`, shared by every card), and the
+/// frame map.
+fn channel_card(
+    ui: &mut Ui,
+    c: &ChannelView,
+    tr: Option<&Transfer>,
+    w: f32,
+    is_live: bool,
+    plots: &mut [Plot; 2],
+) {
     let h = &c.header;
     let live = &c.live;
+    let family = h.mode.family;
     egui::Frame::group(ui.style()).show(ui, |ui| {
+        let inner = w - 24.0;
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(&h.call).strong().size(15.0).color(col::LOCK));
-            ui.label(RichText::new(format!("{}  depth {}", h.mode, h.depth)).strong());
+            ui.label(RichText::new(format!("depth {}", h.depth)).strong());
             ui.label(format!(
-                "session {}  ·  block {}/{}  ·  symbol {}/{}  ·  carrier {:+.2} Hz",
+                "session {}  ·  block {}/{}  ·  symbol {}/{}",
                 h.session,
                 c.blocks_done + 1,
                 h.nblocks,
                 live.symbol,
                 live.symbols_in_block,
-                c.carrier_hz
             ));
             if !is_live {
                 ui.label(RichText::new("between segments").italics());
             }
         });
+
+        // The mode and its margin. Between segments there is no reading.
+        let es = if is_live {
+            recent_snr_db(&live.snr_db)
+        } else {
+            None
+        };
+        let ebn0 = es.map(|e| h.mode.ebn0_from_es_db(f64::from(e)));
+        let (need, measured) = h.mode.ebn0_needed_db(h.profile);
+        scope::margin_bar(
+            ui,
+            &scope::Margin {
+                mode: h.mode.to_string(),
+                ebn0_db: ebn0.map(|e| e as f32),
+                snr_db: ebn0.map(|e| (e + h.mode.snr_offset_db(h.profile)) as f32),
+                need_db: need as f32,
+                measured,
+                between: !is_live,
+            },
+            inner,
+        );
+
+        // The numbers, latest values.
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            // Each name and value in a group of its own, so a narrow card
+            // wraps between quantities, never inside one.
+            let kpi = |ui: &mut Ui, name: &str, value: String| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(name).weak());
+                    ui.label(RichText::new(value).monospace().strong());
+                });
+                ui.add_space(8.0);
+            };
+            let e = live.epl;
+            let disc = (e[0] - e[2]) / (e[0] + e[2]).max(1e-6);
+            match live.snr_db.last() {
+                Some(s) => kpi(ui, "Symbol SNR", format!("{s:.1} dB")),
+                None => kpi(ui, "Symbol SNR", "–".into()),
+            }
+            kpi(ui, "Carrier", format!("{:+.2} Hz", c.carrier_hz));
+            kpi(ui, "E−L", format!("{disc:+.2}"));
+        });
+
+        // The two plots, each under its own row of tabs.
         let gap = ui.spacing().item_spacing.x;
-        let side = ((w - 2.0 * gap - 24.0) / 3.0).clamp(90.0, 170.0);
-        ui.horizontal(|ui| match h.mode.family {
-            Family::DsPsk => {
-                scope::constellation(
-                    ui,
-                    "Despread symbols",
-                    &live.symbols,
-                    &scope::QPSK,
-                    side,
-                    col::TRACE,
-                );
-                scope::constellation(
-                    ui,
-                    "Symbol × previous",
-                    &live.diffs,
-                    &scope::QUADRANTS,
-                    side,
-                    col::LOCK,
-                );
-                scope::epl(ui, live.epl, side);
-            }
-            Family::Csk => {
-                scope::bank(ui, &live.bank, side);
-                scope::bank_bars(ui, live.bank.last(), side);
-                scope::epl(ui, live.epl, side);
+        let half = ((inner - gap) / 2.0).floor();
+        ui.horizontal_top(|ui| {
+            // Rust note: `iter_mut` hands out `&mut Plot` for each slot, so a
+            // click writes straight into the caller's array.
+            for slot in plots.iter_mut() {
+                ui.vertical(|ui| {
+                    ui.set_width(half);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for p in Plot::ALL {
+                            let text = RichText::new(p.label(family)).size(11.0);
+                            if ui.selectable_label(*slot == p, text).clicked() {
+                                *slot = p;
+                            }
+                        }
+                    });
+                    plot(ui, *slot, c, vec2(half, CARD_PLOT_H));
+                });
             }
         });
-        ui.horizontal(|ui| {
-            scope::rake(
-                ui,
-                &live.profile,
-                &live.fingers,
-                vec2(2.0 * side + gap, 96.0),
-            );
-            scope::chip_scope(ui, &live.raw_chips, &live.despread_chips, vec2(side, 96.0));
-        });
-        let snr = live.snr_db.last().copied().unwrap_or(f32::NAN);
-        let f = live.freq_hz.last().copied().unwrap_or(f32::NAN);
-        ui.horizontal(|ui| {
-            let half = (w - gap - 24.0) / 2.0;
-            let cap = decdsss_phy::rx::payload::LIVE_STRIP;
+        if let Some(t) = tr {
+            scope::frame_map(ui, &t.map, t.have, vec2(inner, 34.0));
+        }
+    });
+}
+
+/// Draws one of a station card's plots `size` big.
+fn plot(ui: &mut Ui, p: Plot, c: &ChannelView, size: egui::Vec2) {
+    let live = &c.live;
+    let ds = c.header.mode.family == Family::DsPsk;
+    let cap = decdsss_phy::rx::payload::LIVE_STRIP;
+    // Rust note: `Plot::Symbols if ds` is a match guard: the arm is taken only
+    // when the pattern matches and the condition holds, else the next arm is
+    // tried.
+    match p {
+        Plot::Symbols if ds => scope::constellation(
+            ui,
+            "Despread symbols",
+            &live.symbols,
+            &scope::QPSK,
+            size,
+            col::TRACE,
+        ),
+        Plot::Symbols => scope::bank(ui, &live.bank, size),
+        Plot::Detail if ds => scope::constellation(
+            ui,
+            "Symbol × previous",
+            &live.diffs,
+            &scope::QUADRANTS,
+            size,
+            col::LOCK,
+        ),
+        Plot::Detail => scope::bank_bars(ui, live.bank.last(), size),
+        Plot::Timing => scope::epl(ui, live.epl, size),
+        Plot::Delay => scope::rake(ui, &live.profile, &live.fingers, size),
+        Plot::Chips => scope::chip_scope(ui, &live.raw_chips, &live.despread_chips, size),
+        Plot::Soft => scope::soft_bits(ui, &live.soft, size),
+        Plot::Snr => {
+            let s = live.snr_db.last().copied().unwrap_or(f32::NAN);
             scope::strip(
                 ui,
                 "Symbol SNR",
-                &format!("{snr:.1} dB"),
+                &format!("{s:.1} dB"),
                 &live.snr_db,
                 scope::Strip {
                     cap,
                     color: col::LOCK,
                     min_span: 6.0,
                 },
-                vec2(half, 56.0),
+                size,
             );
+        }
+        Plot::Carrier => {
+            let f = live.freq_hz.last().copied().unwrap_or(f32::NAN);
             scope::strip(
                 ui,
                 "Carrier",
@@ -1172,14 +1347,10 @@ fn channel_card(ui: &mut Ui, c: &ChannelView, tr: Option<&Transfer>, w: f32, is_
                     color: col::TRACE,
                     min_span: 0.5,
                 },
-                vec2(half, 56.0),
+                size,
             );
-        });
-        scope::soft_bits(ui, &live.soft, vec2(w - 24.0, 44.0));
-        if let Some(t) = tr {
-            scope::frame_map(ui, &t.map, t.have, vec2(w - 24.0, 34.0));
         }
-    });
+    }
 }
 
 impl eframe::App for App {

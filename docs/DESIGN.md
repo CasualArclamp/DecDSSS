@@ -398,14 +398,14 @@ started from, if any, so `--version` and `--write-demo` still print.
 - **Header** (a card per candidate once its preamble has ended, until the header
   decodes): the symbols of the alphabet being tried, despread as they arrive by
   the same per-symbol loop that decodes them (`rx::header::HeaderWatch`):
-  - symbol × previous symbol (main finger, decided code), the carrier's mean turn
-    a symbol taken off. CSK carries nothing in the phase, so the header being
-    sent is one cluster at 1 and noise a ring; a longer header seen in a shorter
-    alphabet is two clusters at ±1, half the points each (see Header above).
-    Neighbouring symbols rather than a running phase reference: on the moderate
-    channel a reference slipped 180° in a fade and painted the real header as
-    the wrong one
-  - the Walsh correlator bank and early/prompt/late timing, as on a CSK station
+  - side by side, as on a station card: symbol × previous symbol (main finger,
+    decided code), the carrier's mean turn a symbol taken off, and the Walsh
+    correlator bank. CSK carries nothing in the phase, so the header being sent
+    is one cluster at 1 and noise a ring; a longer header seen in a shorter
+    alphabet is two clusters at ±1, about half the points each (derived, see
+    Header above). Neighbouring symbols rather than a running phase reference:
+    on the moderate channel a reference slipped 180° in a fade and painted the
+    real header as the wrong one
   - in place of a progress bar: one bar a symbol across the whole header, its
     height the decision margin (decided code over the runner-up; noise alone is
     about 1 dB, derived, and drawn as a line), green in phase with the symbol
@@ -415,16 +415,30 @@ started from, if any, so `--version` and `--write-demo` still print.
     more (display choices: `the_watch_tells_the_alphabet_sent_by_its_phase`
     measured 0–3 % for the alphabet sent and 34–41 % for a shorter one, AWGN at
     0 dB and moderate fading at +2 dB in-band)
-  - the preamble's delay profile with the fingers the header uses
+  - the preamble's delay profile with the fingers the header uses, and
+    early/prompt/late timing
 - **Per station** (one card per decoding channel; dimmed between segments):
-  - DS-PSK: despread constellation (Es/N0 from the error), symbol × previous
-    symbol, early/prompt/late timing; CSK: the Walsh correlator bank (a waterfall
-    of the correlators whose bright trace is the decided codes), the last symbol's
-    bars, timing
-  - the delay profile with the rake fingers marked (multipath, in chips)
-  - the chip scope (the last symbol's chips as received, and despread)
-  - symbol SNR and carrier strips
-  - the last codeword's soft bits, and a frame map of the transmission
+  - the mode and its link margin, laid out as DecSAT's DVB card: the margin is
+    the Eb/N0 now less the Eb/N0 the mode needs, red below 0 dB, amber within
+    1 dB; under it an Eb/N0 bar on a fixed 0–20 dB scale with a tick at the need,
+    and the Eb/N0 and in-band SNR as numbers. The need is the AWGN no-loss figure
+    under Verification where that mode was measured on that profile, else 4.0 dB
+    (shown as ≈; most measured modes came out there). Eb/N0 is the symbol SNR over
+    the last 1.5 s less 10·log10 of the information bits a symbol, pilots counted
+    as air time (padding left out). CSK's SNR is the main path's alone, so with
+    multipath its margin reads low.
+  - symbol SNR, carrier and E−L as numbers
+  - two plots side by side, each chosen by its own row of tabs (the choice is
+    shared by every card and remembered): DS-PSK's despread constellation (Es/N0
+    from the error) or symbol × previous symbol, CSK's Walsh correlator bank (a
+    waterfall of the correlators whose bright trace is the decided codes) or the
+    last symbol's bars; and for both early/prompt/late timing, the delay profile
+    with the rake fingers (multipath, in chips), the chip scope (the last symbol's
+    chips as received, and despread), the last codeword's soft bits, and the
+    symbol SNR and carrier strips. A strip point is half a second: the signal
+    powers summed over the noise powers summed. Left defaults to the
+    constellation or the Walsh bank, right to the delay profile.
+  - a frame map of the transmission
 - **Files** — the received list (click to open), progress bars, the log.
 - **Speech** — cards in the same strip: the waveform of the speech so far
   (frames not yet in are shaded red and silent), frames in against frames in

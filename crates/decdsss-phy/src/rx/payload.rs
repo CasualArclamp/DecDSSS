@@ -320,8 +320,11 @@ pub struct PayloadRx {
     rate: f64,
     work: Option<Work>,
     live: Live,
-    /// Symbols since the last strip point.
+    /// Symbols since the last strip point, and their signal and noise powers
+    /// summed.
     strip_count: usize,
+    strip_signal: f64,
+    strip_noise: f64,
     /// The last block's interleaved LLRs (kept for the tests).
     #[cfg(test)]
     pub last_llrs: Vec<f32>,
@@ -350,6 +353,8 @@ impl PayloadRx {
                 ..Live::default()
             },
             strip_count: 0,
+            strip_signal: 0.0,
+            strip_noise: 0.0,
             #[cfg(test)]
             last_llrs: Vec::new(),
         })
@@ -776,12 +781,22 @@ impl PayloadRx {
         }
     }
 
-    /// Adds a strip point (SNR and carrier) about twice a second.
-    fn strip(&mut self, snr_db: f32, freq: f64, sym_s: f64) {
+    /// Takes one symbol's signal and noise powers and adds a strip point (SNR
+    /// and carrier) about twice a second. The SNR point is the ratio of the
+    /// sums over the symbols since the last point, so it is a half-second
+    /// average rather than one symbol's draw (a CSK symbol's alone wanders by
+    /// decibels).
+    fn strip(&mut self, signal: f32, noise: f32, freq: f64, sym_s: f64) {
         self.strip_count += 1;
+        self.strip_signal += f64::from(signal);
+        self.strip_noise += f64::from(noise);
         if self.strip_count as f64 * sym_s >= 0.5 {
+            let snr_db =
+                10.0 * (self.strip_signal.max(1e-30) / self.strip_noise.max(1e-30)).log10();
             self.strip_count = 0;
-            push_cap(&mut self.live.snr_db, snr_db, LIVE_STRIP);
+            self.strip_signal = 0.0;
+            self.strip_noise = 0.0;
+            push_cap(&mut self.live.snr_db, snr_db as f32, LIVE_STRIP);
             push_cap(&mut self.live.freq_hz, freq as f32, LIVE_STRIP);
         }
     }
@@ -857,11 +872,9 @@ impl PayloadRx {
                 row.iter().map(|v| v / mx).collect(),
                 LIVE_ROWS,
             );
-            self.strip(
-                10.0 * (((row[m] - noise).max(1e-30)) / noise.max(1e-30)).log10(),
-                wk.t.freq,
-                t_sym,
-            );
+            // Signal: the winner less the mean of the others (its noise share);
+            // summed over the half second, so it is not clipped here.
+            self.strip(row[m] - noise, noise, wk.t.freq, t_sym);
             // The chips as received, carrier off, scrambler on.
             if s.is_multiple_of(4) {
                 let dphi = wk.t.dphase();
@@ -1019,8 +1032,8 @@ impl PayloadRx {
                     let k = std::f32::consts::FRAC_1_SQRT_2;
                     let e = (z.re.abs() - k).powi(2) + (z.im.abs() - k).powi(2);
                     wk.err2 += 0.02 * (e - wk.err2);
-                    let snr = -10.0 * wk.err2.max(1e-4).log10();
-                    self.strip(snr, wk.t.freq, t_sym);
+                    // Unit-amplitude symbols: signal 1, noise the mean error.
+                    self.strip(1.0, wk.err2.max(1e-4), wk.t.freq, t_sym);
                 }
             }
             if s.is_multiple_of(8) {
