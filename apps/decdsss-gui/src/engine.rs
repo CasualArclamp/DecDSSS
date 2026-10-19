@@ -10,7 +10,7 @@ use crate::player::Player;
 use crate::spectrum::Spectrum;
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_codec2::Mode as Codec;
-use decdsss_core::Profile;
+use decdsss_core::Band;
 use decdsss_link::{Assembler, ReceivedFile, ReceivedVoice};
 use decdsss_phy::framing::PayloadType;
 use decdsss_phy::rx::{Event, MultiReceiver, Snapshot};
@@ -37,7 +37,7 @@ pub enum Source {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub source: Source,
-    pub profiles: Vec<Profile>,
+    pub bands: Vec<Band>,
     pub out_dir: PathBuf,
     /// Faster than real time for files and the demo.
     pub speed: f64,
@@ -548,10 +548,10 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
             )
         }
     };
-    let profiles = if cfg.profiles.is_empty() {
-        Profile::ALL.to_vec()
+    let bands = if cfg.bands.is_empty() {
+        Band::ALL.to_vec()
     } else {
-        cfg.profiles.clone()
+        cfg.bands.clone()
     };
     {
         let mut g = shared.lock().unwrap();
@@ -570,7 +570,7 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
     Ok(Run {
         reader,
         rate,
-        mr: MultiReceiver::new(&profiles, rate),
+        mr: MultiReceiver::with_bands(&bands, rate),
         spectrum: Spectrum::new(rate),
         asm: Assembler::new(),
         out_dir: cfg.out_dir.clone(),
@@ -652,7 +652,7 @@ fn step(
         }
         let t = r.samples as f64 / r.rate;
         for tagged in r.mr.push(&chunk) {
-            handle_event(shared, r, player, t, tagged.profile, tagged.event);
+            handle_event(shared, r, player, t, tagged.band, tagged.event);
         }
         shared.lock().unwrap().level = peak;
     }
@@ -665,10 +665,10 @@ fn handle_event(
     r: &mut Run,
     player: &mut Player,
     t: f64,
-    profile: Profile,
+    band: Band,
     event: Event,
 ) {
-    let p = profile.label();
+    let p = band.label();
     match event {
         Event::Acquired(d) if r.details => log(
             shared,

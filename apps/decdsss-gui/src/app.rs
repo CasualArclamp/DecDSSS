@@ -8,7 +8,7 @@ use crate::prefs::Prefs;
 use crate::scope::{self, HeatTexture, col};
 use crate::tx::TxPanel;
 use decdsss_audio::{list_input_devices, list_output_devices};
-use decdsss_core::{Family, Profile};
+use decdsss_core::{Band, Family, Profile, Slot};
 use decdsss_phy::rx::{AttemptView, ChannelView, Snapshot};
 use eframe::egui::{
     self, Align2, Color32, ColorImage, FontId, RichText, Sense, Stroke, TextureHandle,
@@ -95,14 +95,15 @@ pub struct App {
     device_in: usize,
     details: bool,
     prefs: Prefs,
-    profiles: [bool; 3],
+    /// Which bands to listen on, in `Band::ALL` order.
+    bands: [bool; 5],
     speed: f64,
     out_dir: PathBuf,
     log_open: bool,
     started: Instant,
     pub auto: Automation,
     waterfall: Option<crate::waterfall::Waterfall>,
-    heat: [HeatTexture; 3],
+    heat: [HeatTexture; 5],
     tx: TxPanel,
     view: View,
     /// The RF monitor: on or off, how loud, and on which output (0 the default).
@@ -158,7 +159,7 @@ impl App {
         wav: Option<PathBuf>,
         speed: f64,
         out_dir: Option<PathBuf>,
-        profiles: Option<[bool; 3]>,
+        bands: Option<[bool; 5]>,
         initial_device: Option<String>,
     ) -> App {
         let devices_in: Vec<String> = list_input_devices()
@@ -230,7 +231,7 @@ impl App {
             device_in,
             details: false,
             prefs,
-            profiles: profiles.unwrap_or([true, true, true]),
+            bands: bands.unwrap_or([true; 5]),
             speed,
             out_dir: out_dir.unwrap_or_else(default_out_dir),
             log_open: true,
@@ -301,15 +302,15 @@ impl App {
             },
             SourceKind::Demo => Source::Demo,
         };
-        let profiles: Vec<Profile> = Profile::ALL
+        let bands: Vec<Band> = Band::ALL
             .iter()
-            .zip(self.profiles)
+            .zip(self.bands)
             .filter(|(_, on)| *on)
-            .map(|(p, _)| *p)
+            .map(|(b, _)| *b)
             .collect();
         self.engine.send(Cmd::Start(Config {
             source: src,
-            profiles,
+            bands,
             out_dir: self.out_dir.clone(),
             speed: self.speed,
             details: self.details,
@@ -402,8 +403,8 @@ impl App {
             });
             ui.separator();
             ui.add_enabled_ui(!sh.running, |ui| {
-                for (i, p) in Profile::ALL.iter().enumerate() {
-                    ui.checkbox(&mut self.profiles[i], p.label());
+                for (i, b) in Band::ALL.iter().enumerate() {
+                    ui.checkbox(&mut self.bands[i], b.label());
                 }
             });
             ui.separator();
@@ -556,37 +557,50 @@ impl App {
         let lo = view.floor_db - 8.0;
         let hi = (view.psd.iter().copied().fold(f32::MIN, f32::max) + 6.0).max(lo + 40.0);
         let y = |db: f32| plot.bottom() - ((db - lo) / (hi - lo)).clamp(0.0, 1.0) * plot.height();
-        // The profile bands.
-        for (p, c) in [
+        // The bands: the two wide profiles, and the three 500 Hz slots side by side
+        // (their labels in one row, the wide ones above).
+        for (band, row, c) in [
             (
-                Profile::W3000,
+                Band::mid(Profile::W3000),
+                0usize,
                 Color32::from_rgba_unmultiplied(86, 182, 236, 22),
             ),
             (
-                Profile::W2400,
+                Band::mid(Profile::W2400),
+                1,
                 Color32::from_rgba_unmultiplied(98, 200, 140, 26),
             ),
             (
-                Profile::N500,
+                Band::new(Profile::N500, Slot::Low),
+                2,
+                Color32::from_rgba_unmultiplied(232, 176, 72, 40),
+            ),
+            (
+                Band::new(Profile::N500, Slot::Mid),
+                2,
+                Color32::from_rgba_unmultiplied(232, 176, 72, 56),
+            ),
+            (
+                Band::new(Profile::N500, Slot::High),
+                2,
                 Color32::from_rgba_unmultiplied(232, 176, 72, 40),
             ),
         ] {
-            let (a, b) = p.edges_hz();
+            let (a, b) = band.edges_hz();
             painter.rect_filled(
                 egui::Rect::from_min_max(pos2(x(a), plot.top()), pos2(x(b), plot.bottom())),
                 0.0,
                 c,
             );
             painter.text(
-                pos2(
-                    x(a) + 3.0,
-                    plot.top()
-                        + 2.0
-                        + 11.0
-                            * (2 - Profile::ALL.iter().position(|q| *q == p).unwrap_or(0)) as f32,
-                ),
+                pos2(x(a) + 3.0, plot.top() + 2.0 + 11.0 * row as f32),
                 Align2::LEFT_TOP,
-                p.label(),
+                if band.profile == Profile::N500 && band.slot != Slot::Mid {
+                    // Three of them side by side: no room for the long label.
+                    format!("500 {}", band.slot.name())
+                } else {
+                    band.label()
+                },
                 FontId::proportional(9.5),
                 col::REF,
             );
@@ -656,8 +670,8 @@ impl App {
             wf.paint(&painter, plot);
         }
         let top_hz = view.psd.len() as f64 * view.bin_hz;
-        for p in Profile::ALL {
-            let (a, b) = p.edges_hz();
+        for band in Band::ALL {
+            let (a, b) = band.edges_hz();
             for hz in [a, b] {
                 let xx = plot.left() + (hz / top_hz) as f32 * plot.width();
                 painter.line_segment(
@@ -692,7 +706,7 @@ impl App {
         let n = snap.channels.len();
         let title = format!(
             "{}  ·  {}",
-            snap.profile.label(),
+            snap.band.label(),
             if n == 0 {
                 "searching".to_string()
             } else {
@@ -1035,10 +1049,7 @@ impl App {
                     }
                     let snaps = sh.snapshots.clone();
                     for (i, s) in snaps.iter().enumerate() {
-                        let idx = Profile::ALL
-                            .iter()
-                            .position(|p| *p == s.profile)
-                            .unwrap_or(i);
+                        let idx = Band::ALL.iter().position(|b| *b == s.band).unwrap_or(i);
                         self.profile_section(ui, s, idx, &sh.transfers);
                     }
                 });

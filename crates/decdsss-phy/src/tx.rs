@@ -14,7 +14,7 @@ use crate::codes::{
 };
 use crate::framing::{Header, Layout, frame_bits};
 use decdsss_core::mode::PILOT_INTERVAL;
-use decdsss_core::{Family, Profile, profile::ROLLOFF};
+use decdsss_core::{Band, Family, Profile, profile::ROLLOFF};
 use decdsss_dsp::Iq;
 use decdsss_dsp::shaper::Shaper;
 use decdsss_fec::interleave::Interleaver;
@@ -284,13 +284,19 @@ pub struct LiveTx {
 impl LiveTx {
     /// `None` if the header cannot be packed or the callsign has no code.
     pub fn new(header: Header, sample_rate: f64, level: f32) -> Option<LiveTx> {
+        let band = Band::mid(header.profile);
+        LiveTx::at(header, band, sample_rate, level)
+    }
+
+    /// A live transmission from a band (a slot of the 500 Hz profile).
+    pub fn at(header: Header, band: Band, sample_rate: f64, level: f32) -> Option<LiveTx> {
         header.pack()?;
         let layout = Layout::new(header.profile, header.mode, header.depth);
         let scr = Scrambler::new(own_code(&header.call)?);
         let shaper = Shaper::new(
             f64::from(header.profile.chip_rate()),
             sample_rate,
-            header.profile.centre_hz(),
+            band.centre_hz(),
             ROLLOFF,
             10,
             level,
@@ -386,10 +392,30 @@ pub fn chips_to_audio(
     lead_s: f64,
     tail_s: f64,
 ) -> Vec<f32> {
-    let mut shaper = Shaper::new(
-        f64::from(profile.chip_rate()),
+    chips_to_audio_at(
+        chips,
+        Band::mid(profile),
         sample_rate,
-        profile.centre_hz(),
+        level,
+        lead_s,
+        tail_s,
+    )
+}
+
+/// [`chips_to_audio`] at a band: the 500 Hz profile's slots are sent from 500 Hz
+/// below or above its middle.
+pub fn chips_to_audio_at(
+    chips: &[Iq],
+    band: Band,
+    sample_rate: f64,
+    level: f32,
+    lead_s: f64,
+    tail_s: f64,
+) -> Vec<f32> {
+    let mut shaper = Shaper::new(
+        f64::from(band.profile.chip_rate()),
+        sample_rate,
+        band.centre_hz(),
         ROLLOFF,
         10,
         level,

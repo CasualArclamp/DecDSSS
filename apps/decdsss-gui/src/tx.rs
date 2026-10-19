@@ -8,7 +8,7 @@ use crate::prefs::Prefs;
 use crate::voice::{Play, VoicePanel};
 use decdsss_audio::wav;
 use decdsss_codec2::Mode as Codec;
-use decdsss_core::{Family, Mode, Profile};
+use decdsss_core::{Family, Mode, Profile, Slot};
 use decdsss_image::Source;
 use decdsss_link::voice::{default_codec, render_speech};
 use decdsss_link::{
@@ -16,7 +16,7 @@ use decdsss_link::{
 };
 use decdsss_phy::codes::normalise_call;
 use decdsss_phy::framing::{DEPTHS, Layout, PayloadType};
-use decdsss_phy::tx::{chips_to_audio, transmission_chips, vox_lead};
+use decdsss_phy::tx::{chips_to_audio_at, transmission_chips, vox_lead};
 use eframe::egui::{self, ColorImage, Context, RichText, TextureHandle, TextureOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -114,6 +114,8 @@ pub struct TxPanel {
     file: Option<PathBuf>,
     call: String,
     profile: Profile,
+    /// Where a 500 Hz signal sits (the other profiles have no slots).
+    slot: Slot,
     mode: String,
     depth: usize,
     resync: f64,
@@ -153,6 +155,7 @@ impl Default for TxPanel {
             file: None,
             call: String::new(),
             profile: Profile::W2400,
+            slot: Slot::Mid,
             mode: "ds8-1/2".into(),
             depth: 4,
             resync: 60.0,
@@ -194,6 +197,9 @@ impl TxPanel {
         }
         if let Some(p) = p.get("tx_profile").and_then(Profile::from_name) {
             self.profile = p;
+        }
+        if let Some(s) = p.get("tx_slot").and_then(Slot::from_name) {
+            self.slot = s;
         }
         if let Some(m) = p.get("tx_mode")
             && Mode::from_name(m).is_some()
@@ -576,9 +582,19 @@ impl TxPanel {
     pub fn remember(&self, p: &mut Prefs) {
         p.set("call", self.call.clone());
         p.set("tx_profile", self.profile.name());
+        p.set("tx_slot", self.slot.name());
         p.set("tx_mode", self.mode.clone());
         p.set("tx_depth", self.depth.to_string());
         p.set("tx_air", format!("{:.0}", self.air));
+    }
+
+    /// Where in the passband the signal goes: the profile's place, or for 500 Hz
+    /// the slot chosen.
+    fn band(&self) -> decdsss_core::Band {
+        match self.profile {
+            Profile::N500 => decdsss_core::Band::new(Profile::N500, self.slot),
+            p => decdsss_core::Band::mid(p),
+        }
     }
 
     /// The transmission as the picture will be sent, `passes` of it.
@@ -755,7 +771,8 @@ impl TxPanel {
             spec.session = session;
             let plan = plan_voice(&spec, &clip.pcm)?;
             let chips = transmission_chips(&plan.segments).ok_or("cannot build the header")?;
-            let audio = chips_to_audio(&chips, self.profile, f64::from(rate), self.level, 1.0, 1.0);
+            let audio =
+                chips_to_audio_at(&chips, self.band(), f64::from(rate), self.level, 1.0, 1.0);
             let audio = self.with_vox(rate, audio);
             return Ok(Plan {
                 frames: plan.frames,
@@ -795,7 +812,7 @@ impl TxPanel {
         };
         let segs = segments(&spec, &container::pack(&name, &data))?;
         let chips = transmission_chips(&segs).ok_or("cannot build the header")?;
-        let audio = chips_to_audio(&chips, self.profile, f64::from(rate), self.level, 1.0, 1.0);
+        let audio = chips_to_audio_at(&chips, self.band(), f64::from(rate), self.level, 1.0, 1.0);
         let audio = self.with_vox(rate, audio);
         Ok(Plan {
             frames: segs.iter().map(|s| s.frames.len()).sum(),
@@ -920,6 +937,27 @@ impl TxPanel {
                 }
             });
             ui.end_row();
+            if self.profile == Profile::N500 {
+                ui.label("Slot");
+                ui.horizontal(|ui| {
+                    for s in Slot::ALL {
+                        let hz = decdsss_core::Band::new(Profile::N500, s).centre_hz();
+                        ui.selectable_value(
+                            &mut self.slot,
+                            s,
+                            match s {
+                                Slot::Low => "−500 Hz",
+                                Slot::Mid => "middle",
+                                Slot::High => "+500 Hz",
+                            },
+                        )
+                        .on_hover_text(format!(
+                            "Audio centre {hz:.0} Hz. Up to three 500 Hz stations fit side by side in a 2.4 kHz filter; the receiver listens on all three."
+                        ));
+                    }
+                });
+                ui.end_row();
+            }
             // The family is read from the chosen mode rather than kept beside it,
             // so the two cannot disagree (a voice mode or a saved setting moves both).
             let current = Mode::from_name(&self.mode);

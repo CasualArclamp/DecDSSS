@@ -7,4 +7,4 @@ pub mod mode;
 pub mod profile;
 
 pub use mode::{CodeRate, Family, Mode};
-pub use profile::Profile;
+pub use profile::{Band, Profile, Slot};

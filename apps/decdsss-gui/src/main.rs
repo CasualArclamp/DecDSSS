@@ -49,7 +49,7 @@ fn main() -> eframe::Result {
     let mut wav = None;
     let mut speed = 1.0;
     let mut out_dir = None;
-    let mut profiles = None;
+    let mut bands = None;
     let mut device: Option<String> = None;
     let mut auto = Automation::default();
     let mut size = [1500.0, 900.0];
@@ -99,22 +99,25 @@ fn main() -> eframe::Result {
             "--out-dir" => out_dir = Some(PathBuf::from(value("--out-dir"))),
             "--profile" => {
                 let list = value("--profile");
-                let mut on = [false; 3];
+                // A profile, and for 500 Hz optionally one slot (`500@-500`); plain
+                // `500` listens on all three.
+                let mut on = [false; 5];
                 for name in list.split(',') {
-                    match decdsss_core::Profile::from_name(name) {
-                        Some(p) => {
-                            on[decdsss_core::Profile::ALL
-                                .iter()
-                                .position(|q| *q == p)
-                                .unwrap_or(0)] = true
-                        }
-                        None => {
-                            eprintln!("decdsss-gui: unknown profile {name:?}\n{USAGE}");
-                            std::process::exit(2);
+                    let (prof, slot) = match name.split_once('@') {
+                        Some((p, s)) => (p, decdsss_core::Slot::from_name(s)),
+                        None => (name, None),
+                    };
+                    let Some(p) = decdsss_core::Profile::from_name(prof) else {
+                        eprintln!("decdsss-gui: unknown profile {name:?}\n{USAGE}");
+                        std::process::exit(2);
+                    };
+                    for (i, b) in decdsss_core::Band::ALL.iter().enumerate() {
+                        if b.profile == p && slot.is_none_or(|s| s == b.slot) {
+                            on[i] = true;
                         }
                     }
                 }
-                profiles = Some(on);
+                bands = Some(on);
             }
             "--after" => auto.after = value("--after").parse().ok(),
             "--screenshot" => auto.screenshot = Some(PathBuf::from(value("--screenshot"))),
@@ -168,7 +171,7 @@ fn main() -> eframe::Result {
                 f.push("Hack".into());
             }
             cc.egui_ctx.set_fonts(fonts);
-            let mut app = App::new(auto, source, wav, speed, out_dir, profiles, device);
+            let mut app = App::new(auto, source, wav, speed, out_dir, bands, device);
             if autostart {
                 app.start();
             }

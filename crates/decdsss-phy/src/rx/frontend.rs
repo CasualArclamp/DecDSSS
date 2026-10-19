@@ -8,8 +8,8 @@
 //! matches the transmitter's pulse. One front end runs per profile; they all
 //! read the same audio.
 
-use decdsss_core::Profile;
 use decdsss_core::profile::ROLLOFF;
+use decdsss_core::{Band, Profile};
 use decdsss_dsp::Iq;
 use decdsss_dsp::fir::Fir;
 use decdsss_dsp::interp::cubic;
@@ -38,9 +38,16 @@ pub struct Frontend {
 
 impl Frontend {
     pub fn new(profile: Profile, sample_rate: f64) -> Frontend {
+        Frontend::at(Band::mid(profile), sample_rate)
+    }
+
+    /// A front end for a band: the 500 Hz profile's slots are mixed down from
+    /// 500 Hz below or above its middle.
+    pub fn at(band: Band, sample_rate: f64) -> Frontend {
+        let profile = band.profile;
         let cr = f64::from(profile.chip_rate());
         let out_rate = SPS as f64 * cr;
-        let centre = profile.centre_hz();
+        let centre = band.centre_hz();
         // The signal is ±(1 + α)/2 chip rates wide; keep the offset margin too.
         let pass = (1.0 + ROLLOFF) / 2.0 * cr + MAX_OFFSET_HZ;
         // Stop at the nearer of the mixing image's edge and the output's alias.

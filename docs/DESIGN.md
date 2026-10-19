@@ -46,6 +46,27 @@ transmitter at 48 kHz runs an integer number of samples per chip.
 | `2k4` | 1920 chip/s | 1500 Hz | 300–2700 Hz | 25 | 0.52 ms |
 | `3k` | 2400 chip/s | 1800 Hz | 300–3300 Hz | 20 | 0.42 ms |
 
+**500 Hz slots (FDMA).** The 500 Hz profile can sit in any of three slots, 500 Hz
+apart: −500 Hz (audio centre 1000 Hz, band 750–1250), the middle (1500 Hz, 1250–1750)
+and +500 Hz (2000 Hz, 1750–2250). The occupied width is 500 Hz, so neighbouring
+slots touch with no guard band, and all three fit in a 2.4 kHz filter, so up to three
+500 Hz stations can share one SSB channel, as narrow HF modems do. The slot is not
+signalled: a transmitter just sends from its slot (`tx --profile 500 --slot +500`, the
+Slot selector in the Transmit panel) and a receiver runs one 500 Hz receiver per
+slot, each with its front end mixed down from that slot's centre (`rx::Receiver::at`,
+`MultiReceiver::with_bands`; `core::Band` is a profile and a slot). Events say which
+band heard them. *Measured* (`rx::tests::fdma_neighbour_curve`, ignored; a weak DS4
+1/2 station in the middle slot at 8 dB in-band SNR, a DS4 1/2 neighbour in the slot
+above or below, louder by the amount given, 16 frames a point, no fading): every
+frame delivered with a neighbour up to 40 dB louder at any carrier offset tried (0 and
+±25 Hz, the weak station also DS16 1/2); at 50 dB delivered with the neighbour on
+frequency or moved away from the weak station, lost with it 25 Hz toward it; at 60 dB
+lost, except a neighbour below and 25 Hz further down (delivered, lost at 70 dB). So
+the isolation between slots is about 40 to 60 dB in this simulation (the shaping
+filter at the transmitter and the matched filter at the receiver, not separated); a
+real radio's filter skirts and a neighbour's splatter are not modelled. Three stations at once, one per slot, are all received
+(`rx::tests::three_500_hz_stations_share_the_passband`).
+
 On `2k4` and `3k`, a chip is short against HF delay spreads (0.5–3 ms), so
 multipath resolves into separate paths a rake receiver can combine. On `500`,
 it mostly does not (flat fading).

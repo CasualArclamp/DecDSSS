@@ -6,13 +6,13 @@ use clap::{Parser, Subcommand};
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_chan::{Channel, Watterson};
 use decdsss_codec2::Mode as Codec;
-use decdsss_core::{Mode, Profile};
+use decdsss_core::{Band, Mode, Profile, Slot};
 use decdsss_link::voice::default_codec;
 use decdsss_link::{Assembler, SendSpec, VoiceSpec, container, max_stream_bytes, plan, plan_voice};
 use decdsss_phy::codes::{normalise_call, own_code};
 use decdsss_phy::framing::{Layout, PayloadType};
 use decdsss_phy::rx::{Event, MultiReceiver};
-use decdsss_phy::tx::{Segment, chips_to_audio, transmission_chips};
+use decdsss_phy::tx::{Segment, chips_to_audio_at, transmission_chips};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -46,6 +46,11 @@ enum Command {
         /// Bandwidth profile: 500, 2k4 or 3k.
         #[arg(long, default_value = "2k4")]
         profile: String,
+        /// With --profile 500, where in the passband: -500, 0 or +500 Hz from the
+        /// middle. Up to three 500 Hz stations fit side by side in a 2.4 kHz
+        /// filter; a receiver on 500 listens on all three.
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        slot: String,
         /// Mode, for example ds8-1/2, ds4-2/3, csk64-1/2 (see `decdsss modes`).
         /// Default ds8-1/2; for --voice, the voice mode of the profile.
         #[arg(long)]
@@ -123,6 +128,7 @@ enum Command {
         #[arg(long)]
         duration: Option<f64>,
         /// Profiles to listen on: all, or a comma-separated list of 500, 2k4, 3k.
+        /// 500 listens on all three of its slots; 500@-500, 500@0 or 500@+500 on one.
         #[arg(long, default_value = "all")]
         profile: String,
         /// Where received files go.
@@ -198,6 +204,7 @@ fn main() -> Result<()> {
             file,
             call,
             profile,
+            slot,
             mode,
             depth,
             resync,
@@ -221,6 +228,7 @@ fn main() -> Result<()> {
             &file,
             &call,
             &profile,
+            &slot,
             mode.as_deref(),
             depth,
             resync,
@@ -312,6 +320,34 @@ fn parse_profile(s: &str) -> Result<Profile> {
     Profile::from_name(s).with_context(|| format!("unknown profile {s:?}: use 500, 2k4 or 3k"))
 }
 
+/// The bands to listen on: `all`, or a comma-separated list of profiles, where `500`
+/// is all three of its slots and `500@-500`, `500@0`, `500@+500` is one.
+fn parse_bands(s: &str) -> Result<Vec<Band>> {
+    if s == "all" {
+        return Ok(Band::ALL.to_vec());
+    }
+    let mut out = Vec::new();
+    for item in s.split(',') {
+        let (name, slot) = match item.split_once('@') {
+            Some((n, sl)) => (
+                n,
+                Some(
+                    Slot::from_name(sl)
+                        .with_context(|| format!("unknown slot {sl:?}: use -500, 0 or +500"))?,
+                ),
+            ),
+            None => (item, None),
+        };
+        let profile = parse_profile(name)?;
+        for b in Band::ALL {
+            if b.profile == profile && slot.is_none_or(|s| s == b.slot) && !out.contains(&b) {
+                out.push(b);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn modes(profile: Option<&str>) -> Result<()> {
     let profiles: Vec<Profile> = match profile {
         Some(s) => vec![parse_profile(s)?],
@@ -357,6 +393,7 @@ fn tx(
     file: &Path,
     call: &str,
     profile: &str,
+    slot: &str,
     mode: Option<&str>,
     depth: usize,
     resync: f64,
@@ -376,6 +413,12 @@ fn tx(
         bail!("give -o FILE.wav to write the audio and/or --play DEVICE to play it");
     }
     let profile = parse_profile(profile)?;
+    let slot = Slot::from_name(slot)
+        .with_context(|| format!("unknown slot {slot:?}: use -500, 0 or +500"))?;
+    if profile != Profile::N500 && slot != Slot::Mid {
+        bail!("slots are for the 500 Hz profile only (the wider profiles have just a middle)");
+    }
+    let band = Band::new(profile, slot);
     let mode = match (mode, &payload) {
         (Some(m), _) => Mode::from_name(m).with_context(|| format!("unknown mode {m:?}"))?,
         (None, Payload::Voice(_)) => {
@@ -474,7 +517,7 @@ fn tx(
         (plan.segments, summary)
     };
     let chips = transmission_chips(&segs).context("cannot build the header")?;
-    let mut audio = chips_to_audio(&chips, profile, f64::from(rate), level, lead, tail);
+    let mut audio = chips_to_audio_at(&chips, band, f64::from(rate), level, lead, tail);
     if vox {
         let mut v = decdsss_phy::tx::vox_lead(f64::from(rate), level, 0.4, 0.3);
         v.extend(audio);
@@ -628,9 +671,9 @@ struct RxRun {
 }
 
 impl RxRun {
-    fn new(profiles: &[Profile], rate: f64, out_dir: &Path, verbose: bool) -> RxRun {
+    fn new(bands: &[Band], rate: f64, out_dir: &Path, verbose: bool) -> RxRun {
         RxRun {
-            mr: MultiReceiver::new(profiles, rate),
+            mr: MultiReceiver::with_bands(bands, rate),
             rate,
             seen: 0,
             asm: Assembler::new(),
@@ -648,7 +691,7 @@ impl RxRun {
         self.seen += chunk.len() as u64;
         let t = self.seen as f64 / self.rate;
         for tagged in self.mr.push(chunk) {
-            let p = tagged.profile.label();
+            let p = tagged.band.label();
             match tagged.event {
                 Event::Acquired(d) => {
                     if self.verbose {
@@ -820,19 +863,12 @@ fn rx(
     out_dir: &Path,
     verbose: bool,
 ) -> Result<()> {
-    let profiles: Vec<Profile> = if profile == "all" {
-        Profile::ALL.to_vec()
-    } else {
-        profile
-            .split(',')
-            .map(parse_profile)
-            .collect::<Result<_>>()?
-    };
+    let bands = parse_bands(profile)?;
     std::fs::create_dir_all(out_dir)?;
     match (input, device) {
         (Some(path), None) => {
             let rate = f64::from(wav::sample_rate(path)?);
-            let mut run = RxRun::new(&profiles, rate, out_dir, verbose);
+            let mut run = RxRun::new(&bands, rate, out_dir, verbose);
             wav::stream(path, 8192, |chunk| run.push(chunk))?;
             run.summary();
             Ok(())
@@ -849,7 +885,7 @@ fn rx(
                 stream.device_name(),
                 duration.map_or(", Ctrl-C to stop".to_string(), |d| format!(" for {d:.0} s"))
             );
-            let mut run = RxRun::new(&profiles, f64::from(fmt.sample_rate), out_dir, verbose);
+            let mut run = RxRun::new(&bands, f64::from(fmt.sample_rate), out_dir, verbose);
             let started = std::time::Instant::now();
             while duration.is_none_or(|d| started.elapsed().as_secs_f64() < d) {
                 if stream.is_dead() {

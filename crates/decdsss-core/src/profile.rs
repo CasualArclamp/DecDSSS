@@ -86,6 +86,107 @@ impl Profile {
     }
 }
 
+/// Where a 500 Hz signal sits in the audio passband. Three of them fit side by
+/// side, 500 Hz apart (FDMA, as narrow-band HF modems do), so up to three stations
+/// can share a 2.4 kHz filter. It is not signalled: a receiver listens on all
+/// three, and a transmitter just chooses one. The wider profiles have no slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Slot {
+    /// 500 Hz below the middle: 750–1250 Hz.
+    Low,
+    /// The profile's own place: 1250–1750 Hz.
+    #[default]
+    Mid,
+    /// 500 Hz above the middle: 1750–2250 Hz.
+    High,
+}
+
+impl Slot {
+    pub const ALL: [Slot; 3] = [Slot::Low, Slot::Mid, Slot::High];
+
+    /// Shift from the profile's centre, Hz: exactly one occupied width of the 500
+    /// Hz profile, so neighbouring slots touch with no guard band.
+    pub const fn offset_hz(self) -> f64 {
+        match self {
+            Slot::Low => -500.0,
+            Slot::Mid => 0.0,
+            Slot::High => 500.0,
+        }
+    }
+
+    /// Short name for the command line: `-500`, `0` or `+500`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Slot::Low => "-500",
+            Slot::Mid => "0",
+            Slot::High => "+500",
+        }
+    }
+
+    /// Parses `-500`/`low`/`l`, `0`/`mid`/`centre`/`center`, `+500`/`500`/`high`/`h`.
+    pub fn from_name(s: &str) -> Option<Slot> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "-500" | "low" | "l" | "lower" => Some(Slot::Low),
+            "0" | "mid" | "m" | "centre" | "center" | "" => Some(Slot::Mid),
+            "+500" | "500" | "high" | "h" | "upper" => Some(Slot::High),
+            _ => None,
+        }
+    }
+}
+
+/// A place in the passband a receiver listens at and a transmitter sends from: a
+/// profile and, for the 500 Hz profile, one of its slots. (The wider profiles are
+/// always in the middle.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Band {
+    pub profile: Profile,
+    pub slot: Slot,
+}
+
+impl Band {
+    /// Every band, narrowest and lowest first.
+    pub const ALL: [Band; 5] = [
+        Band::new(Profile::N500, Slot::Low),
+        Band::new(Profile::N500, Slot::Mid),
+        Band::new(Profile::N500, Slot::High),
+        Band::new(Profile::W2400, Slot::Mid),
+        Band::new(Profile::W3000, Slot::Mid),
+    ];
+
+    pub const fn new(profile: Profile, slot: Slot) -> Band {
+        Band { profile, slot }
+    }
+
+    /// The profile's own place (what a profile alone meant before there were slots).
+    pub const fn mid(profile: Profile) -> Band {
+        Band::new(profile, Slot::Mid)
+    }
+
+    /// Centre of the occupied band in the audio passband, Hz.
+    pub const fn centre_hz(self) -> f64 {
+        match self.profile {
+            Profile::N500 => self.profile.centre_hz() + self.slot.offset_hz(),
+            _ => self.profile.centre_hz(),
+        }
+    }
+
+    /// Lower and upper band edges, Hz.
+    pub fn edges_hz(self) -> (f64, f64) {
+        let half = self.profile.bandwidth_hz() / 2.0;
+        (self.centre_hz() - half, self.centre_hz() + half)
+    }
+
+    /// Human label: the profile's, and for a 500 Hz slot off the middle its shift.
+    pub fn label(self) -> String {
+        match (self.profile, self.slot) {
+            (Profile::N500, Slot::Mid) | (Profile::W2400 | Profile::W3000, _) => {
+                self.profile.label().to_string()
+            }
+            (Profile::N500, s) => format!("{} {} Hz", self.profile.label(), s.name()),
+        }
+    }
+}
+
 // `Display` lets a profile go straight into `format!("{p}")`.
 impl fmt::Display for Profile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -115,6 +216,27 @@ mod tests {
     fn chip_rates_divide_48k() {
         for p in Profile::ALL {
             assert_eq!(48_000 % p.chip_rate(), 0, "{p}");
+        }
+    }
+
+    #[test]
+    fn slots_sit_side_by_side_in_the_passband() {
+        let edges: Vec<(f64, f64)> = Slot::ALL
+            .iter()
+            .map(|&s| Band::new(Profile::N500, s).edges_hz())
+            .collect();
+        assert_eq!(edges, [(750.0, 1250.0), (1250.0, 1750.0), (1750.0, 2250.0)]);
+        // Inside the 2.4 kHz filter, and the wide profiles have only a middle.
+        assert!(edges[0].0 >= 300.0 && edges[2].1 <= 2700.0);
+        assert_eq!(
+            Band::new(Profile::W2400, Slot::High).centre_hz(),
+            Profile::W2400.centre_hz()
+        );
+        assert_eq!(Band::mid(Profile::N500), Band::ALL[1]);
+        assert_eq!(Band::ALL[0].label(), "500 Hz -500 Hz");
+        assert_eq!(Band::ALL[1].label(), "500 Hz");
+        for s in Slot::ALL {
+            assert_eq!(Slot::from_name(s.name()), Some(s));
         }
     }
 

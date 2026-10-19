@@ -48,7 +48,9 @@ side by side. Two ways of spreading, as a ladder of modes (`decdsss modes`):
   rake-combined on power: the robust end.
 
 LDPC (rate ½, ⅔ or ¾, 1152-bit codewords, designed in this repository) and a
-time interleaver sit under both. A file is sent as frames in segments, each a
+time interleaver sit under both. The 500 Hz profile has three slots, 500 Hz apart
+(−500, middle, +500), so up to three 500 Hz stations share one 2.4 kHz channel; the
+receiver listens on all three. A file is sent as frames in segments, each a
 preamble, a rate-¼ header (callsign, mode, frame numbers) and blocks; a long
 transmission repeats the preamble so a late listener can join, and the last
 block is followed by a one-second end-of-transmission postamble that a receiver

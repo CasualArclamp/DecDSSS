@@ -20,7 +20,7 @@ pub mod testrig;
 
 use crate::framing::Header;
 use acq::{Acquirer, Detection};
-use decdsss_core::Profile;
+use decdsss_core::{Band, Profile};
 use frontend::{Buf, Frontend, SPS};
 use header::{HeaderOutcome, HeaderResult, HeaderView, HeaderWatch, demod_header};
 use payload::{BlockResult, PayloadRx};
@@ -98,6 +98,8 @@ pub struct AttemptView {
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub profile: Profile,
+    /// Where in the passband it listens (the slot, for the 500 Hz profile).
+    pub band: Band,
     pub samples_in: u64,
     /// The acquisition search surface, if the search has seen a window.
     pub search: Option<acq::Surface>,
@@ -109,6 +111,8 @@ pub struct Snapshot {
 #[derive(Clone, Debug)]
 pub struct Tagged {
     pub profile: Profile,
+    /// The band that heard it: with `profile`, which 500 Hz slot.
+    pub band: Band,
     pub event: Event,
 }
 
@@ -166,6 +170,7 @@ const MAX_TAILS: usize = 8;
 
 pub struct Receiver {
     pub profile: Profile,
+    pub band: Band,
     fe: Frontend,
     buf: Buf,
     acq: Acquirer,
@@ -181,11 +186,19 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn new(profile: Profile, sample_rate: f64) -> Receiver {
-        let fe = Frontend::new(profile, sample_rate);
+        Receiver::at(Band::mid(profile), sample_rate)
+    }
+
+    /// A receiver for one band: the profile's place in the passband, or a slot of
+    /// the 500 Hz profile.
+    pub fn at(band: Band, sample_rate: f64) -> Receiver {
+        let profile = band.profile;
+        let fe = Frontend::at(band, sample_rate);
         let rate = fe.out_rate();
         let acq = Acquirer::new(profile, SEARCH_OFFSET_HZ);
         Receiver {
             profile,
+            band,
             fe,
             buf: Buf::default(),
             attempts: Vec::new(),
@@ -208,6 +221,7 @@ impl Receiver {
     pub fn snapshot(&self, search_cols: usize) -> Snapshot {
         Snapshot {
             profile: self.profile,
+            band: self.band,
             samples_in: self.samples_in,
             search: self.acq.preview(search_cols),
             attempts: self
@@ -476,17 +490,24 @@ impl Receiver {
     }
 }
 
-/// A receiver per profile, fed the same audio.
+/// A receiver per band, fed the same audio.
 pub struct MultiReceiver {
     rx: Vec<Receiver>,
 }
 
 impl MultiReceiver {
+    /// One receiver per profile, each at its own place in the passband.
     pub fn new(profiles: &[Profile], sample_rate: f64) -> MultiReceiver {
+        let bands: Vec<Band> = profiles.iter().map(|&p| Band::mid(p)).collect();
+        MultiReceiver::with_bands(&bands, sample_rate)
+    }
+
+    /// One receiver per band: for the 500 Hz profile, several slots side by side.
+    pub fn with_bands(bands: &[Band], sample_rate: f64) -> MultiReceiver {
         MultiReceiver {
-            rx: profiles
+            rx: bands
                 .iter()
-                .map(|&p| Receiver::new(p, sample_rate))
+                .map(|&b| Receiver::at(b, sample_rate))
                 .collect(),
         }
     }
@@ -498,12 +519,12 @@ impl MultiReceiver {
     pub fn push(&mut self, audio: &[f32]) -> Vec<Tagged> {
         let mut out = Vec::new();
         for r in &mut self.rx {
-            let profile = r.profile;
-            out.extend(
-                r.push(audio)
-                    .into_iter()
-                    .map(|event| Tagged { profile, event }),
-            );
+            let (profile, band) = (r.profile, r.band);
+            out.extend(r.push(audio).into_iter().map(|event| Tagged {
+                profile,
+                band,
+                event,
+            }));
         }
         out
     }
@@ -519,6 +540,7 @@ mod tests {
     use super::*;
     use crate::tx::{Segment, chips_to_audio, segment_chips};
     use decdsss_chan::Channel;
+    use decdsss_core::Slot;
 
     fn run(rx: &mut Receiver, audio: &[f32]) -> Vec<Event> {
         let mut events = Vec::new();
@@ -690,6 +712,151 @@ mod tests {
         }
         assert!(seen, "the channel opened");
         assert!(worst < 1.0, "the display stood still for {worst:.1} s");
+    }
+
+    /// One station's audio at a band: its segment and postamble, shifted by its
+    /// own carrier offset (a clean channel, no noise), scaled by `gain`.
+    fn station(
+        call: &str,
+        seed: u8,
+        band: Band,
+        mode: &str,
+        offset_hz: f64,
+        gain: f32,
+    ) -> (Segment, Vec<f32>) {
+        let mut seg = segment(band.profile, mode, 1, 2);
+        seg.header.call = call.into();
+        for (i, f) in seg.frames.iter_mut().enumerate() {
+            for b in f.iter_mut() {
+                *b = b.wrapping_mul(seed).wrapping_add(i as u8);
+            }
+        }
+        let chips = crate::tx::transmission_chips(std::slice::from_ref(&seg)).unwrap();
+        let audio = crate::tx::chips_to_audio_at(&chips, band, FS, LEVEL * gain, 1.0, 1.0);
+        let mut shift = Channel::clean(f64::from(LEVEL), band.profile.bandwidth_hz());
+        shift.offset_hz = offset_hz;
+        (seg, shift.apply(&audio, FS))
+    }
+
+    /// Sum of stations' audio plus noise at `snr_db` in the 500 Hz bandwidth,
+    /// relative to a station at the usual level.
+    fn on_one_frequency(stations: &[&Vec<f32>], snr_db: f64) -> Vec<f32> {
+        let n = stations.iter().map(|a| a.len()).max().unwrap();
+        let mut mix = vec![0.0f32; n];
+        for a in stations {
+            for (m, v) in mix.iter_mut().zip(a.iter()) {
+                *m += v;
+            }
+        }
+        channel(Profile::N500, snr_db).apply(&mix, FS)
+    }
+
+    /// Frames each (call, band) delivered.
+    fn delivered(events: &[Tagged]) -> std::collections::BTreeMap<(String, Band), usize> {
+        let mut got = std::collections::BTreeMap::new();
+        for t in events {
+            if let Event::Block { header, result, .. } = &t.event {
+                *got.entry((header.call.clone(), t.band)).or_insert(0) +=
+                    result.frames.iter().flatten().count();
+            }
+        }
+        got
+    }
+
+    /// The 500 Hz profile has three slots side by side, 500 Hz apart: three stations
+    /// send at once, one in each, and all three are received, each by the receiver
+    /// at its own slot and only that one.
+    #[test]
+    fn three_500_hz_stations_share_the_passband() {
+        let bands = [
+            Band::new(Profile::N500, Slot::Low),
+            Band::new(Profile::N500, Slot::Mid),
+            Band::new(Profile::N500, Slot::High),
+        ];
+        let sts: Vec<(Segment, Vec<f32>)> = [("VK2ABC", 3u8), ("W1AW", 5), ("JA1XYZ", 7)]
+            .iter()
+            .zip(bands)
+            .map(|(&(call, seed), band)| station(call, seed, band, "ds4-1/2", 0.0, 1.0))
+            .collect();
+        let mix = on_one_frequency(&[&sts[0].1, &sts[1].1, &sts[2].1], 12.0);
+        let mut mr = MultiReceiver::with_bands(&bands, FS);
+        let mut events = Vec::new();
+        for c in mix.chunks(4800) {
+            events.extend(mr.push(c));
+        }
+        let got = delivered(&events);
+        for (i, (seg, _)) in sts.iter().enumerate() {
+            assert_eq!(
+                got.get(&(seg.header.call.clone(), bands[i])),
+                Some(&seg.frames.len()),
+                "{} at {}: {got:?}",
+                seg.header.call,
+                bands[i].label()
+            );
+        }
+        assert_eq!(
+            got.len(),
+            3,
+            "no station heard in a slot that is not its own: {got:?}"
+        );
+    }
+
+    /// What a strong neighbour 500 Hz away does to a weak station: the weak one in
+    /// the middle slot at 8 dB in-band SNR, a neighbour in the slot above (and again
+    /// below) louder by up to 70 dB, its carrier off by 0 and ±25 Hz (toward the weak
+    /// one and away). Run with
+    /// `cargo test --release -p decdsss-phy fdma_neighbour -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement"]
+    fn fdma_neighbour_curve() {
+        let trials = 8u64;
+        let weak_band = Band::new(Profile::N500, Slot::Mid);
+        for mode in ["ds4-1/2"] {
+            println!("weak station {mode}, 8 dB in-band SNR");
+            for (side, slot) in [("above", Slot::High), ("below", Slot::Low)] {
+                for off in [0.0, 25.0, -25.0] {
+                    let mut row = String::new();
+                    for louder_db in [-100.0f64, 40.0, 50.0, 60.0, 70.0] {
+                        let (mut ok, mut all) = (0usize, 0usize);
+                        for seed in 0..trials {
+                            let (w, wa) = station("VK2ABC", 3, weak_band, mode, 0.0, 1.0);
+                            let gain = 10f32.powf(louder_db as f32 / 20.0);
+                            let (_, na) = station(
+                                "W1AW",
+                                5,
+                                Band::new(Profile::N500, slot),
+                                "ds4-1/2",
+                                off,
+                                gain,
+                            );
+                            let mut ch = channel(Profile::N500, 8.0);
+                            ch.seed = 7 + seed;
+                            let n = wa.len().max(na.len());
+                            let mut mix = vec![0.0f32; n];
+                            for (m, v) in mix.iter_mut().zip(&wa) {
+                                *m += v;
+                            }
+                            for (m, v) in mix.iter_mut().zip(&na) {
+                                *m += v;
+                            }
+                            let mix = ch.apply(&mix, FS);
+                            let mut mr = MultiReceiver::with_bands(&[weak_band], FS);
+                            let mut events = Vec::new();
+                            for c in mix.chunks(4800) {
+                                events.extend(mr.push(c));
+                            }
+                            ok += delivered(&events)
+                                .get(&("VK2ABC".to_string(), weak_band))
+                                .copied()
+                                .unwrap_or(0);
+                            all += w.frames.len();
+                        }
+                        row += &format!("  +{louder_db:>4.0} dB: {ok:>2}/{all}");
+                    }
+                    println!("  neighbour {side}, {off:+.0} Hz:{row}");
+                }
+            }
+        }
     }
 
     fn eots(events: &[Event]) -> usize {
