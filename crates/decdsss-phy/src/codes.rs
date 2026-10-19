@@ -39,6 +39,16 @@ pub const POLY9: Poly = Poly {
     degree: 9,
     taps: &[0, 4],
 };
+/// x^7 + x^3 + 1: the 500 Hz preamble's end marker (B).
+pub const POLY7B: Poly = Poly {
+    degree: 7,
+    taps: &[0, 3],
+};
+/// x^9 + x^6 + x^4 + x^3 + 1: the preamble's end marker (B) on 2k4 and 3k.
+pub const POLY9B: Poly = Poly {
+    degree: 9,
+    taps: &[0, 3, 4, 6],
+};
 /// x^15 + x + 1: the scrambler's Gold family is built on it.
 pub const POLY15: Poly = Poly {
     degree: 15,
@@ -151,14 +161,38 @@ pub fn fwht(x: &mut [Complex32]) {
     }
 }
 
-/// The preamble m-sequence for a profile's chip rate: 511 chips on 2k4 and
-/// 3k (266 / 213 ms a period), 127 on 500 Hz (318 ms).
-pub fn preamble_code(profile: decdsss_core::Profile) -> &'static [f32] {
+/// Periods of sequence A, then of sequence B, that make up a preamble. A
+/// carries the acquisition; the two B periods mark where the header starts.
+pub const PRE_A_PERIODS: usize = 12;
+pub const PRE_B_PERIODS: usize = 2;
+
+/// The preamble's period in chips: 511 on 2k4 and 3k (266 / 213 ms), 127 on
+/// 500 Hz (318 ms).
+pub fn preamble_len(profile: decdsss_core::Profile) -> usize {
+    match profile {
+        decdsss_core::Profile::N500 => 127,
+        _ => 511,
+    }
+}
+
+/// The preamble's main sequence A for a profile (one period).
+pub fn preamble_a(profile: decdsss_core::Profile) -> &'static [f32] {
     static LONG: OnceLock<Vec<f32>> = OnceLock::new();
     static SHORT: OnceLock<Vec<f32>> = OnceLock::new();
     match profile {
         decdsss_core::Profile::N500 => SHORT.get_or_init(|| bipolar(&m_sequence(POLY7))),
         _ => LONG.get_or_init(|| bipolar(&m_sequence(POLY9))),
+    }
+}
+
+/// The end-marker sequence B (a different primitive polynomial of the same
+/// degree, so A and B correlate only weakly).
+pub fn preamble_b(profile: decdsss_core::Profile) -> &'static [f32] {
+    static LONG: OnceLock<Vec<f32>> = OnceLock::new();
+    static SHORT: OnceLock<Vec<f32>> = OnceLock::new();
+    match profile {
+        decdsss_core::Profile::N500 => SHORT.get_or_init(|| bipolar(&m_sequence(POLY7B))),
+        _ => LONG.get_or_init(|| bipolar(&m_sequence(POLY9B))),
     }
 }
 
@@ -226,7 +260,7 @@ mod tests {
     /// which shows as a two-valued periodic autocorrelation (N, −1).
     #[test]
     fn m_sequences_are_maximal() {
-        for p in [POLY5, POLY6, POLY7, POLY8, POLY9, POLY15] {
+        for p in [POLY5, POLY6, POLY7, POLY7B, POLY8, POLY9, POLY9B, POLY15] {
             let s = m_sequence(p);
             let n = s.len();
             assert_eq!(n, (1 << p.degree) - 1);
@@ -271,6 +305,23 @@ mod tests {
                     assert_eq!(v.re, want, "L={l} m={m} k={k}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn preamble_a_and_b_are_nearly_orthogonal() {
+        use decdsss_core::Profile;
+        for p in Profile::ALL {
+            let (a, b) = (preamble_a(p), preamble_b(p));
+            assert_eq!(a.len(), preamble_len(p));
+            assert_eq!(b.len(), preamble_len(p));
+            let n = a.len();
+            // Worst periodic cross-correlation between the two, against the
+            // peak n: the end marker must not look like the body.
+            let worst = (0..n)
+                .map(|t| (0..n).map(|i| a[i] * b[(i + t) % n]).sum::<f32>().abs())
+                .fold(0.0, f32::max);
+            assert!(worst / (n as f32) < 0.25, "{p}: cross {worst} of {n}");
         }
     }
 

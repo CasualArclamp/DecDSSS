@@ -149,8 +149,10 @@ dependencies = [
 name = "decdsss-phy"
 version = "0.0.1"
 dependencies = [
+ "decdsss-chan",
  "decdsss-core",
  "decdsss-dsp",
+ "decdsss-fec",
  "num-complex",
  "rustfft",
 ]

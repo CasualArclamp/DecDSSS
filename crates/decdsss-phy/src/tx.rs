@@ -1,0 +1,280 @@
+// made by CasualArclamp
+//! The transmitter: a segment's chips and the audio they become.
+//!
+//! Chips (complex, unit power) are built in this order: the preamble (real
+//! BPSK, unscrambled), the header (CSK256 on the call code) and the payload
+//! blocks (DS-PSK or CSK on the sender's own code). A scrambler chip
+//! (±1 ± j)/√2 multiplies every chip after the preamble; the header's
+//! scrambler starts at chip 0 of the header, the payload's at chip 0 of the
+//! first block and runs on across blocks.
+
+use crate::codes::{
+    CALL_CODE, PRE_A_PERIODS, PRE_B_PERIODS, Scrambler, own_code, preamble_a, preamble_b,
+    walsh_chip,
+};
+use crate::framing::{Header, Layout, frame_bits};
+use decdsss_core::mode::PILOT_INTERVAL;
+use decdsss_core::{Family, Profile, profile::ROLLOFF};
+use decdsss_dsp::Iq;
+use decdsss_dsp::shaper::Shaper;
+use decdsss_fec::interleave::Interleaver;
+use decdsss_fec::ldpc::Code;
+
+/// The header's CSK alphabet and symbol count: 256 chips a symbol, 8 bits each.
+pub const HEADER_CSK: usize = 256;
+pub const HEADER_SYMBOLS: usize = 256 / 8;
+
+/// The known value of the k-th pilot of a block: QPSK from an m-sequence.
+pub fn pilot_symbol(k: usize) -> Iq {
+    use crate::codes::{POLY7, m_sequence};
+    use std::sync::OnceLock;
+    static SEQ: OnceLock<Vec<u8>> = OnceLock::new();
+    let s = SEQ.get_or_init(|| m_sequence(POLY7));
+    let a = s[(2 * k) % s.len()];
+    let b = s[(2 * k + 1) % s.len()];
+    qpsk(a, b)
+}
+
+/// Two bits to a QPSK symbol of unit power; bit 0 maps to +.
+pub fn qpsk(b0: u8, b1: u8) -> Iq {
+    let k = std::f32::consts::FRAC_1_SQRT_2;
+    Iq::new(
+        k * (1.0 - 2.0 * f32::from(b0)),
+        k * (1.0 - 2.0 * f32::from(b1)),
+    )
+}
+
+/// The preamble's chips for a profile.
+pub fn preamble_chips(profile: Profile) -> Vec<Iq> {
+    let (a, b) = (preamble_a(profile), preamble_b(profile));
+    let mut v = Vec::new();
+    for _ in 0..PRE_A_PERIODS {
+        v.extend(a.iter().map(|&c| Iq::new(c, 0.0)));
+    }
+    for _ in 0..PRE_B_PERIODS {
+        v.extend(b.iter().map(|&c| Iq::new(c, 0.0)));
+    }
+    v
+}
+
+/// Chips of the header: 128 information bits to the 256-bit header
+/// codeword, interleaved, 32 CSK256 symbols on the call code.
+pub fn header_chips(h: &Header) -> Option<Vec<Iq>> {
+    let info = h.pack()?;
+    let cw = Code::header().encode(&info);
+    let sent = Interleaver::new(cw.len()).apply(&cw);
+    let scr = Scrambler::new(CALL_CODE);
+    let mut chips = Vec::with_capacity(HEADER_SYMBOLS * HEADER_CSK);
+    for (s, bits) in sent.chunks(8).enumerate() {
+        let m = bits.iter().fold(0usize, |a, &b| (a << 1) | usize::from(b));
+        for i in 0..HEADER_CSK {
+            chips.push(scr.chip(s * HEADER_CSK + i) * walsh_chip(m, i));
+        }
+    }
+    Some(chips)
+}
+
+/// The coded bits of one block, interleaved, in transmit order: `depth`
+/// codewords from `depth` frames (a short last block is padded with zero
+/// frames).
+pub fn block_bits(layout: &Layout, frames: &[Vec<u8>]) -> Vec<u8> {
+    let code = layout.code();
+    let zero = vec![0u8; layout.frame_bytes()];
+    let mut coded = Vec::with_capacity(layout.coded_bits());
+    for f in 0..layout.depth {
+        let data = frames.get(f).unwrap_or(&zero);
+        assert_eq!(data.len(), layout.frame_bytes(), "frame has the wrong size");
+        coded.extend(code.encode(&frame_bits(data)));
+    }
+    Interleaver::new(coded.len()).apply(&coded)
+}
+
+/// The block's symbols from its transmit-order bits: for DS-PSK QPSK data
+/// symbols with pilots; for CSK the Walsh code numbers. Short groups are
+/// padded with zero bits.
+pub fn block_symbols(layout: &Layout, bits: &[u8]) -> Vec<Iq> {
+    assert_eq!(layout.mode.family, Family::DsPsk);
+    let mut out = Vec::with_capacity(layout.symbols());
+    let mut it = bits.iter().copied().chain(std::iter::repeat(0));
+    let mut pilot = 0;
+    for n in 0..layout.symbols() {
+        if layout.is_pilot(n) {
+            out.push(pilot_symbol(pilot));
+            pilot += 1;
+        } else {
+            let (b0, b1) = (it.next().unwrap(), it.next().unwrap());
+            out.push(qpsk(b0, b1));
+        }
+    }
+    debug_assert_eq!(PILOT_INTERVAL, 8);
+    out
+}
+
+/// The Walsh code numbers of a CSK block.
+pub fn block_walsh(layout: &Layout, bits: &[u8]) -> Vec<usize> {
+    assert_eq!(layout.mode.family, Family::Csk);
+    let m = layout.bits_per_data_symbol();
+    let mut it = bits.iter().copied().chain(std::iter::repeat(0));
+    (0..layout.symbols())
+        .map(|_| (0..m).fold(0usize, |a, _| (a << 1) | usize::from(it.next().unwrap())))
+        .collect()
+}
+
+/// Chips of a block starting at scrambler chip `chip0`.
+pub fn block_chips(layout: &Layout, frames: &[Vec<u8>], scr: &Scrambler, chip0: usize) -> Vec<Iq> {
+    let bits = block_bits(layout, frames);
+    let l = usize::from(layout.mode.spread);
+    let mut chips = Vec::with_capacity(layout.chips());
+    match layout.mode.family {
+        Family::DsPsk => {
+            for (n, sym) in block_symbols(layout, &bits).into_iter().enumerate() {
+                for i in 0..l {
+                    chips.push(scr.chip(chip0 + n * l + i) * sym);
+                }
+            }
+        }
+        Family::Csk => {
+            for (n, m) in block_walsh(layout, &bits).into_iter().enumerate() {
+                for i in 0..l {
+                    chips.push(scr.chip(chip0 + n * l + i) * walsh_chip(m, i));
+                }
+            }
+        }
+    }
+    chips
+}
+
+/// A segment to send.
+#[derive(Clone, Debug)]
+pub struct Segment {
+    pub header: Header,
+    /// Frames of `Layout::frame_bytes` data bytes each, `nblocks × depth` of
+    /// them at most (fewer: the last block is padded).
+    pub frames: Vec<Vec<u8>>,
+}
+
+/// All chips of a segment: preamble, header, payload blocks. `None` if the
+/// header cannot be packed.
+pub fn segment_chips(seg: &Segment) -> Option<Vec<Iq>> {
+    let h = &seg.header;
+    let layout = Layout::new(h.profile, h.mode, h.depth);
+    let mut chips = preamble_chips(h.profile);
+    chips.extend(header_chips(h)?);
+    let scr = Scrambler::new(own_code(&h.call)?);
+    let mut chip0 = 0;
+    for b in 0..usize::from(h.nblocks) {
+        let from = (b * h.depth).min(seg.frames.len());
+        let to = ((b + 1) * h.depth).min(seg.frames.len());
+        let block = block_chips(&layout, &seg.frames[from..to], &scr, chip0);
+        chip0 += block.len();
+        chips.extend(block);
+    }
+    Some(chips)
+}
+
+/// Chips up to the first payload block: preamble plus header.
+pub fn lead_chips(profile: Profile) -> usize {
+    (PRE_A_PERIODS + PRE_B_PERIODS) * crate::codes::preamble_len(profile)
+        + HEADER_SYMBOLS * HEADER_CSK
+}
+
+/// Chips to audio at `sample_rate`: RRC-shaped, on the profile's audio
+/// centre, `level` the RMS of the output. `lead_s` and `tail_s` seconds of
+/// silence go before and after.
+pub fn chips_to_audio(
+    chips: &[Iq],
+    profile: Profile,
+    sample_rate: f64,
+    level: f32,
+    lead_s: f64,
+    tail_s: f64,
+) -> Vec<f32> {
+    let mut shaper = Shaper::new(
+        f64::from(profile.chip_rate()),
+        sample_rate,
+        profile.centre_hz(),
+        ROLLOFF,
+        10,
+        level,
+    );
+    let mut audio = vec![0.0; (lead_s * sample_rate) as usize];
+    shaper.push(chips, &mut audio);
+    shaper.flush(&mut audio);
+    audio.extend(std::iter::repeat_n(0.0, (tail_s * sample_rate) as usize));
+    audio
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framing::PayloadType;
+    use decdsss_core::Mode;
+
+    fn seg(mode: &str, depth: usize, nblocks: u16) -> Segment {
+        let header = Header {
+            profile: Profile::W2400,
+            mode: Mode::from_name(mode).unwrap(),
+            depth,
+            ptype: PayloadType::Test,
+            call: "VK2ABC".into(),
+            session: 1,
+            frame0: 0,
+            nblocks,
+            total_frames: 0,
+        };
+        let layout = Layout::new(header.profile, header.mode, depth);
+        let frames = (0..usize::from(nblocks) * depth)
+            .map(|i| {
+                (0..layout.frame_bytes())
+                    .map(|b| (i * 7 + b) as u8)
+                    .collect()
+            })
+            .collect();
+        Segment { header, frames }
+    }
+
+    #[test]
+    fn segment_length_follows_the_layout() {
+        for mode in ["ds4-1/2", "ds64-3/4", "csk32-2/3", "csk256-1/2"] {
+            let s = seg(mode, 2, 3);
+            let layout = Layout::new(s.header.profile, s.header.mode, 2);
+            let chips = segment_chips(&s).unwrap();
+            assert_eq!(
+                chips.len(),
+                lead_chips(Profile::W2400) + 3 * layout.chips(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn chips_have_unit_power() {
+        let chips = segment_chips(&seg("ds8-1/2", 1, 2)).unwrap();
+        let p = chips.iter().map(|c| c.norm_sqr()).sum::<f32>() / chips.len() as f32;
+        assert!((p - 1.0).abs() < 1e-3, "{p}");
+        let chips = segment_chips(&seg("csk64-1/2", 1, 2)).unwrap();
+        let p = chips.iter().map(|c| c.norm_sqr()).sum::<f32>() / chips.len() as f32;
+        assert!((p - 1.0).abs() < 1e-3, "{p}");
+    }
+
+    #[test]
+    fn pilots_sit_where_the_layout_says() {
+        let s = seg("ds4-1/2", 1, 1);
+        let layout = Layout::new(s.header.profile, s.header.mode, 1);
+        let scr = Scrambler::new(own_code("VK2ABC").unwrap());
+        let chips = block_chips(&layout, &s.frames, &scr, 0);
+        // Despread the first symbol by hand: it is pilot 0.
+        let y: Iq = (0..4).map(|i| chips[i] * scr.chip(i).conj()).sum::<Iq>() / 4.0;
+        assert!((y - pilot_symbol(0)).norm() < 1e-5);
+    }
+
+    #[test]
+    fn audio_has_the_requested_level_and_band() {
+        let chips = segment_chips(&seg("csk64-1/2", 1, 1)).unwrap();
+        let a = chips_to_audio(&chips, Profile::W2400, 48_000.0, 0.2, 0.0, 0.0);
+        let mid = &a[a.len() / 4..a.len() * 3 / 4];
+        let rms = (mid.iter().map(|v| v * v).sum::<f32>() / mid.len() as f32).sqrt();
+        assert!((rms - 0.2).abs() < 0.02, "rms {rms}");
+        assert!(a.iter().all(|v| v.abs() < 1.0));
+    }
+}

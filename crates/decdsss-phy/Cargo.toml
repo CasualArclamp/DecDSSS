@@ -11,5 +11,9 @@ rust-version.workspace = true
 [dependencies]
 decdsss-core = { path = "../decdsss-core" }
 decdsss-dsp = { path = "../decdsss-dsp" }
+decdsss-fec = { path = "../decdsss-fec" }
 num-complex.workspace = true
 rustfft.workspace = true
+
+[dev-dependencies]
+decdsss-chan = { path = "../decdsss-chan" }

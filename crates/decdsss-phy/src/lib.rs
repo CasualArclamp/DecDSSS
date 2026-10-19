@@ -3,5 +3,8 @@
 //! the receiver (acquisition, tracking, rake, demodulation).
 
 pub mod codes;
+pub mod framing;
+pub mod rx;
+pub mod tx;
 
 pub use decdsss_dsp::Iq;
