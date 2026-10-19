@@ -187,7 +187,46 @@ impl TxPanel {
     /// Switches to voice and starts recording (for `--record-for`).
     pub fn auto_record(&mut self, devices_in: &[String], hint: &str) {
         self.voice = true;
+        if let Some(vm) = Mode::voice(self.profile) {
+            self.mode = vm.name();
+        }
         self.vp.record_on(devices_in, hint);
+    }
+
+    /// Plays what the window is set up to send on the output whose name contains
+    /// `hint`, as if Play had been pressed (for `--tx-play`).
+    pub fn auto_play(&mut self, engine: &Engine, devices_out: &[(String, u32)], hint: &str) {
+        if self.call.is_empty() {
+            self.call = "VK2ABC".into();
+        }
+        self.device = devices_out
+            .iter()
+            .position(|d| d.0.to_lowercase().contains(&hint.to_lowercase()))
+            .map_or(0, |i| i + 1);
+        let (device, rate) = self.output(devices_out);
+        match self.build(rate) {
+            Ok(plan) => engine.send(Cmd::Transmit {
+                audio: plan.audio,
+                rate,
+                device,
+            }),
+            Err(e) => self.note = e,
+        }
+    }
+
+    /// Lets go of the PTT after [`TxPanel::auto_record`] and sends what was said on
+    /// the output whose name contains `out_hint` (for `--ptt-for`).
+    pub fn auto_release(&mut self, engine: &Engine, devices_out: &[(String, u32)], out_hint: &str) {
+        if self.call.is_empty() {
+            self.call = "VK2ABC".into();
+        }
+        self.device = devices_out
+            .iter()
+            .position(|d| d.0.to_lowercase().contains(&out_hint.to_lowercase()))
+            .map_or(0, |i| i + 1);
+        if self.vp.release() == Play::Send {
+            self.send_transmission(engine, devices_out);
+        }
     }
 
     /// Stops a recording started by [`TxPanel::auto_record`].
@@ -237,10 +276,10 @@ impl TxPanel {
     }
 
     /// Plays the clip, as it is or as Codec2 will send it.
-    fn play_voice(&mut self, which: Play, engine: &Engine, devices_out: &[(String, u32)]) {
+    fn play_voice(&mut self, which: Play, engine: &Engine, listen: &(Option<String>, u32)) {
         let Some(clip) = &self.vp.clip else { return };
         let pcm: Vec<i16> = match which {
-            Play::Nothing => return,
+            Play::Nothing | Play::Send => return,
             Play::Clip => clip.pcm.clone(),
             Play::AsSent => {
                 let Some(spec) = self.voice_spec() else {
@@ -263,12 +302,36 @@ impl TxPanel {
                 }
             }
         };
-        let (device, rate) = self.output(devices_out);
+        // To the speakers, never the output that feeds the radio.
+        let (device, rate) = listen.clone();
         engine.send(Cmd::Transmit {
             audio: crate::voice::speech_to_audio(&pcm, rate),
             rate,
             device,
         });
+    }
+
+    /// Builds the transmission as set up and plays it on the output device.
+    fn send_transmission(&mut self, engine: &Engine, devices_out: &[(String, u32)]) {
+        let rate = self.device_rate(devices_out);
+        match self.build(rate) {
+            Ok(plan) => {
+                self.note = format!(
+                    "{} frames in {} segment(s), {:.0} s of audio",
+                    plan.frames, plan.segments, plan.seconds
+                );
+                engine.send(Cmd::Transmit {
+                    audio: plan.audio,
+                    rate,
+                    device: if self.device == 0 {
+                        None
+                    } else {
+                        devices_out.get(self.device - 1).map(|d| d.0.clone())
+                    },
+                });
+            }
+            Err(e) => self.note = e,
+        }
     }
 
     /// The speech controls and what sending the clip comes to.
@@ -278,9 +341,14 @@ impl TxPanel {
         devices_in: &[String],
         engine: &Engine,
         devices_out: &[(String, u32)],
+        listen: &(Option<String>, u32),
     ) {
         let play = self.vp.ui(ui, devices_in);
-        self.play_voice(play, engine, devices_out);
+        if play == Play::Send {
+            self.send_transmission(engine, devices_out);
+        } else {
+            self.play_voice(play, engine, listen);
+        }
         ui.horizontal(|ui| {
             ui.label("Codec2");
             let auto =
@@ -601,7 +669,7 @@ impl TxPanel {
         state: &TxState,
         devices_out: &[(String, u32)],
         devices_in: &[String],
-        _out_dir: &Path,
+        listen: &(Option<String>, u32),
     ) {
         ui.label(
                     RichText::new(
@@ -773,31 +841,13 @@ impl TxPanel {
             self.picture_status(ui);
         }
         if self.voice {
-            self.voice_section(ui, devices_in, engine, devices_out);
+            self.voice_section(ui, devices_in, engine, devices_out, listen);
         }
         ui.separator();
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!state.active, |ui| {
                 if ui.button("▶ Play to the sound card").clicked() {
-                    let rate = self.device_rate(devices_out);
-                    match self.build(rate) {
-                        Ok(plan) => {
-                            self.note = format!(
-                                "{} frames in {} segment(s), {:.0} s of audio",
-                                plan.frames, plan.segments, plan.seconds
-                            );
-                            engine.send(Cmd::Transmit {
-                                audio: plan.audio,
-                                rate,
-                                device: if self.device == 0 {
-                                    None
-                                } else {
-                                    devices_out.get(self.device - 1).map(|d| d.0.clone())
-                                },
-                            });
-                        }
-                        Err(e) => self.note = e,
-                    }
+                    self.send_transmission(engine, devices_out);
                 }
                 if ui.button("Save WAV…").clicked() {
                     match self.build(self.rate) {
@@ -824,11 +874,27 @@ impl TxPanel {
             });
         });
         if state.active {
-            ui.add(
-                egui::ProgressBar::new((state.played / state.seconds.max(1.0)) as f32).text(
-                    format!("sending {:.0} / {:.0} s", state.played, state.seconds),
-                ),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new((state.played / state.seconds.max(1.0)) as f32)
+                        .desired_width(200.0)
+                        .text(format!(
+                            "sending {:.0} / {:.0} s",
+                            state.played, state.seconds
+                        )),
+                );
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("■ Stop transmission").strong())
+                            .fill(crate::scope::col::BAD),
+                    )
+                    .clicked()
+                {
+                    engine.send(Cmd::StopTransmit);
+                }
+            });
+        } else if state.stopped {
+            ui.label(RichText::new("stopped").weak());
         }
         if let Some(e) = &state.error {
             ui.colored_label(crate::scope::col::BAD, e);

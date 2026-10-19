@@ -5,6 +5,7 @@
 //! a shared state the UI polls. The UI never touches a receiver.
 
 use crate::demo;
+use crate::monitor::Monitor;
 use crate::spectrum::Spectrum;
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_codec2::Mode as Codec;
@@ -14,6 +15,7 @@ use decdsss_phy::framing::PayloadType;
 use decdsss_phy::rx::{Event, MultiReceiver, Snapshot};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +47,14 @@ pub struct Config {
 pub enum Cmd {
     Start(Config),
     Stop,
+    /// Stops the transmission (or playback) in progress at once.
+    StopTransmit,
+    /// The RF monitor: play what the receiver hears on an output device.
+    Monitor {
+        on: bool,
+        device: Option<String>,
+        volume: f32,
+    },
     /// Plays audio (already at `rate`) on the output device.
     Transmit {
         audio: Vec<f32>,
@@ -116,6 +126,8 @@ pub struct TxState {
     pub seconds: f64,
     pub played: f64,
     pub error: Option<String>,
+    /// The last transmission was stopped before it was done.
+    pub stopped: bool,
 }
 
 /// Everything the UI reads.
@@ -137,6 +149,11 @@ pub struct Shared {
     /// Speech received or arriving, oldest first.
     pub voices: Vec<Arc<VoiceView>>,
     pub tx: TxState,
+    /// Why the RF monitor stopped, if it did.
+    pub monitor_error: Option<String>,
+    /// Waterfall rows made and not yet taken by the display: the noise floor at
+    /// the time, and dB per bin.
+    pub new_rows: Vec<(f32, Vec<f32>)>,
     /// Bumped whenever something the UI draws changed.
     pub version: u64,
 }
@@ -146,9 +163,6 @@ pub struct SpectrumView {
     pub psd: Vec<f32>,
     pub floor_db: f32,
     pub bin_hz: f64,
-    /// Waterfall rows, oldest first.
-    pub rows: Vec<Vec<f32>>,
-    pub row_version: u64,
 }
 
 pub struct Engine {
@@ -209,7 +223,6 @@ struct Run {
     details: bool,
     samples: u64,
     last_publish: Instant,
-    row_version: u64,
     transfers: BTreeMap<(String, u8), Transfer>,
     /// Pictures by (call, session), oldest first, with the bytes of the file
     /// they were last drawn from.
@@ -359,6 +372,8 @@ fn log(shared: &Arc<Mutex<Shared>>, line: String) {
 
 fn worker(shared: Arc<Mutex<Shared>>, rx: Receiver<Cmd>) {
     let mut run: Option<Run> = None;
+    let mut monitor = Monitor::default();
+    let tx_stop = Arc::new(AtomicBool::new(false));
     loop {
         // Commands: block briefly when idle, poll when running.
         let cmd = if run.is_some() {
@@ -393,15 +408,20 @@ fn worker(shared: Arc<Mutex<Shared>>, rx: Receiver<Cmd>) {
                     g.version += 1;
                 }
             },
+            Some(Cmd::Monitor { on, device, volume }) => {
+                monitor.configure(on, device, volume);
+                shared.lock().unwrap().monitor_error = None;
+            }
+            Some(Cmd::StopTransmit) => tx_stop.store(true, Ordering::Relaxed),
             Some(Cmd::Transmit {
                 audio,
                 rate,
                 device,
-            }) => transmit(&shared, audio, rate, device),
+            }) => transmit(&shared, audio, rate, device, tx_stop.clone()),
             None => {}
         }
         let Some(r) = run.as_mut() else { continue };
-        if !step(&shared, r) {
+        if !step(&shared, r, &mut monitor) {
             run = None;
             let mut g = shared.lock().unwrap();
             g.running = false;
@@ -485,7 +505,6 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
         details: cfg.details,
         samples: 0,
         last_publish: Instant::now(),
-        row_version: 0,
         transfers: BTreeMap::new(),
         pictures: Vec::new(),
         picture_version: 0,
@@ -495,7 +514,7 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
 
 /// Reads what is available, processes it, publishes. False when a finite
 /// source has run out.
-fn step(shared: &Arc<Mutex<Shared>>, r: &mut Run) -> bool {
+fn step(shared: &Arc<Mutex<Shared>>, r: &mut Run, monitor: &mut Monitor) -> bool {
     let chunk: Vec<f32> = match &mut r.reader {
         Reader::Device(input) => {
             if input.is_dead() {
@@ -536,10 +555,22 @@ fn step(shared: &Arc<Mutex<Shared>>, r: &mut Run) -> bool {
         }
     };
     if !chunk.is_empty() {
+        if let Some(e) = monitor.feed(&chunk, r.rate) {
+            let mut g = shared.lock().unwrap();
+            g.monitor_error = Some(e);
+            g.version += 1;
+        }
         let peak = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         r.samples += chunk.len() as u64;
         if r.spectrum.push(&chunk) {
-            r.row_version += 1;
+            // Straight to the display, each as it is made, so the waterfall
+            // scrolls smoothly; the rest of the state is published ten times a
+            // second.
+            let rows = r.spectrum.take_rows();
+            let mut g = shared.lock().unwrap();
+            g.new_rows.extend(rows);
+            let extra = g.new_rows.len().saturating_sub(600);
+            g.new_rows.drain(..extra);
         }
         let t = r.samples as f64 / r.rate;
         for tagged in r.mr.push(&chunk) {
@@ -709,8 +740,6 @@ fn publish(shared: &Arc<Mutex<Shared>>, r: &mut Run, force: bool) {
         psd: r.spectrum.psd.clone(),
         floor_db: r.spectrum.floor_db,
         bin_hz: r.spectrum.bin_hz(),
-        rows: r.spectrum.rows.iter().cloned().collect(),
-        row_version: r.row_version,
     };
     let transfers: Vec<Transfer> = r.transfers.values().cloned().collect();
     let pictures: Vec<Arc<PictureView>> = r.pictures.iter().map(|(.., v)| v.clone()).collect();
@@ -726,7 +755,13 @@ fn publish(shared: &Arc<Mutex<Shared>>, r: &mut Run, force: bool) {
 }
 
 /// Plays audio on the output device without blocking the receiver.
-fn transmit(shared: &Arc<Mutex<Shared>>, audio: Vec<f32>, rate: u32, device: Option<String>) {
+fn transmit(
+    shared: &Arc<Mutex<Shared>>,
+    audio: Vec<f32>,
+    rate: u32,
+    device: Option<String>,
+    stop: Arc<AtomicBool>,
+) {
     {
         let mut g = shared.lock().unwrap();
         if g.tx.active {
@@ -737,9 +772,11 @@ fn transmit(shared: &Arc<Mutex<Shared>>, audio: Vec<f32>, rate: u32, device: Opt
             seconds: audio.len() as f64 / f64::from(rate),
             played: 0.0,
             error: None,
+            stopped: false,
         };
         g.version += 1;
     }
+    stop.store(false, Ordering::Relaxed);
     let shared = shared.clone();
     std::thread::spawn(move || {
         let result = (|| -> Result<(), String> {
@@ -761,6 +798,11 @@ fn transmit(shared: &Arc<Mutex<Shared>>, audio: Vec<f32>, rate: u32, device: Opt
             let total = audio.len();
             let mut i = 0;
             while i < total {
+                if stop.load(Ordering::Relaxed) {
+                    // Dropping the stream at the end of this closure cuts the audio.
+                    shared.lock().unwrap().tx.stopped = true;
+                    return Ok(());
+                }
                 let n = (rate as usize / 10).min(total - i);
                 let mut block = Vec::with_capacity(n * ch);
                 for &v in &audio[i..i + n] {

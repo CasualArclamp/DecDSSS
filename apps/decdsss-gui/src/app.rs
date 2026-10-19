@@ -67,6 +67,15 @@ pub struct Automation {
     pub mic: Option<String>,
     /// Start on this view: rx, tx or both.
     pub view: Option<String>,
+    /// Switch the RF monitor on at launch, on the output whose name contains this.
+    pub monitor: Option<String>,
+    /// Play the transmit window's transmission on this output one second in, and
+    /// stop it this many seconds in (for checking the Stop button).
+    pub tx_play: Option<String>,
+    pub tx_stop: Option<f64>,
+    /// Hold the PTT this long from the input `mic` (half a second in), then let go:
+    /// what was said is sent on the output named by `tx_play`.
+    pub ptt_for: Option<f64>,
     pub requested_at: Option<Instant>,
 }
 
@@ -86,13 +95,33 @@ pub struct App {
     log_open: bool,
     started: Instant,
     pub auto: Automation,
-    waterfall: Option<TextureHandle>,
-    waterfall_version: u64,
+    waterfall: Option<crate::waterfall::Waterfall>,
     heat: [HeatTexture; 3],
     tx: TxPanel,
     view: View,
+    /// The RF monitor: on or off, how loud, and on which output (0 the default).
+    monitor_on: bool,
+    monitor_volume: f32,
+    monitor_device: usize,
+    /// Why the monitor stopped, shown until it is switched on again.
+    monitor_msg: String,
+    /// Play a received speech transmission when it is whole.
+    auto_play_rx: bool,
+    /// The speech transmissions already played that way.
+    played: std::collections::BTreeSet<(String, u8)>,
+    /// Smoothed frames a second, for the top bar.
+    fps: f32,
+    /// When the last frame began, for the 60 fps limit.
+    last_frame: Instant,
+    /// Frame counting for `DECDSSS_FPS`.
+    frames: u32,
+    fps_since: Instant,
     /// `--record-for` has started its recording.
     recording_started: bool,
+    /// `--tx-play` has started its transmission.
+    tx_play_started: bool,
+    /// `--ptt-for` has let go.
+    ptt_released: bool,
     /// The last view of each station, kept after its segment ends so the card
     /// does not flicker away between segments: (profile, call, session).
     stations: std::collections::BTreeMap<(usize, String, u8), (ChannelView, Instant)>,
@@ -139,7 +168,11 @@ impl App {
             .get("view")
             .and_then(View::from_name)
             .unwrap_or(View::Rx);
-        if auto.open_tx || auto.tx_file.is_some() || auto.record_for.is_some() {
+        if auto.open_tx
+            || auto.tx_file.is_some()
+            || auto.record_for.is_some()
+            || auto.ptt_for.is_some()
+        {
             view = View::Tx;
         }
         if let Some(v) = auto.view.as_deref().and_then(View::from_name) {
@@ -158,7 +191,11 @@ impl App {
                     .position(|d| d.to_lowercase().contains(&n.to_lowercase()))
             })
             .map_or(0, |i| i + 1);
-        App {
+        let monitor_volume = prefs
+            .get("monitor_volume")
+            .and_then(|v| v.parse().ok())
+            .map_or(1.0, |v: f32| v.clamp(0.0, 4.0));
+        let mut app = App {
             engine: Engine::spawn(),
             source,
             wav,
@@ -174,14 +211,40 @@ impl App {
             started: Instant::now(),
             auto,
             waterfall: None,
-            waterfall_version: u64::MAX,
             heat: Default::default(),
             tx,
             view,
+            monitor_on: false,
+            monitor_volume,
+            monitor_device: 0,
+            monitor_msg: String::new(),
+            auto_play_rx: true,
+            played: Default::default(),
+            fps: 0.0,
+            last_frame: Instant::now(),
+            frames: 0,
+            fps_since: Instant::now(),
             recording_started: false,
+            tx_play_started: false,
+            ptt_released: false,
             stations: Default::default(),
             pictures: Default::default(),
+        };
+        if let Some(hint) = app.auto.monitor.clone() {
+            app.monitor_on = true;
+            app.monitor_device = app
+                .devices_out
+                .iter()
+                .position(|d| d.0.to_lowercase().contains(&hint.to_lowercase()))
+                .map_or(0, |i| i + 1);
+            app.engine.send(Cmd::Monitor {
+                on: true,
+                device: (app.monitor_device > 0)
+                    .then(|| app.devices_out[app.monitor_device - 1].0.clone()),
+                volume: app.monitor_volume,
+            });
         }
+        app
     }
 
     pub fn start(&mut self) {
@@ -321,9 +384,102 @@ impl App {
                 if sh.level > 0.95 { col::BAD } else { col::LOCK },
             );
             ui.label(format!("{:.0} s", sh.seconds));
+            // The measured frame rate of the window (the waterfall scrolls a row a frame).
+            let dt = ui.ctx().input(|i| i.stable_dt).max(1e-3);
+            self.fps += 0.1 * (1.0 / dt - self.fps);
+            ui.label(RichText::new(format!("{:.0} fps", self.fps)).weak());
+            // Whatever tab is showing, a transmission in progress can be stopped.
+            if sh.tx.active
+                && ui
+                    .add(egui::Button::new(RichText::new("■ STOP").strong()).fill(col::BAD))
+                    .on_hover_text(
+                        "Stop the transmission (or the playback) now; if you key the radio by hand, release it too",
+                    )
+                    .clicked()
+            {
+                self.engine.send(Cmd::StopTransmit);
+            }
+            ui.separator();
+            self.monitor_controls(ui, sh);
             ui.separator();
             ui.label(RichText::new(&sh.status).weak());
         });
+    }
+
+    /// The RF monitor: a button to hear what the receiver hears, its volume and
+    /// the output it plays on (not the one that feeds the radio).
+    fn monitor_controls(&mut self, ui: &mut Ui, sh: &Shared) {
+        let before = (self.monitor_on, self.monitor_volume, self.monitor_device);
+        ui.toggle_value(&mut self.monitor_on, "🔊 RF monitor")
+            .on_hover_text(
+                "Play the audio the receiver is hearing on an output device, to listen to the channel. \
+                 Choose speakers or headphones, not the output that feeds the radio.",
+            );
+        if self.monitor_on {
+            ui.add(
+                egui::Slider::new(&mut self.monitor_volume, 0.0..=4.0)
+                    .show_value(false)
+                    .text("vol"),
+            );
+        }
+        // The speakers or headphones: the monitor, received speech and the speech
+        // previews all go here, never to the output that feeds the radio.
+        let name = if self.monitor_device == 0 {
+            "System default".to_string()
+        } else {
+            self.devices_out
+                .get(self.monitor_device - 1)
+                .map(|d| d.0.clone())
+                .unwrap_or_default()
+        };
+        egui::ComboBox::from_id_salt("monitor_device")
+            .width(150.0)
+            .selected_text(format!("🔈 {name}"))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.monitor_device, 0, "System default");
+                for (i, d) in self.devices_out.iter().enumerate() {
+                    ui.selectable_value(
+                        &mut self.monitor_device,
+                        i + 1,
+                        format!("{} ({} Hz)", d.0, d.1),
+                    );
+                }
+            })
+            .response
+            .on_hover_text(
+                "Where you listen: the RF monitor, received speech and speech previews play \
+                 here (speakers or headphones), never on the output that feeds the radio",
+            );
+        ui.checkbox(&mut self.auto_play_rx, "auto-play speech")
+            .on_hover_text("Play a received speech transmission when it is whole");
+        if let Some(e) = &sh.monitor_error {
+            self.monitor_on = false;
+            self.monitor_msg = e.clone();
+        }
+        if self.monitor_on && !before.0 {
+            self.monitor_msg.clear();
+        }
+        if !self.monitor_msg.is_empty() {
+            ui.colored_label(col::BAD, &self.monitor_msg);
+        }
+        if before != (self.monitor_on, self.monitor_volume, self.monitor_device) {
+            self.engine.send(Cmd::Monitor {
+                on: self.monitor_on,
+                device: (self.monitor_device > 0)
+                    .then(|| {
+                        self.devices_out
+                            .get(self.monitor_device - 1)
+                            .map(|d| d.0.clone())
+                    })
+                    .flatten(),
+                volume: self.monitor_volume,
+            });
+            if self.auto.screenshot.is_none() {
+                self.prefs
+                    .set("monitor_volume", format!("{:.2}", self.monitor_volume));
+                self.prefs.save();
+            }
+        }
     }
 
     fn band_view(&mut self, ui: &mut Ui, sh: &Shared) {
@@ -452,49 +608,8 @@ impl App {
     fn waterfall_panel(&mut self, ui: &mut Ui, view: &SpectrumView, size: egui::Vec2) {
         let (painter, area) = scope::panel(ui, size, "Waterfall", "newest at the top");
         let plot = egui::Rect::from_min_max(area.min + vec2(24.0, 0.0), area.max);
-        if view.rows.is_empty() {
-            return;
-        }
-        if self.waterfall_version != view.row_version || self.waterfall.is_none() {
-            let w = view.psd.len();
-            let h = view.rows.len();
-            // From just under the noise floor to 26 dB over it, or to the recent
-            // peaks where those are higher (a clean cable has no noise to speak of).
-            let mut recent: Vec<f32> = view
-                .rows
-                .iter()
-                .rev()
-                .take(40)
-                .flat_map(|r| r.iter().copied())
-                .collect();
-            recent.sort_by(f32::total_cmp);
-            let p99 = recent
-                .get(recent.len() * 995 / 1000)
-                .copied()
-                .unwrap_or(0.0);
-            let lo = view.floor_db - 3.0;
-            let hi = (view.floor_db + 26.0).max(p99 + 3.0);
-            let mut pixels = Vec::with_capacity(w * h);
-            for row in view.rows.iter().rev() {
-                for &d in row.iter().take(w) {
-                    pixels.push(scope::palette((d - lo) / (hi - lo)));
-                }
-            }
-            let img = ColorImage::new([w, h], pixels);
-            let opts = TextureOptions::LINEAR;
-            match &mut self.waterfall {
-                Some(t) => t.set(img, opts),
-                None => self.waterfall = Some(ui.ctx().load_texture("waterfall", img, opts)),
-            }
-            self.waterfall_version = view.row_version;
-        }
-        if let Some(t) = &self.waterfall {
-            painter.image(
-                t.id(),
-                plot,
-                egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
+        if let Some(wf) = &self.waterfall {
+            wf.paint(&painter, plot);
         }
         let top_hz = view.psd.len() as f64 * view.bin_hz;
         for p in Profile::ALL {
@@ -506,6 +621,20 @@ impl App {
                     Stroke::new(1.0, Color32::from_white_alpha(40)),
                 );
             }
+        }
+    }
+
+    /// Writes the spectrum rows the engine has made into the waterfall's ring.
+    fn feed_waterfall(&mut self, ctx: &egui::Context, rows: &[(f32, Vec<f32>)]) {
+        let Some((_, first)) = rows.first() else {
+            return;
+        };
+        let width = first.len();
+        if self.waterfall.as_ref().is_none_or(|w| w.width() != width) {
+            self.waterfall = Some(crate::waterfall::Waterfall::new(ctx, width));
+        }
+        if let Some(w) = &mut self.waterfall {
+            w.push(rows);
         }
     }
 
@@ -592,9 +721,22 @@ impl App {
         });
     }
 
-    /// Plays received speech on the output device chosen in the transmit window.
+    /// The output device for listening (the monitor's, speakers or headphones) and
+    /// the rate it runs at; never the output that feeds the radio.
+    fn listen(&self) -> (Option<String>, u32) {
+        match self
+            .monitor_device
+            .checked_sub(1)
+            .and_then(|i| self.devices_out.get(i))
+        {
+            Some((name, rate)) => (Some(name.clone()), *rate),
+            None => (None, 48_000),
+        }
+    }
+
+    /// Plays received speech on the listening output.
     fn play_speech(&mut self, speech: &[i16]) {
-        let (device, rate) = self.tx.output(&self.devices_out);
+        let (device, rate) = self.listen();
         self.engine.send(Cmd::Transmit {
             audio: crate::voice::speech_to_audio(speech, rate),
             rate,
@@ -731,6 +873,33 @@ impl App {
                 self.auto.record_for = None;
                 self.tx.auto_stop();
             }
+        }
+        let t = now.duration_since(self.started).as_secs_f64();
+        if let Some(hold) = self.auto.ptt_for {
+            if t >= 0.5 && !self.recording_started {
+                self.recording_started = true;
+                let hint = self.auto.mic.clone().unwrap_or_default();
+                self.tx.auto_record(&self.devices_in, &hint);
+            }
+            if t >= 0.5 + hold && !self.ptt_released {
+                self.ptt_released = true;
+                let devices_out = self.devices_out.clone();
+                let out_hint = self.auto.tx_play.clone().unwrap_or_default();
+                self.tx.auto_release(&self.engine, &devices_out, &out_hint);
+            }
+        }
+        if let Some(hint) = self.auto.tx_play.clone()
+            && self.auto.ptt_for.is_none()
+            && t >= 1.0
+            && !self.tx_play_started
+        {
+            self.tx_play_started = true;
+            let devices_out = self.devices_out.clone();
+            self.tx.auto_play(&self.engine, &devices_out, &hint);
+        }
+        if self.auto.tx_stop.is_some_and(|s| t >= s) {
+            self.auto.tx_stop = None;
+            self.engine.send(Cmd::StopTransmit);
         }
         let Some(after) = self.auto.after else { return };
         if now.duration_since(self.started).as_secs_f64() < after {
@@ -926,12 +1095,40 @@ fn channel_card(ui: &mut Ui, c: &ChannelView, tr: Option<&Transfer>, w: f32, is_
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // At most 60 frames a second: a waterfall row is made 60 times a second, so
+        // more frames only repeat rows (and a 144 or 165 Hz display would run the
+        // whole window, scopes and all, that much harder).
+        let frame = Duration::from_micros(16_667);
+        let since = self.last_frame.elapsed();
+        if since < frame {
+            std::thread::sleep(frame - since);
+        }
+        self.last_frame = Instant::now();
         self.tx.background(ctx);
         self.automate(ctx);
-        ctx.request_repaint_after(Duration::from_millis(40));
+        if std::env::var_os("DECDSSS_FPS").is_some() {
+            // Frames in the last second, on stderr, for checking the repaint rate.
+            self.frames += 1;
+            if self.fps_since.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "{} frames in {:.2} s",
+                    self.frames,
+                    self.fps_since.elapsed().as_secs_f64()
+                );
+                self.frames = 0;
+                self.fps_since = Instant::now();
+            }
+        }
+        // 60 frames a second while receiving (the waterfall scrolls a row a frame),
+        // a slow tick otherwise.
+        let running = self.engine.shared.lock().unwrap().running;
+        ctx.request_repaint_after(Duration::from_millis(if running { 16 } else { 100 }));
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // The waterfall rows the engine has made since the last frame.
+        let new_rows = std::mem::take(&mut self.engine.shared.lock().unwrap().new_rows);
+        self.feed_waterfall(ui.ctx(), &new_rows);
         // Take what the engine published, then let go of the lock.
         let (
             running,
@@ -946,6 +1143,7 @@ impl eframe::App for App {
             pictures,
             voices,
             tx,
+            monitor_error,
         ) = {
             let g = self.engine.shared.lock().unwrap();
             (
@@ -967,6 +1165,7 @@ impl eframe::App for App {
                 g.pictures.clone(),
                 g.voices.clone(),
                 g.tx.clone(),
+                g.monitor_error.clone(),
             )
         };
         let sh = Shared {
@@ -982,12 +1181,22 @@ impl eframe::App for App {
             pictures,
             voices,
             tx,
+            monitor_error,
             ..Shared::default()
         };
 
         egui::Panel::top("bar").show(ui, |ui| self.top_bar(ui, &sh));
         let devices_out = self.devices_out.clone();
         let devices_in = self.devices_in.clone();
+        let listen = self.listen();
+        // Received speech plays when it is whole, once (not in unattended runs).
+        if self.auto_play_rx && self.auto.screenshot.is_none() && !sh.tx.active {
+            for v in sh.voices.iter().filter(|v| v.complete) {
+                if self.played.insert((v.call.clone(), v.session)) {
+                    self.play_speech(&v.speech);
+                }
+            }
+        }
         if self.view == View::Both {
             egui::Panel::left("transmit")
                 .resizable(true)
@@ -996,14 +1205,8 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.label(RichText::new("Transmit").strong().size(15.0));
-                        self.tx.show(
-                            ui,
-                            &self.engine,
-                            &sh.tx,
-                            &devices_out,
-                            &devices_in,
-                            &self.out_dir,
-                        );
+                        self.tx
+                            .show(ui, &self.engine, &sh.tx, &devices_out, &devices_in, &listen);
                     });
                 });
         }
@@ -1028,14 +1231,8 @@ impl eframe::App for App {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.add_space(6.0);
                         ui.label(RichText::new("Transmit").strong().size(15.0));
-                        self.tx.show(
-                            ui,
-                            &self.engine,
-                            &sh.tx,
-                            &devices_out,
-                            &devices_in,
-                            &self.out_dir,
-                        );
+                        self.tx
+                            .show(ui, &self.engine, &sh.tx, &devices_out, &devices_in, &listen);
                     });
                 } else {
                     ui.horizontal(|ui| {

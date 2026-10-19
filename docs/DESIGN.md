@@ -329,6 +329,32 @@ pictures and speech, the files and the log sit in the column between them, so
 nothing cuts the instruments off. A recording or a picture being prepared keeps
 going when the TX tab is not showing.
 
+*Push to talk.* Voice in the Transmit panel is PTT style: hold the big button (or
+the space bar) and speak, let go and what was said (at least half a second, at most
+60 s) is sent as one over; "send when I let go" can be switched off to keep the
+speech and send it with *Play to the sound card*. Received speech plays by
+itself when a transmission is whole (*auto-play speech*). Everything you listen
+to (the RF monitor, received speech, the speech previews) plays on the speakers
+chosen in the bar, never on the output that feeds the radio. This is
+store-and-forward, not live: a 12 s preamble and header come before the speech
+(see Payloads, Voice); a live, streamed mode needs a shorter start-up first.
+Checked through VB-Audio cables (`--ptt-for 6 --mic "CABLE-B Output" --tx-play
+"CABLE-A Input"`: six seconds recorded from one cable, sent into the other,
+received by the CLI as 6.4 s of speech).
+
+*Waterfall.* A spectrum row is made 60 times a second (a 4096-point window every
+800 samples) and written into the next row of a 900-row ring texture with a
+one-row upload, so nothing is rebuilt per frame and 15 s of history scrolls at the
+rows' own rate; the window is held to 60 frames a second (`DECDSSS_FPS=1` prints
+the measured rate; a 165 Hz display would otherwise run the scopes at 165).
+*RF monitor.* A button in the bar plays the audio the receiver is hearing on an
+output device (volume, device), tapped before decoding; it never touches the
+signal. Received speech and the speech previews are for the same speakers, never
+the output that feeds the radio. *Stop.* A red **STOP TX** in the bar (and one in
+the TX panel) cuts a transmission in progress at once. The release build is a
+Windows GUI program (no console window); it attaches to the terminal it was
+started from, if any, so `--version` and `--write-demo` still print.
+
 - **Band view** — the audio spectrum 0–4 kHz with the three profile bands
   shaded, the noise floor (15th percentile of 300–3300 Hz), and a label at each
   locked carrier; a waterfall below it (levels from the floor to the strongest

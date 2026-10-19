@@ -84,23 +84,44 @@ pub fn speech_to_audio(pcm: &[i16], rate: u32) -> Vec<f32> {
     decdsss_dsp::resample::resample_real(&x, 8000.0, f64::from(rate), 3500.0, 4000.0)
 }
 
+/// A press shorter than this, seconds, is a slip of the finger, not speech.
+const MIN_TALK_S: f64 = 0.5;
+
 /// What the voice controls ask the window to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Play {
     Nothing,
+    /// The PTT was released with speech recorded: send it.
+    Send,
     /// Play the clip as it is.
     Clip,
     /// Play the clip as Codec2 will send it (compressed and expanded again).
     AsSent,
 }
 
-#[derive(Default)]
 pub struct VoicePanel {
     pub clip: Option<Clip>,
     rec: Option<Recorder>,
     /// Input device for recording: 0 the default, n the nth listed.
     mic: usize,
     note: String,
+    /// The PTT button (or the space bar) is held.
+    ptt_down: bool,
+    /// Send what was said as soon as the PTT is released.
+    send_on_release: bool,
+}
+
+impl Default for VoicePanel {
+    fn default() -> Self {
+        VoicePanel {
+            clip: None,
+            rec: None,
+            mic: 0,
+            note: String::new(),
+            ptt_down: false,
+            send_on_release: true,
+        }
+    }
 }
 
 impl VoicePanel {
@@ -134,6 +155,21 @@ impl VoicePanel {
     /// Stops a recording, as if Stop had been pressed.
     pub fn finish(&mut self) {
         self.stop();
+    }
+
+    /// Lets go of the PTT: stops the recording, and says whether what was said is
+    /// to be sent.
+    pub fn release(&mut self) -> Play {
+        self.ptt_down = false;
+        self.stop();
+        match &self.clip {
+            Some(c) if c.seconds() >= MIN_TALK_S && self.send_on_release => Play::Send,
+            Some(c) if c.seconds() < MIN_TALK_S => {
+                self.note = "too short: hold the button while you talk".into();
+                Play::Nothing
+            }
+            _ => Play::Nothing,
+        }
     }
 
     pub fn recording(&self) -> bool {
@@ -181,6 +217,33 @@ impl VoicePanel {
     /// The controls: choose a WAV or record, and hear the clip. Returns what to play.
     pub fn ui(&mut self, ui: &mut Ui, devices_in: &[String]) -> Play {
         let mut play = Play::Nothing;
+        // Push to talk: hold the button (or the space bar) and speak; let go and it
+        // is sent as one over, like keying a microphone.
+        let talking = self.recording();
+        let label = if talking {
+            "● TALKING: let go to send"
+        } else {
+            "🎙  Hold to talk (PTT)  ·  or hold Space"
+        };
+        let ptt = ui.add_sized(
+            [ui.available_width().min(340.0), 46.0],
+            egui::Button::new(RichText::new(label).size(16.0).strong()).fill(if talking {
+                col::BAD
+            } else {
+                ui.visuals().widgets.inactive.bg_fill
+            }),
+        );
+        let space = ui.ctx().input(|i| i.key_down(egui::Key::Space))
+            && !ui.ctx().egui_wants_keyboard_input();
+        let held = ptt.is_pointer_button_down_on() || space;
+        if held && !self.ptt_down && !talking {
+            self.ptt_down = true;
+            self.start(devices_in);
+        } else if !held && self.ptt_down {
+            play = self.release();
+        }
+        ui.checkbox(&mut self.send_on_release, "send when I let go")
+            .on_hover_text("Off: the speech is kept, and sent with Play to the sound card");
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!self.recording(), egui::Button::new("Choose WAV…"))

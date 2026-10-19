@@ -1,23 +1,47 @@
 // made by CasualArclamp
 //! `decdsss-gui`: the DecDSSS desktop window.
+// A release build on Windows is a GUI program, so double-clicking it opens no
+// console window; `attach_console` gives it the terminal it was started from, if
+// any, so `--version`, `--write-demo` and the messages of the unattended options
+// still print there.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
 mod demo;
 mod engine;
+mod monitor;
 mod prefs;
 mod scope;
 mod spectrum;
 mod tx;
 mod voice;
+mod waterfall;
 
 use app::{App, Automation, SourceKind};
 use eframe::egui;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: decdsss-gui [--demo | --wav FILE] [--speed X] [--profile 500,2k4,3k] \
-[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--record-for SECS [--mic NAME]] [--view rx|tx|both] | --write-demo OUT.wav";
+[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--record-for SECS [--mic NAME]] [--view rx|tx|both] [--monitor OUTPUT] | --write-demo OUT.wav";
+
+/// Attaches to the console of the process that started this one (a terminal), if
+/// there is one; harmless when output is redirected or there is no terminal.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_console() {
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    // SAFETY: a plain Win32 call with the documented "parent process" id.
+    unsafe {
+        AttachConsole(0xFFFF_FFFF);
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_console() {}
 
 fn main() -> eframe::Result {
+    attach_console();
     let mut args = std::env::args().skip(1);
     let mut source = SourceKind::Device;
     let mut wav = None;
@@ -97,6 +121,10 @@ fn main() -> eframe::Result {
             "--record-for" => auto.record_for = value("--record-for").parse().ok(),
             "--mic" => auto.mic = Some(value("--mic")),
             "--view" => auto.view = Some(value("--view")),
+            "--monitor" => auto.monitor = Some(value("--monitor")),
+            "--tx-play" => auto.tx_play = Some(value("--tx-play")),
+            "--ptt-for" => auto.ptt_for = value("--ptt-for").parse().ok(),
+            "--tx-stop" => auto.tx_stop = value("--tx-stop").parse().ok(),
             "--window-size" => {
                 let v = value("--window-size");
                 if let Some((w, h)) = v.split_once('x')
