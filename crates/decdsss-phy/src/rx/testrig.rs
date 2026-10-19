@@ -67,6 +67,12 @@ pub struct Run {
 }
 
 pub fn to_header(audio: &[f32], profile: Profile) -> Result<Run, String> {
+    to_header_in(audio, profile, &crate::tx::HEADER_ALPHABETS)
+}
+
+/// [`to_header`], trying only the CSK alphabets in `alphabets`, in that order
+/// (a measurement of one alphabet, including ones the receiver no longer tries).
+pub fn to_header_in(audio: &[f32], profile: Profile, alphabets: &[usize]) -> Result<Run, String> {
     let mut fe = Frontend::new(profile, FS);
     let mut acq = Acquirer::new(profile, 100.0);
     let mut buf = Buf::default();
@@ -94,8 +100,8 @@ pub fn to_header(audio: &[f32], profile: Profile) -> Result<Run, String> {
         }
         if let Some(l) = &lock {
             // The alphabets in turn, as the receiver tries them.
-            while alphabet < crate::tx::HEADER_ALPHABETS.len() {
-                match demod_header(&buf, l, rate, crate::tx::HEADER_ALPHABETS[alphabet]) {
+            while alphabet < alphabets.len() {
+                match demod_header(&buf, l, rate, alphabets[alphabet]) {
                     HeaderOutcome::NeedMore(_) => break,
                     HeaderOutcome::Bad(_) => alphabet += 1,
                     HeaderOutcome::Decoded(h) => {
@@ -108,7 +114,7 @@ pub fn to_header(audio: &[f32], profile: Profile) -> Result<Run, String> {
                     }
                 }
             }
-            if alphabet == crate::tx::HEADER_ALPHABETS.len() {
+            if alphabet == alphabets.len() {
                 return Err("header: it did not decode in any alphabet".into());
             }
         }

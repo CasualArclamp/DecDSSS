@@ -128,15 +128,20 @@ A transmission is one or more *segments*; a segment is:
 2. **Header** — 128 bits (version, profile, mode, depth, payload type,
    callsign, session, first frame number, blocks in this segment, frames in the
    whole transmission, CRC-16) in a rate-¼ n = 512 LDPC codeword, interleaved,
-   as CSK symbols on the call code, in one of five alphabets (`HEADER_ALPHABETS`:
-   16, 32, 64, 128 or 256 codes of as many chips, 4 to 8 bits a symbol, the same
-   codeword). The weak payload modes (DS16 3/4 down to DS64 and every CSK mode)
-   keep CSK256, decodable wherever any payload mode is: 8.5 s on `2k4`, 6.8 s on
-   `3k`, 41 s on `500`. The fast modes send a shorter one so decoding starts
-   sooner: DS4 uses CSK64 (86 symbols, 2.9 s on `2k4`) and DS8 and DS16 CSK128
+   as CSK symbols on the call code, in one of three alphabets (`HEADER_ALPHABETS`:
+   64, 128 or 256 codes of as many chips, 6 to 8 bits a symbol, the same
+   codeword). The weak payload modes (DS32, DS64 and every CSK mode) keep CSK256,
+   decodable wherever any payload mode is: 8.5 s on `2k4`, 6.8 s on `3k`, 41 s on
+   `500`. The fast modes send a shorter one so decoding starts sooner: DS4 uses
+   CSK64 (86 symbols, 2.9 s on `2k4`) and DS8 and DS16, at every rate, CSK128
    (74 symbols, 4.9 s), where the header still decodes below the payload's own
-   threshold. The receiver tries the alphabets shortest first, each as soon as its
-   chips are in, so it starts as early as the transmitter allows. The start-up
+   threshold. (16 and 32 were measured too and never chosen, see Verification, so
+   the receiver does not try them.) The receiver tries the alphabets shortest
+   first, each as soon as its chips are in, so it starts as early as the
+   transmitter allows. A longer header seen in a shorter alphabet despreads to
+   clean decisions (a Walsh code of 2L chips is a code of L chips twice, the
+   second time negated when its top bit is set), so only the LDPC and the CRC
+   turn it away; the display tells it by phase instead. The start-up
    (preamble and header) of a DS4 transmission is 6.6 s instead of 12.3 s. (A rate-½
    n = 256 header was built first; it needed about 3.4 dB more signal, which made
    it the limit of the whole system.)
@@ -390,6 +395,27 @@ started from, if any, so `--version` and `--write-demo` still print.
 - **Per profile** — the acquisition search surface as a heatmap (frequency ×
   code phase, scaled to the noise, the peak ringed) and one row per candidate
   preamble with its A/B period bars.
+- **Header** (a card per candidate once its preamble has ended, until the header
+  decodes): the symbols of the alphabet being tried, despread as they arrive by
+  the same per-symbol loop that decodes them (`rx::header::HeaderWatch`):
+  - symbol × previous symbol (main finger, decided code), the carrier's mean turn
+    a symbol taken off. CSK carries nothing in the phase, so the header being
+    sent is one cluster at 1 and noise a ring; a longer header seen in a shorter
+    alphabet is two clusters at ±1, half the points each (see Header above).
+    Neighbouring symbols rather than a running phase reference: on the moderate
+    channel a reference slipped 180° in a fade and painted the real header as
+    the wrong one
+  - the Walsh correlator bank and early/prompt/late timing, as on a CSK station
+  - in place of a progress bar: one bar a symbol across the whole header, its
+    height the decision margin (decided code over the runner-up; noise alone is
+    about 1 dB, derived, and drawn as a line), green in phase with the symbol
+    before, red turned round, amber unclear; the slots still to come empty; the
+    seconds in and needed, the alphabets that did not decode, and "a longer
+    header?" when a fifth of the points sit at −1 with a median margin of 4 dB or
+    more (display choices: `the_watch_tells_the_alphabet_sent_by_its_phase`
+    measured 0–3 % for the alphabet sent and 34–41 % for a shorter one, AWGN at
+    0 dB and moderate fading at +2 dB in-band)
+  - the preamble's delay profile with the fingers the header uses
 - **Per station** (one card per decoding channel; dimmed between segments):
   - DS-PSK: despread constellation (Es/N0 from the error), symbol × previous
     symbol, early/prompt/late timing; CSK: the Walsh correlator bank (a waterfall
@@ -523,7 +549,10 @@ at −10), 64 −10 dB, 128 −13 dB, 256 −16 dB; moderate fading, 16 about +8
 transmissions a point on the moderate channel, DS4 2/3 at 24 dB Eb/N0 lost 1.3 % of
 its frames with CSK256, 0.9 % with 64, 1.2 % with 128 and 2.8 % with 32; DS8 1/2 at
 10 dB 2.3 %, 3.2 %, 3.2 % with 256, 128, 64 (a short header gives the timing loop
-less to start from). Hence 64 for DS4 and 128 for DS8 and DS16.
+less to start from). Hence 64 for DS4 and 128 for DS8 and DS16, and the receiver
+tries only 64, 128 and 256. (These figures were taken with the receiver trying
+every alphabet in turn, 16 first; the test now tries each alphabet alone, still
+including 16 and 32, and has not been run since.)
 
 ### Watterson fading (2.4 kHz, ½ rate, depth 4, two blocks, 24 transmissions a point)
 

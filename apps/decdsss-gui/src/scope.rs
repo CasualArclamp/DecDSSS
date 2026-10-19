@@ -5,7 +5,7 @@
 
 use decdsss_phy::Iq;
 use decdsss_phy::rx::acq::Surface;
-use decdsss_phy::rx::header::Finger;
+use decdsss_phy::rx::header::{Finger, HeaderView};
 use decdsss_phy::rx::preamble::DelayProfile;
 use eframe::egui::{
     Align2, Color32, ColorImage, Context, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -568,6 +568,114 @@ pub fn frame_map(ui: &mut Ui, map: &[bool], have: usize, size: Vec2) {
             if ok { col::LOCK } else { col::GRID },
         );
     }
+}
+
+/// A symbol margin this far over the runner-up counts as a clear decision on the
+/// display (green rather than amber). A display choice, not a threshold the
+/// decoder uses: noise alone gives about 1 dB (see `HeaderView::margin_db`).
+const CLEAR_MARGIN_DB: f32 = 3.0;
+
+/// The header strip says "a longer header?" once this share of the points sit
+/// at −1 while the median margin is clear (noise alone also puts half the
+/// points at −1, but with a margin near 1 dB). Also display choices: in
+/// `the_watch_tells_the_alphabet_sent_by_its_phase` (AWGN at 0 dB, moderate
+/// fading at +2 dB) the alphabet sent gave 0–3 % and a shorter one 34–41 %,
+/// with median margins of 7.5 dB and more.
+const LONGER_FLIPS: f32 = 0.2;
+const LONGER_MARGIN_DB: f32 = 4.0;
+const LONGER_AFTER: usize = 16;
+
+/// The header as it comes in: one bar a symbol across the whole header in the
+/// alphabet being tried, its height the decision margin (decided code over the
+/// runner-up), the symbols still to come as empty slots, and the level noise
+/// alone would give as a line. Green is a clear decision in phase with the
+/// symbol before, red a clear one turned round from it (at −1 in the header
+/// constellation, a sign of a longer header), amber an unclear one. Replaces a
+/// progress bar: it fills at the same rate and shows whether what fills it is a
+/// header in this alphabet.
+pub fn header_symbols(ui: &mut Ui, h: &HeaderView, since_s: f64, needs_s: f64, size: Vec2) {
+    let mut title = format!(
+        "Header: CSK{}, symbol {} of {}",
+        h.alphabet, h.done, h.symbols
+    );
+    if !h.failed.is_empty() {
+        let tried: Vec<String> = h.failed.iter().map(|l| format!("CSK{l}")).collect();
+        title += &format!("  ({} did not decode)", tried.join(", "));
+    }
+    let mut reading = format!("{:.1} of {:.1} s", since_s.min(needs_s), needs_s);
+    if !h.margin_db.is_empty() {
+        let mut m = h.margin_db.clone();
+        m.sort_by(f32::total_cmp);
+        let median = m[m.len() / 2];
+        let flipped = h.flipped();
+        reading += &format!("  ·  margin {median:.1} dB  ·  {flipped} at −1");
+        if h.done >= LONGER_AFTER
+            && median >= LONGER_MARGIN_DB
+            && flipped as f32 >= LONGER_FLIPS * h.points.len() as f32
+        {
+            reading += ": a longer header?";
+        }
+    }
+    let (painter, area) = panel(ui, size, &title, &reading);
+    if h.symbols == 0 {
+        return;
+    }
+    // The bars on the left, their scale on the right.
+    let plot = Rect::from_min_max(area.min, area.max - vec2(44.0, 0.0));
+    // Noise alone: the largest of L equal exponentials over the second largest,
+    // H_L / (H_L − 1) in the means (one finger).
+    let hl: f32 = (1..=h.alphabet.max(2)).map(|k| 1.0 / k as f32).sum();
+    let noise_db = 10.0 * (hl / (hl - 1.0)).log10();
+    let top_db = h.margin_db.iter().copied().fold(12.0f32, f32::max);
+    let y = |db: f32| plot.bottom() - (db.max(0.0) / top_db).min(1.0) * plot.height();
+    let w = plot.width() / h.symbols as f32;
+    for i in 0..h.symbols {
+        let x0 = plot.left() + i as f32 * w;
+        let (l, r) = (x0 + 0.5, (x0 + w - 0.5).max(x0 + 1.0));
+        let (top, c) = match h.margin_db.get(i) {
+            Some(&db) => {
+                // The points start at the second symbol (each is symbol × previous).
+                let flipped = i
+                    .checked_sub(1)
+                    .and_then(|j| h.points.get(j))
+                    .is_some_and(|z| z.re < 0.0);
+                let c = match (db >= CLEAR_MARGIN_DB, flipped) {
+                    (false, _) => col::MARK,
+                    (true, false) => col::LOCK,
+                    (true, true) => col::BAD,
+                };
+                (y(db), c)
+            }
+            // Still to come: an empty slot.
+            None => (plot.bottom() - 3.0, col::GRID),
+        };
+        painter.rect_filled(
+            Rect::from_min_max(pos2(l, top), pos2(r, plot.bottom())),
+            0.0,
+            c,
+        );
+    }
+    painter.line_segment(
+        [
+            pos2(plot.left(), y(noise_db)),
+            pos2(plot.right(), y(noise_db)),
+        ],
+        (1.0, col::REF),
+    );
+    small(
+        &painter,
+        pos2(area.right(), y(noise_db)),
+        Align2::RIGHT_CENTER,
+        &format!("noise {noise_db:.1}"),
+        col::REF,
+    );
+    small(
+        &painter,
+        pos2(area.right(), plot.top()),
+        Align2::RIGHT_TOP,
+        &format!("{top_db:.0} dB"),
+        col::AXIS,
+    );
 }
 
 /// The preamble: per period, the correlation power with sequence A (blue) and

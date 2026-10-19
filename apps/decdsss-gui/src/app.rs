@@ -1057,21 +1057,34 @@ fn attempt_card(ui: &mut Ui, a: &AttemptView, w: f32) {
     if !a.periods.is_empty() {
         scope::preamble_bars(ui, &a.periods, vec2(w, 54.0));
     }
-    if a.header_stage && a.header_needs_s > 0.0 {
-        // The header is a stretch of its own, from a second to eight and a half:
-        // how far into it the receiver is, and which header it is waiting for (the
-        // shortest is tried first, and a longer one if that does not decode).
-        let frac = (a.header_since_s / a.header_needs_s).clamp(0.0, 1.0) as f32;
-        ui.add(
-            egui::ProgressBar::new(frac)
-                .desired_width(w - 24.0)
-                .text(format!(
-                    "header: {:.1} of {:.1} s  ·  trying the {}-code header",
-                    a.header_since_s.min(a.header_needs_s),
-                    a.header_needs_s,
-                    a.header_alphabet
-                )),
-        );
+    // The header is a stretch of its own, 2.9 to 8.5 s on 2k4: its symbols as
+    // they come in, in the alphabet being tried (the shortest first, a longer one
+    // if that does not decode), laid out like a CSK station's card.
+    if let Some(h) = a.header.as_ref().filter(|_| a.header_stage) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            let gap = ui.spacing().item_spacing.x;
+            let side = ((w - 2.0 * gap - 24.0) / 3.0).clamp(90.0, 170.0);
+            ui.horizontal(|ui| {
+                scope::constellation(
+                    ui,
+                    "Symbol × previous",
+                    &h.points,
+                    &[(1.0, 0.0)],
+                    side,
+                    col::TRACE,
+                );
+                scope::bank(ui, &h.bank, side);
+                scope::epl(ui, h.epl, side);
+            });
+            scope::header_symbols(
+                ui,
+                h,
+                a.header_since_s,
+                a.header_needs_s,
+                vec2(w - 24.0, 72.0),
+            );
+            scope::rake(ui, &h.profile, &h.fingers, vec2(w - 24.0, 80.0));
+        });
     }
 }
 

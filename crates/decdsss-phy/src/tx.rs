@@ -2,7 +2,7 @@
 //! The transmitter: a segment's chips and the audio they become.
 //!
 //! Chips (complex, unit power) are built in this order: the preamble (real
-//! BPSK, unscrambled), the header (CSK256 on the call code) and the payload
+//! BPSK, unscrambled), the header (CSK64, 128 or 256 on the call code) and the payload
 //! blocks (DS-PSK or CSK on the sender's own code). A scrambler chip
 //! (±1 ± j)/√2 multiplies every chip after the preamble; the header's
 //! scrambler starts at chip 0 of the header, the payload's at chip 0 of the
@@ -24,13 +24,14 @@ use decdsss_fec::ldpc::Code;
 pub const HEADER_CSK: usize = 256;
 pub const HEADER_SYMBOLS: usize = 512 / 8;
 
-/// The CSK alphabets a header may use (chips and codes to a symbol), shortest
-/// first. A small alphabet is a short header (16: 128 symbols of 16 chips, 2048
-/// chips, about a second) that needs a stronger signal; 256 is the long one
-/// (16384 chips, 8.5 s) for the weakest modes. The receiver tries them in this
-/// order, as soon as each could be in, so it starts as early as the transmitter
-/// allows.
-pub const HEADER_ALPHABETS: [usize; 5] = [16, 32, 64, 128, 256];
+/// The CSK alphabets a header is sent in (chips and codes to a symbol), shortest
+/// first: exactly the ones [`header_alphabet_for`] picks. 64 is the short header
+/// (86 symbols, 5504 chips, 2.9 s on `2k4`) and needs the strongest signal; 256 is
+/// the long one (16384 chips, 8.5 s) for the weakest modes. The receiver tries
+/// them in this order, as soon as each could be in, so it starts as early as the
+/// transmitter allows. 16 and 32 were measured and never chosen
+/// (`header_alphabet_curve`), so the receiver no longer tries them.
+pub const HEADER_ALPHABETS: [usize; 3] = [64, 128, 256];
 
 /// Bits in a header symbol of alphabet `l`.
 pub fn header_bits(l: usize) -> usize {
@@ -107,8 +108,9 @@ pub fn header_chips(h: &Header) -> Option<Vec<Iq>> {
     header_chips_l(h, HEADER_CSK)
 }
 
-/// Chips of the header in CSK alphabet `l` (one of [`HEADER_ALPHABETS`]): the
-/// same codeword, `log2 l` bits to a symbol.
+/// Chips of the header in CSK alphabet `l` (one of [`HEADER_ALPHABETS`], or any
+/// power of two from 16 for a measurement): the same codeword, `log2 l` bits to a
+/// symbol.
 pub fn header_chips_l(h: &Header, l: usize) -> Option<Vec<Iq>> {
     let info = h.pack()?;
     let cw = Code::header().encode(&info);
@@ -436,6 +438,15 @@ mod tests {
                 "{mode}"
             );
         }
+    }
+
+    #[test]
+    fn the_receiver_tries_exactly_the_alphabets_that_are_sent() {
+        let sent: std::collections::BTreeSet<usize> =
+            Mode::all().into_iter().map(header_alphabet_for).collect();
+        let tried: std::collections::BTreeSet<usize> = HEADER_ALPHABETS.into_iter().collect();
+        assert_eq!(sent, tried);
+        assert!(HEADER_ALPHABETS.is_sorted(), "shortest first");
     }
 
     #[test]

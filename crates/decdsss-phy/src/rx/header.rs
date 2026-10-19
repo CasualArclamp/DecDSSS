@@ -80,49 +80,95 @@ pub fn header_need(lock: &PreambleLock, alphabet: usize) -> f64 {
     lock.header_start + (header_len(alphabet) as f64 + max_lag + 6.0) * lock.step + 16.0
 }
 
-/// Demodulates the header, in CSK alphabet `alphabet`, that starts at
-/// `lock.header_start`.
-pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64, alphabet: usize) -> HeaderOutcome {
-    let (hl, nsym, bits) = (alphabet, header_symbols(alphabet), header_bits(alphabet));
-    let fingers = pick_fingers(&lock.profile, 3);
-    let max_lag = fingers.iter().map(|f| f.lag).fold(0.0f64, f64::max);
-    let total_chips = header_len(alphabet);
-    let need = lock.header_start + (total_chips as f64 + max_lag + 6.0) * lock.step + 16.0;
-    if need > buf.end() as f64 {
-        return HeaderOutcome::NeedMore(need.ceil() as i64);
-    }
-    let scr = Scrambler::new(CALL_CODE).chips(0, total_chips);
-    let main = fingers
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.power.total_cmp(&b.1.power))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+/// One header symbol as the demodulator saw it.
+struct Symbol {
+    /// The Walsh correlations on each finger: `per_finger[finger][code]`.
+    per_finger: Vec<Vec<Iq>>,
+    /// The finger-weighted power of each code, and the decided code (the most).
+    power: Vec<f32>,
+    code: usize,
+    /// Early and late magnitudes on the main finger, with the decided code.
+    early: f32,
+    late: f32,
+}
 
-    let mut t = Track {
-        pos: lock.header_start,
-        step: lock.step,
-        freq: lock.freq_hz,
-        phase: 0.0,
-        rate,
-    };
-    let mut u = vec![Iq::new(0.0, 0.0); hl];
-    // W[symbol][finger] = the `hl` correlations.
-    let mut w: Vec<Vec<Vec<Iq>>> = Vec::with_capacity(nsym);
-    let mut decisions = Vec::with_capacity(nsym);
-    let mut peak_prev: Option<Iq> = None;
-    let mut freq_acc = Iq::new(0.0, 0.0);
-    let (mut err_int, kp, ki) = (0.0f64, 0.15, 0.01);
-    for s in 0..nsym {
-        let sc = &scr[s * hl..(s + 1) * hl];
-        let mut per_finger = Vec::with_capacity(fingers.len());
-        for f in &fingers {
-            despread(buf, &t, sc, f.lag, &mut u);
+/// The timing loop's proportional and integral gains, per symbol.
+const KP: f64 = 0.15;
+const KI: f64 = 0.01;
+
+/// The per-symbol part of the header demodulator: despreads a CSK symbol on
+/// every finger, decides its code, steers the timing from the decision and
+/// gathers the carrier's drift. [`demod_header`] runs it over the whole header
+/// at once; [`HeaderWatch`] runs it as the chips come in, for a display.
+struct SymbolLoop {
+    hl: usize,
+    nsym: usize,
+    fingers: Vec<Finger>,
+    /// The strongest finger, which the timing and carrier follow.
+    main: usize,
+    max_lag: f64,
+    scr: Vec<Iq>,
+    t: Track,
+    err_int: f64,
+    peak_prev: Option<Iq>,
+    /// Σ peak·conj(previous peak): its angle is the carrier's turn a symbol.
+    freq_acc: Iq,
+    /// Symbols done.
+    done: usize,
+}
+
+impl SymbolLoop {
+    fn new(lock: &PreambleLock, rate: f64, alphabet: usize) -> SymbolLoop {
+        let fingers = pick_fingers(&lock.profile, 3);
+        let max_lag = fingers.iter().map(|f| f.lag).fold(0.0f64, f64::max);
+        let main = fingers
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.power.total_cmp(&b.1.power))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        SymbolLoop {
+            hl: alphabet,
+            nsym: header_symbols(alphabet),
+            fingers,
+            main,
+            max_lag,
+            scr: Scrambler::new(CALL_CODE).chips(0, header_len(alphabet)),
+            t: Track {
+                pos: lock.header_start,
+                step: lock.step,
+                freq: lock.freq_hz,
+                phase: 0.0,
+                rate,
+            },
+            err_int: 0.0,
+            peak_prev: None,
+            freq_acc: Iq::new(0.0, 0.0),
+            done: 0,
+        }
+    }
+
+    /// True if there is a symbol left and its chips (and the fingers' and the
+    /// interpolator's reach past them) are all in `buf`: the margin
+    /// [`header_need`] allows for the whole header, a symbol at a time.
+    fn ready(&self, buf: &Buf) -> bool {
+        self.done < self.nsym
+            && self.t.pos + (self.hl as f64 + self.max_lag + 6.0) * self.t.step + 16.0
+                <= buf.end() as f64
+    }
+
+    fn next(&mut self, buf: &Buf) -> Symbol {
+        let (hl, s) = (self.hl, self.done);
+        let sc = &self.scr[s * hl..(s + 1) * hl];
+        let mut u = vec![Iq::new(0.0, 0.0); hl];
+        let mut per_finger = Vec::with_capacity(self.fingers.len());
+        for f in &self.fingers {
+            despread(buf, &self.t, sc, f.lag, &mut u);
             per_finger.push(walsh_correlate(&u));
         }
         // The decision: the code with the most weighted power.
         let mut power = vec![0.0f32; hl];
-        for (f, wf) in fingers.iter().zip(&per_finger) {
+        for (f, wf) in self.fingers.iter().zip(&per_finger) {
             for (p, z) in power.iter_mut().zip(wf) {
                 *p += f.power * z.norm_sqr();
             }
@@ -133,30 +179,65 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64, alphabet: usize) 
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)
             .unwrap_or(0);
-        decisions.push(m);
         // Early/late on the main finger, with the decided code.
-        let lag = fingers[main].lag;
+        let lag = self.fingers[self.main].lag;
         let mut ue = vec![Iq::new(0.0, 0.0); hl];
         let mut ul = vec![Iq::new(0.0, 0.0); hl];
-        despread(buf, &t, sc, lag - 0.25, &mut ue);
-        despread(buf, &t, sc, lag + 0.25, &mut ul);
+        despread(buf, &self.t, sc, lag - 0.25, &mut ue);
+        despread(buf, &self.t, sc, lag + 0.25, &mut ul);
         let (e, l) = (walsh_one(&ue, m).norm(), walsh_one(&ul, m).norm());
         let d = f64::from((l - e) / (l + e).max(1e-30));
         let err = d / 1.33;
-        err_int += ki * err;
-        t.pos += (kp * err + err_int) * t.step;
+        self.err_int += KI * err;
+        self.t.pos += (KP * err + self.err_int) * self.t.step;
         // Frequency from successive peak phases.
-        let peak = per_finger[main][m];
-        if let Some(p) = peak_prev {
-            freq_acc += peak * p.conj();
+        let peak = per_finger[self.main][m];
+        if let Some(p) = self.peak_prev {
+            self.freq_acc += peak * p.conj();
         }
-        peak_prev = Some(peak);
-        w.push(per_finger);
-        t.advance(hl);
+        self.peak_prev = Some(peak);
+        self.t.advance(hl);
+        self.done += 1;
+        Symbol {
+            per_finger,
+            power,
+            code: m,
+            early: e,
+            late: l,
+        }
     }
-    let t_sym = hl as f64 * t.step / rate;
-    let f_res = f64::from(freq_acc.arg()) / (std::f64::consts::TAU * t_sym);
-    t.freq += 0.5 * f_res;
+
+    /// The track at the end of the header, its carrier moved half way to the
+    /// drift the symbols showed.
+    fn end_track(&self) -> Track {
+        // Rust note: `Track` is `Copy`, so this is a copy, not a move out of `self`.
+        let mut t = self.t;
+        let t_sym = self.hl as f64 * t.step / t.rate;
+        let f_res = f64::from(self.freq_acc.arg()) / (std::f64::consts::TAU * t_sym);
+        t.freq += 0.5 * f_res;
+        t
+    }
+}
+
+/// Demodulates the header, in CSK alphabet `alphabet`, that starts at
+/// `lock.header_start`.
+pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64, alphabet: usize) -> HeaderOutcome {
+    let (hl, nsym, bits) = (alphabet, header_symbols(alphabet), header_bits(alphabet));
+    let need = header_need(lock, alphabet);
+    if need > buf.end() as f64 {
+        return HeaderOutcome::NeedMore(need.ceil() as i64);
+    }
+    let mut lp = SymbolLoop::new(lock, rate, alphabet);
+    // W[symbol][finger] = the `hl` correlations.
+    let mut w: Vec<Vec<Vec<Iq>>> = Vec::with_capacity(nsym);
+    let mut decisions = Vec::with_capacity(nsym);
+    for _ in 0..nsym {
+        let s = lp.next(buf);
+        decisions.push(s.code);
+        w.push(s.per_finger);
+    }
+    let mut t = lp.end_track();
+    let (fingers, main) = (lp.fingers, lp.main);
 
     // Per-finger noise and amplitude from the decided symbols.
     let nf = fingers.len();
@@ -231,6 +312,130 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64, alphabet: usize) 
         iterations: outcome.iterations,
         snr_db: 10.0 * (amp2[main] / sigma2[main]).log10(),
     }))
+}
+
+/// The header so far, for a display: the symbols of the alphabet being tried,
+/// as the decoding loop sees them.
+#[derive(Clone, Debug, Default)]
+pub struct HeaderView {
+    /// The alphabet being tried, and the ones tried before it that did not decode.
+    pub alphabet: usize,
+    pub failed: Vec<usize>,
+    /// Symbols of a header in this alphabet, and how many are in.
+    pub symbols: usize,
+    pub done: usize,
+    /// Symbol × previous: each symbol's correlation with its decided code on the
+    /// main finger times the conjugate of the one before (so from the second
+    /// symbol on), turned back by the mean turn a symbol (taken modulo 180°) and
+    /// scaled by the mean product magnitude. CSK puts nothing in the phase, so a
+    /// header in this alphabet is one cluster at 1, and noise a ring. A longer
+    /// header seen in this alphabet decides just as cleanly but is two clusters,
+    /// at ±1, half the points each: a Walsh code of 2L chips is a code of L
+    /// chips twice, the second time negated when the code's top bit is set, so
+    /// neighbouring pieces differ in sign half the time. Neighbours, not a
+    /// running reference, because a fade can turn a reference round by 180°.
+    pub points: Vec<Iq>,
+    /// Each symbol's decision margin: the decided code's finger-weighted power
+    /// over the runner-up's, dB. About 1 dB for noise alone (derived for one
+    /// finger: the code powers are then L equal exponentials, whose largest and
+    /// second largest have means H_L and H_L − 1, harmonic numbers; their ratio
+    /// is 1.03 dB at L = 64, 0.88 dB at 128, 0.77 dB at 256).
+    pub margin_db: Vec<f32>,
+    /// The correlator bank: main-finger power against code, one row a symbol
+    /// (the last `payload::LIVE_ROWS`), each row scaled to its maximum.
+    pub bank: Vec<Vec<f32>>,
+    /// The last symbol's early, prompt and late magnitudes, prompt = 1.
+    pub epl: [f32; 3],
+    /// The preamble's delay profile (power against lag) and the fingers from it.
+    pub profile: Vec<f32>,
+    pub fingers: Vec<Finger>,
+}
+
+/// Follows a header as its chips come in, with the same loop that decodes it,
+/// and keeps a [`HeaderView`]. Display only: the decision is [`demod_header`]'s.
+pub struct HeaderWatch {
+    lp: SymbolLoop,
+    view: HeaderView,
+    /// The last decided correlation, and Σ (z·conj(previous z))²: half its
+    /// angle is the carrier's turn a symbol, blind to the 180° flips of a
+    /// header seen in too short an alphabet.
+    prev: Option<Iq>,
+    turn_sq: Iq,
+    /// Sum of the products' magnitudes so far.
+    mag_sum: f32,
+}
+
+impl HeaderWatch {
+    pub fn new(lock: &PreambleLock, rate: f64, alphabet: usize, failed: Vec<usize>) -> HeaderWatch {
+        let lp = SymbolLoop::new(lock, rate, alphabet);
+        let view = HeaderView {
+            alphabet,
+            failed,
+            symbols: lp.nsym,
+            profile: lock.profile.power.clone(),
+            fingers: lp.fingers.clone(),
+            ..HeaderView::default()
+        };
+        HeaderWatch {
+            lp,
+            view,
+            prev: None,
+            turn_sq: Iq::new(0.0, 0.0),
+            mag_sum: 0.0,
+        }
+    }
+
+    /// Runs every symbol whose chips are in.
+    pub fn advance(&mut self, buf: &Buf) {
+        while self.lp.ready(buf) {
+            let s = self.lp.next(buf);
+            let v = &mut self.view;
+            v.done = self.lp.done;
+            let z = s.per_finger[self.lp.main][s.code];
+            let a = z.norm();
+            // Rust note: `if let Some(p) = self.prev` copies the `Iq` out (it is
+            // `Copy`), so `self.prev` can be overwritten below.
+            if let Some(p) = self.prev {
+                let d = z * p.conj();
+                self.turn_sq += d * d;
+                self.mag_sum += d.norm();
+                // The carrier's mean turn a symbol so far, taken back off so a
+                // small offset left by the preamble does not move the cluster.
+                let (sn, cs) = (0.5 * self.turn_sq.arg()).sin_cos();
+                let products = v.points.len() + 1;
+                let mean = (self.mag_sum / products as f32).max(1e-30);
+                v.points.push(d * Iq::new(cs, -sn) / mean);
+            }
+            self.prev = Some(z);
+            let mut sorted = s.power.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let (best, second) = (sorted[0], sorted.get(1).copied().unwrap_or(0.0));
+            v.margin_db
+                .push(10.0 * (best.max(1e-30) / second.max(1e-30)).log10());
+            let row: Vec<f32> = s.per_finger[self.lp.main]
+                .iter()
+                .map(|z| z.norm_sqr())
+                .collect();
+            let top = row.iter().copied().fold(1e-30f32, f32::max);
+            if v.bank.len() == super::payload::LIVE_ROWS {
+                v.bank.remove(0);
+            }
+            v.bank.push(row.into_iter().map(|p| p / top).collect());
+            let p = a.max(1e-30);
+            v.epl = [s.early / p, 1.0, s.late / p];
+        }
+    }
+
+    pub fn view(&self) -> &HeaderView {
+        &self.view
+    }
+}
+
+impl HeaderView {
+    /// Symbols turned round from the one before: points at −1.
+    pub fn flipped(&self) -> usize {
+        self.points.iter().filter(|z| z.re < 0.0).count()
+    }
 }
 
 #[cfg(test)]
@@ -320,18 +525,19 @@ mod tests {
     }
 
     /// Header success against SNR for each alphabet, on AWGN and the moderate
-    /// channel; run with
+    /// channel, each alphabet tried alone; 16 and 32 too, which no mode sends,
+    /// so the choice in `tx::header_alphabet_for` can be checked again. Run with
     /// `cargo test -p decdsss-phy --release -- --ignored --nocapture header_alphabet_curve`.
     #[test]
     #[ignore]
     fn header_alphabet_curve() {
-        use crate::tx::{HEADER_ALPHABETS, chips_to_audio, header_chips_l, preamble_chips};
+        use crate::tx::{chips_to_audio, header_chips_l, preamble_chips};
         let profile = Profile::W2400;
         let seg = segment(profile, "ds8-1/2", 1, 1);
         let chans: [(&str, Option<Watterson>); 2] =
             [("awgn", None), ("moderate", Some(Watterson::MODERATE))];
         for (name, fading) in chans {
-            for &l in &HEADER_ALPHABETS {
+            for l in [16, 32, 64, 128, 256] {
                 let mut chips = preamble_chips(profile);
                 chips.extend(header_chips_l(&seg.header, l).unwrap());
                 chips.extend(std::iter::repeat_n(decdsss_dsp::Iq::new(0.0, 0.0), 4000));
@@ -347,7 +553,7 @@ mod tests {
                         ch.offset_hz = -15.0 + seed as f64 * 3.0;
                         ch.clock_ppm = -30.0 + seed as f64 * 6.0;
                         let heard = ch.apply(&audio, 48_000.0);
-                        if let Ok(r) = to_header(&heard, profile)
+                        if let Ok(r) = to_header_in(&heard, profile, &[l])
                             && r.header.header == seg.header
                         {
                             ok += 1;
@@ -356,6 +562,57 @@ mod tests {
                     row += &format!(" {snr:+.0}:{ok:2}");
                 }
                 println!("{row}");
+            }
+        }
+    }
+
+    /// The watch on headers in AWGN and in moderate fading. In the alphabet sent:
+    /// every symbol in, one cluster at 1. In a shorter one (as the receiver tries
+    /// first): margins just as clear, since a longer Walsh code is a shorter one
+    /// repeated with signs, but half the points at −1.
+    #[test]
+    fn the_watch_tells_the_alphabet_sent_by_its_phase() {
+        use super::HeaderWatch;
+        use crate::tx::{HEADER_ALPHABETS, header_alphabet_for};
+        let profile = Profile::W2400;
+        let median = |v: &[f32]| {
+            let mut v = v.to_vec();
+            v.sort_by(f32::total_cmp);
+            v[v.len() / 2]
+        };
+        for (fading, snr) in [(None, 0.0), (Some(Watterson::MODERATE), 2.0)] {
+            for (k, mode) in ["ds4-1/2", "ds8-1/2", "csk64-1/2"].into_iter().enumerate() {
+                let seg = segment(profile, mode, 1, 1);
+                let sent = header_alphabet_for(seg.header.mode);
+                let mut ch = channel(profile, snr);
+                ch.fading = fading;
+                ch.seed = 40 + k as u64;
+                let audio = through(&seg, &ch);
+                let Ok(run) = to_header(&audio, profile) else {
+                    eprintln!("{mode}: no header this time");
+                    continue;
+                };
+                let rate = run.fe.out_rate();
+                for l in HEADER_ALPHABETS.into_iter().filter(|&l| l <= sent) {
+                    let mut w = HeaderWatch::new(&run.lock, rate, l, Vec::new());
+                    w.advance(&run.buf);
+                    let v = w.view();
+                    assert_eq!(v.done, v.symbols, "{mode} as {l}");
+                    let m = median(&v.margin_db);
+                    let flips = v.flipped() as f32 / v.points.len() as f32;
+                    eprintln!(
+                        "{} {mode} (CSK{sent}) as CSK{l}: median margin {m:.1} dB, \
+                         {:.0} % at -1",
+                        if fading.is_some() { "fading" } else { "awgn  " },
+                        100.0 * flips
+                    );
+                    if l == sent {
+                        assert!(flips < 0.15, "{mode} as {l}: flips {flips}");
+                    } else {
+                        assert!(m > 6.0, "{mode} as {l}: margin {m}");
+                        assert!((0.3..0.7).contains(&flips), "{mode} as {l}: {flips}");
+                    }
+                }
             }
         }
     }
