@@ -155,6 +155,57 @@ impl Mode {
         10.0 * (self.info_bit_rate(p) / p.bandwidth_hz()).log10()
     }
 
+    /// Information bits a modulation symbol, the pilots counted as air time
+    /// (the convention the measured thresholds use; padding is left out).
+    pub fn info_bits_per_symbol(self) -> f64 {
+        self.coded_bits_per_symbol() * self.rate.value()
+    }
+
+    /// Eb/N0 (dB) from the Es/N0 of a data symbol: pilots carry the same
+    /// energy as data symbols, so Eb/N0 = Es/N0 − 10·log10(info bits a symbol).
+    pub fn ebn0_from_es_db(self, es_n0_db: f64) -> f64 {
+        es_n0_db - 10.0 * self.info_bits_per_symbol().log10()
+    }
+
+    /// The lowest Eb/N0 (dB, in 0.5 dB steps) at which every frame arrived
+    /// over AWGN through the whole receiver: measured with `decdsss sweep`
+    /// on 2026-10-19 (DESIGN.md, Verification). `None` where that profile and
+    /// mode were not measured.
+    pub fn ebn0_measured_db(self, p: Profile) -> Option<f64> {
+        // Rust note: a `use` inside a function brings the enum's variants into
+        // scope here only, so the table reads `DsPsk` rather than `Family::DsPsk`.
+        use CodeRate::*;
+        use Family::*;
+        let db = match (p, self.family, self.spread, self.rate) {
+            (Profile::W2400, DsPsk, 4, R1_2) => 4.0,
+            (Profile::W2400, DsPsk, 8, R1_2) => 4.5,
+            (Profile::W2400, DsPsk, 16, R1_2) => 4.0,
+            (Profile::W2400, DsPsk, 32, R1_2) => 4.5,
+            (Profile::W2400, DsPsk, 64, R1_2) => 4.0,
+            (Profile::W2400, DsPsk, 4, R3_4) => 5.0,
+            (Profile::W2400, DsPsk, 16, R3_4) => 4.5,
+            (Profile::W2400, Csk, 32 | 64 | 128 | 256, R1_2) => 4.0,
+            (Profile::W2400, Csk, 32, R3_4) => 4.0,
+            (Profile::W2400, Csk, 64, R3_4) => 3.5,
+            (Profile::W3000, DsPsk, 8, R1_2) => 4.0,
+            (Profile::W3000, Csk, 64 | 256, R1_2) => 4.0,
+            (Profile::N500, DsPsk, 8, R1_2) => 4.0,
+            (Profile::N500, Csk, 64, R1_2) => 6.0,
+            _ => return None,
+        };
+        Some(db)
+    }
+
+    /// The Eb/N0 (dB) a display takes this mode to need, and whether it was
+    /// measured: where it was not, 4.0 dB, the figure most measured modes
+    /// came out at.
+    pub fn ebn0_needed_db(self, p: Profile) -> (f64, bool) {
+        match self.ebn0_measured_db(p) {
+            Some(db) => (db, true),
+            None => (4.0, false),
+        }
+    }
+
     /// Parses `ds4-2/3`, `DS16 1/2`, `csk64-1/2`. The rate defaults to 1/2.
     pub fn from_name(s: &str) -> Option<Mode> {
         let s = s.trim().to_ascii_lowercase();
@@ -232,6 +283,24 @@ mod tests {
         );
         assert_eq!(Mode::from_name("ds5"), None);
         assert_eq!(Mode::from_name("csk64-5/6"), None);
+    }
+
+    #[test]
+    fn ebn0_from_es_by_hand() {
+        // DS8 1/2: 2 bits × 7/8 × 1/2 = 0.875 bit a symbol → +0.58 dB.
+        let e = m("ds8-1/2").ebn0_from_es_db(10.0);
+        assert!((e - 10.580).abs() < 1e-3, "{e}");
+        // CSK32 3/4: 5 bits × 3/4 = 3.75 bits a symbol → −5.74 dB.
+        let e = m("csk32-3/4").ebn0_from_es_db(10.0);
+        assert!((e - 4.260).abs() < 1e-3, "{e}");
+    }
+
+    #[test]
+    fn thresholds_where_measured() {
+        assert_eq!(m("ds8-1/2").ebn0_measured_db(Profile::W2400), Some(4.5));
+        assert_eq!(m("csk64-1/2").ebn0_measured_db(Profile::N500), Some(6.0));
+        assert_eq!(m("ds4-2/3").ebn0_measured_db(Profile::W2400), None);
+        assert_eq!(m("ds4-2/3").ebn0_needed_db(Profile::W2400), (4.0, false));
     }
 
     #[test]

@@ -8,8 +8,8 @@ use decdsss_phy::rx::acq::Surface;
 use decdsss_phy::rx::header::Finger;
 use decdsss_phy::rx::preamble::DelayProfile;
 use eframe::egui::{
-    Align2, Color32, ColorImage, Context, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind,
-    TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
+    Align, Align2, Color32, ColorImage, Context, FontId, Layout, Painter, Pos2, Rect, RichText,
+    Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
 };
 
 /// One hue a quantity, kept muted.
@@ -110,6 +110,121 @@ fn small(painter: &Painter, at: Pos2, align: Align2, text: &str, color: Color32)
     painter.text(at, align, text, FontId::proportional(9.5), color);
 }
 
+/// A link margin's colour: red below 0 dB, amber within 1 dB, else green
+/// (DecSAT's `margin_colour`, `apps/decsat-gui/src/side_panel.rs`).
+pub fn margin_colour(margin_db: f32) -> Color32 {
+    if margin_db < 0.0 {
+        col::BAD
+    } else if margin_db < 1.0 {
+        col::MARK
+    } else {
+        col::LOCK
+    }
+}
+
+/// What the margin bar shows.
+pub struct Margin {
+    /// The mode, as the header names it.
+    pub mode: String,
+    /// Eb/N0 now, dB; `None` before there is a reading or between segments.
+    pub ebn0_db: Option<f32>,
+    /// The same as an in-band SNR, dB.
+    pub snr_db: Option<f32>,
+    /// The Eb/N0 the mode needs, dB, and whether that was measured.
+    pub need_db: f32,
+    pub measured: bool,
+    /// The station's segment has ended (no reading until the next).
+    pub between: bool,
+}
+
+/// Eb/N0 bar scale, dB: fixed, so the bar does not jump as the reading moves.
+const MARGIN_LO: f32 = 0.0;
+const MARGIN_HI: f32 = 20.0;
+
+/// The mode big with its link margin beside it, and under them an Eb/N0 bar
+/// on a fixed scale with a tick at the Eb/N0 the mode needs. The layout is
+/// DecSAT's MODCOD-and-margin card (`dvb_card` in
+/// `apps/decsat-gui/src/side_panel.rs`), with Eb/N0 for its Es/N0.
+pub fn margin_bar(ui: &mut Ui, m: &Margin, width: f32) {
+    let margin = m.ebn0_db.map(|e| e - m.need_db);
+    let colour = margin.map_or(col::REF, margin_colour);
+    let need = if m.measured {
+        format!("needs {:.1} dB", m.need_db)
+    } else {
+        format!("needs ≈ {:.1} dB", m.need_db)
+    };
+    let resp = ui
+        .horizontal(|ui| {
+            ui.set_width(width);
+            ui.label(
+                RichText::new(&m.mode)
+                    .monospace()
+                    .size(22.0)
+                    .color(col::LOCK),
+            );
+            if let Some(v) = margin {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{v:+.1} dB"))
+                            .monospace()
+                            .size(17.0)
+                            .color(colour),
+                    );
+                });
+            }
+        })
+        .response;
+    let about = if m.measured {
+        "The Eb/N0 it needs is the lowest at which every frame arrived over AWGN \
+         through the whole receiver (DESIGN.md, Verification)."
+    } else {
+        "This mode has not been measured on this profile: 4.0 dB is assumed, \
+         the figure most measured modes came out at."
+    };
+    resp.on_hover_text(format!(
+        "Margin: the Eb/N0 now less the Eb/N0 this mode needs. Below 0 dB the \
+         measured runs lost frames; amber is within 1 dB of that. A fading \
+         channel needs more than the AWGN figure.\n\n{about}\n\nEb/N0 is the \
+         symbol SNR (the last 1.5 s) less 10·log10 of the information bits a \
+         symbol, pilots counted as air time. CSK measures the main path only, \
+         so with multipath it reads low."
+    ));
+
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 16.0), Sense::hover());
+    let bar = Rect::from_min_max(rect.min + vec2(0.0, 3.0), rect.max - vec2(0.0, 3.0));
+    let x_of = |db: f32| {
+        bar.left() + bar.width() * ((db - MARGIN_LO) / (MARGIN_HI - MARGIN_LO)).clamp(0.0, 1.0)
+    };
+    let p = ui.painter();
+    p.rect_filled(bar, 2.0, ui.visuals().extreme_bg_color);
+    if let Some(e) = m.ebn0_db {
+        p.rect_filled(
+            Rect::from_min_max(bar.min, pos2(x_of(e), bar.max.y)),
+            2.0,
+            colour,
+        );
+    }
+    let x = x_of(m.need_db);
+    p.rect_filled(
+        Rect::from_min_max(pos2(x - 1.0, rect.top()), pos2(x + 1.0, rect.bottom())),
+        0.0,
+        ui.visuals().strong_text_color(),
+    );
+
+    ui.horizontal(|ui| {
+        ui.set_width(width);
+        let left = match (m.ebn0_db, m.snr_db) {
+            (Some(e), Some(s)) => format!("Eb/N0 {e:.1} dB · in-band SNR {s:+.1} dB"),
+            _ if m.between => "no reading between segments".into(),
+            _ => "Eb/N0 not measured yet".into(),
+        };
+        ui.label(RichText::new(left).size(12.0).weak());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(need).size(12.0).weak());
+        });
+    });
+}
+
 /// A scatter of complex points with axes, a unit circle and the ideal points
 /// as crosses; points fade with age, the newest marked. The reading is the
 /// mean error against the nearest ideal point as an Es/N0.
@@ -118,7 +233,7 @@ pub fn constellation(
     title: &str,
     pts: &[Iq],
     ideal: &[(f32, f32)],
-    side: f32,
+    size: Vec2,
     color: Color32,
 ) {
     const FULL: f32 = 1.8;
@@ -139,7 +254,7 @@ pub fn constellation(
             10.0 * (pts.len() as f32 / err.max(1e-9)).log10()
         )
     };
-    let (painter, area) = panel(ui, vec2(side, side + 14.0), title, &reading);
+    let (painter, area) = panel(ui, size, title, &reading);
     let r = area.width().min(area.height()) / 2.0;
     let o = area.center();
     let k = r / FULL;
@@ -186,7 +301,7 @@ pub const QUADRANTS: [(f32, f32); 4] = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.
 
 /// The early, prompt and late correlators on the ideal correlation triangle;
 /// the reading is the timing discriminator (E − L)/(E + L).
-pub fn epl(ui: &mut Ui, e: [f32; 3], side: f32) {
+pub fn epl(ui: &mut Ui, e: [f32; 3], size: Vec2) {
     const SPAN: f32 = 1.25;
     let disc = (e[0] - e[2]) / (e[0] + e[2]).max(1e-6);
     let reading = if e[1] > 0.0 {
@@ -194,7 +309,7 @@ pub fn epl(ui: &mut Ui, e: [f32; 3], side: f32) {
     } else {
         String::new()
     };
-    let (painter, area) = panel(ui, vec2(side, side + 14.0), "Timing", &reading);
+    let (painter, area) = panel(ui, size, "Timing", &reading);
     let plot = Rect::from_min_max(area.min, area.max - vec2(0.0, 14.0));
     let x = |t: f32| plot.center().x + t / SPAN * plot.width() / 2.0;
     let y = |v: f32| plot.bottom() - v.clamp(0.0, 1.2) / 1.2 * plot.height();
@@ -307,11 +422,11 @@ pub fn strip(ui: &mut Ui, title: &str, reading: &str, v: &[f32], style: Strip, s
 /// CSK: the correlator bank over the last symbols, one row each (newest at the
 /// top), brightness the square root of the power against code number. The
 /// decided codes show as a bright trace.
-pub fn bank(ui: &mut Ui, rows: &[Vec<f32>], side: f32) {
+pub fn bank(ui: &mut Ui, rows: &[Vec<f32>], size: Vec2) {
     let reading = rows
         .last()
         .map_or(String::new(), |r| format!("{} codes", r.len()));
-    let (painter, area) = panel(ui, vec2(side, side + 14.0), "Walsh bank", &reading);
+    let (painter, area) = panel(ui, size, "Walsh bank", &reading);
     let n = rows.len();
     if n == 0 {
         return;
@@ -343,9 +458,9 @@ fn super_rows() -> usize {
 }
 
 /// CSK: the newest correlator row as bars, the decided code marked.
-pub fn bank_bars(ui: &mut Ui, row: Option<&Vec<f32>>, side: f32) {
+pub fn bank_bars(ui: &mut Ui, row: Option<&Vec<f32>>, size: Vec2) {
     let Some(row) = row else {
-        let _ = panel(ui, vec2(side, side + 14.0), "Last symbol", "");
+        let _ = panel(ui, size, "Last symbol", "");
         return;
     };
     let (best, _) = row.iter().enumerate().fold(
@@ -362,7 +477,7 @@ pub fn bank_bars(ui: &mut Ui, row: Option<&Vec<f32>>, side: f32) {
         "code {best} +{:.0} dB",
         10.0 * (1.0 / second.max(1e-6)).log10()
     );
-    let (painter, area) = panel(ui, vec2(side, side + 14.0), "Last symbol", &reading);
+    let (painter, area) = panel(ui, size, "Last symbol", &reading);
     let cw = area.width() / row.len() as f32;
     for (i, &v) in row.iter().enumerate() {
         let h = v.max(0.0).sqrt() * area.height();
@@ -389,18 +504,14 @@ pub fn rake(ui: &mut Ui, profile: &[f32], fingers: &[Finger], size: Vec2) {
         fingers.len(),
         if fingers.len() == 1 { "" } else { "s" }
     );
-    let (painter, area) = panel(
-        ui,
-        size,
-        "Multipath: delay profile & rake fingers",
-        &reading,
-    );
+    let (painter, area) = panel(ui, size, "Delay profile", &reading);
     let plot = Rect::from_min_max(area.min, area.max - vec2(0.0, 12.0));
     let lo = DelayProfile::LAG0 as f32;
     let hi = DelayProfile::lag(DelayProfile::LAGS - 1) as f32;
     let x = |lag: f32| plot.left() + (lag - lo) / (hi - lo) * plot.width();
-    // Chip ticks and the reference at 0.
-    for c in (lo.ceil() as i32..=hi.floor() as i32).step_by(2) {
+    // Chip ticks (every 2 chips, every 4 when narrow) and the reference at 0.
+    let every = if plot.width() > 300.0 { 2 } else { 4 };
+    for c in (lo.ceil() as i32..=hi.floor() as i32).filter(|c| c % every == 0) {
         let xx = x(c as f32);
         painter.line_segment(
             [pos2(xx, plot.bottom()), pos2(xx, plot.bottom() + 3.0)],

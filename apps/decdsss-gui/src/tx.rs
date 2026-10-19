@@ -966,7 +966,7 @@ impl TxPanel {
                                 "{}   {:.0} bit/s, needs ≈ {:.0} dB SNR",
                                 m.name(),
                                 m.info_bit_rate(self.profile),
-                                m.snr_offset_db(self.profile) + 4.0
+                                m.snr_offset_db(self.profile) + m.ebn0_needed_db(self.profile).0
                             ),
                         );
                     }
