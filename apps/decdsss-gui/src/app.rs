@@ -888,10 +888,15 @@ impl App {
 
     /// Received text, newest at the bottom, each line the time, who sent it, in which
     /// band, and the message.
-    fn messages_panel(&mut self, ui: &mut Ui, messages: &[crate::engine::Message]) {
+    fn messages_panel(
+        &mut self,
+        ui: &mut Ui,
+        messages: &[crate::engine::Message],
+        max_height: f32,
+    ) {
         ui.label(RichText::new("Messages").strong());
         egui::ScrollArea::vertical()
-            .max_height(110.0)
+            .max_height(max_height)
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for m in messages {
@@ -914,25 +919,70 @@ impl App {
             });
     }
 
-    fn files_and_log(&mut self, ui: &mut Ui, sh: &Shared) {
-        if !sh.files.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Received:").strong());
-                for f in &sh.files {
-                    if ui
-                        .link(format!(
-                            "{} ({} B, {})",
-                            f.file.name,
-                            f.file.data.len(),
-                            f.file.call
-                        ))
-                        .on_hover_text(f.path.display().to_string())
-                        .clicked()
-                    {
-                        let _ = open_path(&f.path);
-                    }
+    /// The received files as links that open them, in a row that wraps.
+    fn file_links(ui: &mut Ui, files: &[crate::engine::FileEntry]) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Files:").strong());
+            for f in files {
+                if ui
+                    .link(format!(
+                        "{} ({} B, {})",
+                        f.file.name,
+                        f.file.data.len(),
+                        f.file.call
+                    ))
+                    .on_hover_text(f.path.display().to_string())
+                    .clicked()
+                {
+                    let _ = open_path(&f.path);
                 }
-            });
+            }
+        });
+    }
+
+    /// What has been received (messages, files, pictures, speech), stacked in a
+    /// column: the place for it beside the transmit controls, where the window has
+    /// the room.
+    fn received_column(&mut self, ui: &mut Ui, sh: &Shared) {
+        ui.label(RichText::new("Received").strong().size(15.0));
+        if sh.messages.is_empty()
+            && sh.files.is_empty()
+            && sh.pictures.is_empty()
+            && sh.voices.is_empty()
+        {
+            ui.label(
+                RichText::new("Messages, files, pictures and speech that arrive show here.")
+                    .weak()
+                    .size(11.0),
+            );
+            return;
+        }
+        if !sh.messages.is_empty() {
+            self.messages_panel(ui, &sh.messages, 220.0);
+        }
+        if !sh.files.is_empty() {
+            Self::file_links(ui, &sh.files);
+        }
+        self.pictures.retain(|k, _| {
+            sh.pictures
+                .iter()
+                .any(|p| (p.call.clone(), p.session) == *k)
+        });
+        for p in sh.pictures.iter().rev() {
+            self.picture_card(ui, p);
+        }
+        for v in sh.voices.iter().rev() {
+            if crate::voice::voice_card(ui, v) {
+                self.play_speech(&v.speech);
+            }
+        }
+    }
+
+    /// The transfers under way, the search switch and the log; and the received
+    /// files unless they are shown elsewhere (`files_here`).
+    fn files_and_log(&mut self, ui: &mut Ui, sh: &Shared, files_here: bool) {
+        if files_here && !sh.files.is_empty() {
+            Self::file_links(ui, &sh.files);
         }
         for t in &sh.transfers {
             if !t.done && t.total > 0 {
@@ -1528,6 +1578,8 @@ impl eframe::App for App {
                         ui.label(RichText::new("Transmit").strong().size(15.0));
                         self.tx
                             .show(ui, &self.engine, &sh.tx, &devices_out, &devices_in, &listen);
+                        ui.separator();
+                        self.received_column(ui, &sh);
                     });
                 });
         }
@@ -1537,15 +1589,18 @@ impl eframe::App for App {
         // The side panels are laid out first, so they run the full height under the
         // bar and the files, log and pictures sit in the column beside them rather
         // than cutting the instruments off.
+        // With the transmit controls beside the instruments (RX+TX) what was received
+        // goes in the left column under them; otherwise it sits along the bottom.
+        let received_below = self.view != View::Both;
         egui::Panel::bottom("log")
             .resizable(false)
-            .show(ui, |ui| self.files_and_log(ui, &sh));
-        if !sh.messages.is_empty() {
+            .show(ui, |ui| self.files_and_log(ui, &sh, received_below));
+        if received_below && !sh.messages.is_empty() {
             egui::Panel::bottom("messages")
                 .resizable(false)
-                .show(ui, |ui| self.messages_panel(ui, &sh.messages));
+                .show(ui, |ui| self.messages_panel(ui, &sh.messages, 110.0));
         }
-        if !sh.pictures.is_empty() || !sh.voices.is_empty() {
+        if received_below && (!sh.pictures.is_empty() || !sh.voices.is_empty()) {
             egui::Panel::bottom("pictures")
                 .resizable(false)
                 .show(ui, |ui| self.pictures_panel(ui, &sh.pictures, &sh.voices));

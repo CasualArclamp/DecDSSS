@@ -410,7 +410,11 @@ fn update_picture(r: &mut Run, call: &str, session: u8, finished: Option<&Receiv
     };
     let key = (call.to_string(), session);
     let at = r.pictures.iter().position(|(k, ..)| *k == key);
-    if !complete && at.is_some_and(|i| r.pictures[i].1 == data.len()) {
+    // Nothing new to draw; and a picture that has arrived whole stays whole: blocks
+    // that come after it (the rest of a pass) would otherwise redraw it from the
+    // front that arrived without a gap, which is shorter when a data frame was lost
+    // and the file was rebuilt from coded ones.
+    if !complete && at.is_some_and(|i| r.pictures[i].1 == data.len() || r.pictures[i].2.complete) {
         return;
     }
     let Some(part) = decdsss_image::decode_partial(&data) else {
