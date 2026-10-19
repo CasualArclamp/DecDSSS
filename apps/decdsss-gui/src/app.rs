@@ -551,6 +551,30 @@ impl App {
     /// scrolls a row a frame).
     fn clock_and_fps(&mut self, ui: &mut Ui, sh: &Shared) {
         ui.label(format!("{:.0} s", sh.seconds));
+        if sh.dropped_share > 0.0 {
+            let pct = sh.dropped_share * 100.0;
+            let pct = if pct < 1.0 {
+                "<1".to_string()
+            } else {
+                format!("{pct:.0}")
+            };
+            ui.label(
+                RichText::new(format!("falling behind: {pct}% audio dropped"))
+                    .strong()
+                    .color(col::BAD),
+            )
+            .on_hover_text(format!(
+                "The receiver is not keeping up with the sound card, so audio is thrown                  away and nothing will decode. Untick bands you do not need, close other                  heavy programs, or set the input to a lower sample rate.
+                 Share over the last {} s; {:.1} s of audio dropped since Start{}.",
+                crate::engine::DROP_WINDOW.as_secs(),
+                sh.dropped_frames as f64 / sh.sample_rate.max(1.0),
+                if sh.xruns > 0 {
+                    format!(", and {} losses reported by the driver", sh.xruns)
+                } else {
+                    String::new()
+                }
+            ));
+        }
         self.fps += 0.1 * (self.measured_fps - self.fps);
         ui.label(RichText::new(format!("{:.0} fps", self.fps)).weak());
     }
@@ -1704,6 +1728,7 @@ impl eframe::App for App {
             voices,
             tx,
             monitor_error,
+            (dropped_share, dropped_frames, xruns, sample_rate),
         ) = {
             let g = self.engine.shared.lock().unwrap();
             (
@@ -1727,6 +1752,7 @@ impl eframe::App for App {
                 g.voices.clone(),
                 g.tx.clone(),
                 g.monitor_error.clone(),
+                (g.dropped_share, g.dropped_frames, g.xruns, g.sample_rate),
             )
         };
         let sh = Shared {
@@ -1744,6 +1770,10 @@ impl eframe::App for App {
             voices,
             tx,
             monitor_error,
+            dropped_share,
+            dropped_frames,
+            xruns,
+            sample_rate,
             ..Shared::default()
         };
 

@@ -237,6 +237,19 @@ down by the profile's centre, resamples to four samples a chip (a polyphase
 sinc, 70 dB down at the mixing image) and applies the root-raised-cosine matched
 filter, normalised so a chip comes out at its own amplitude.
 
+A fast sound card is first brought down for all the bands at once: a whole-factor
+decimator (Kaiser sinc, passing the highest band edge plus the 100 Hz offset margin,
+70 dB down from the new Nyquist frequency) leaves at least three times that edge, so
+44.1 and 48 kHz go ÷4 to 11 025 and 12 000 Hz with every band on (`rx::shared_decimator`).
+The resampler's length grows with its input rate, so this is what made 44.1 kHz cost
+what 12 kHz does. The bands then run side by side on rayon's thread pool. Measured with
+`cargo run --release -p decdsss-phy --example realtime` (five bands, 20 ms pushes, the
+11:00:19Z ironstonerange websdr recording at 44.1 kHz, 16-thread desktop): 18× real
+time before, 51× after; each change alone gave about 2× (decimator) and 1.5× (pool).
+At threshold the decimated chain decodes the same frames as the plain 48 kHz one to
+within 1 % (3 kHz profile, 3 dB Eb/N0, 960 frames, 40 ppm clock), and clock offsets
+of ±100 and ±300 ppm change nothing at 4 dB.
+
 1. **Search** (never stops, whatever else is open) — FFT circular correlation of
    the preamble's sequence A across frequency (half-bin steps, ±100 Hz, the
    half-bin ones from a second FFT of the window times e^{-jπn/N}), each window
@@ -653,7 +666,7 @@ of the signal) and the rest of Hamlib's models other than through `rigctld`.
 | Crate | Role |
 |---|---|
 | `decdsss-core` | Profiles, modes, rates — the fixed numbers. |
-| `decdsss-dsp` | RRC, pulse shaper, resampler, matched filter, interpolation, Hilbert, a seeded RNG. |
+| `decdsss-dsp` | RRC, pulse shaper, resampler, decimator, matched filter, interpolation, Hilbert, a seeded RNG. |
 | `decdsss-fec` | QC-LDPC (design, encoder, layered min-sum), the interleaver, CRCs. |
 | `decdsss-phy` | Codes, framing, the transmitter, the receiver (search, preamble, header, payload, refinement), the end-to-end simulator. |
 | `decdsss-chan` | Channel simulator: AWGN, carrier offset and drift, clock error, Watterson fading with the CCIR presets. |

@@ -14,4 +14,5 @@ decdsss-core = { path = "../decdsss-core" }
 decdsss-dsp = { path = "../decdsss-dsp" }
 decdsss-fec = { path = "../decdsss-fec" }
 num-complex.workspace = true
+rayon.workspace = true
 rustfft.workspace = true

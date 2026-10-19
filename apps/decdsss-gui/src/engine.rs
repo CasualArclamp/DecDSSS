@@ -189,6 +189,13 @@ pub struct Shared {
     pub tx: TxState,
     /// Why the RF monitor stopped, if it did.
     pub monitor_error: Option<String>,
+    /// Audio the sound card delivered that the receiver had no room for, as a
+    /// share of what it delivered over the last [`DROP_WINDOW`], 0–1. Above zero
+    /// the receiver is falling behind and nothing will decode.
+    pub dropped_share: f64,
+    /// Frames dropped since Start, and losses the driver itself reported.
+    pub dropped_frames: u64,
+    pub xruns: u64,
     /// Waterfall rows made and not yet taken by the display: the noise floor at
     /// the time, and dB per bin.
     pub new_rows: Vec<(f32, Vec<f32>)>,
@@ -253,6 +260,7 @@ enum Reader {
 
 struct Run {
     reader: Reader,
+    drops: DropWatch,
     rate: f64,
     mr: MultiReceiver,
     spectrum: Spectrum,
@@ -270,6 +278,56 @@ struct Run {
     voices: Vec<((String, u8), usize, Arc<VoiceView>)>,
     /// The codec of each live transmission heard (from its header's type).
     live_codec: BTreeMap<(String, u8), Codec>,
+}
+
+/// How far back the dropped share in the top bar looks.
+pub const DROP_WINDOW: Duration = Duration::from_secs(10);
+
+/// Watches the capture stream's counters for audio thrown away because the
+/// receiver fell behind (the capture ring was full when the driver delivered).
+#[derive(Default)]
+struct DropWatch {
+    /// (when, frames captured, frames dropped), about ten a second, oldest first.
+    marks: VecDeque<(Instant, u64, u64)>,
+    share: f64,
+    dropped: u64,
+    xruns: u64,
+}
+
+impl DropWatch {
+    /// Takes the stream's counters; returns the log lines for a first loss.
+    fn update(&mut self, captured: u64, dropped: u64, xruns: u64) -> Vec<String> {
+        let now = Instant::now();
+        // `is_none_or` is true for an empty queue, or when the closure is.
+        if self
+            .marks
+            .back()
+            .is_none_or(|m| now - m.0 >= Duration::from_millis(100))
+        {
+            self.marks.push_back((now, captured, dropped));
+            while self.marks.len() > 2 && now - self.marks[0].0 > DROP_WINDOW {
+                self.marks.pop_front();
+            }
+        }
+        let (_, c0, d0) = self.marks[0];
+        self.share = if captured > c0 {
+            (dropped - d0) as f64 / (captured - c0) as f64
+        } else {
+            0.0
+        };
+        let mut lines = Vec::new();
+        if dropped > 0 && self.dropped == 0 {
+            lines.push(
+                "Audio dropped: the receiver is not keeping up with the sound card, so                  nothing will decode while this lasts. Untick bands you do not need,                  close other heavy programs, or set the input to a lower sample rate."
+                    .to_string(),
+            );
+        }
+        if xruns > 0 && self.xruns == 0 {
+            lines.push("The sound card driver reported lost input audio.".to_string());
+        }
+        (self.dropped, self.xruns) = (dropped, xruns);
+        lines
+    }
 }
 
 /// Speech cards kept on the display.
@@ -599,11 +657,15 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
         g.transfers.clear();
         g.pictures.clear();
         g.voices.clear();
+        g.dropped_share = 0.0;
+        g.dropped_frames = 0;
+        g.xruns = 0;
         g.version += 1;
     }
     log(shared, format!("Listening on {what}, {} Hz", rate as u32));
     Ok(Run {
         reader,
+        drops: DropWatch::default(),
         rate,
         mr: MultiReceiver::with_bands(&bands, rate),
         spectrum: Spectrum::new(rate),
@@ -633,6 +695,13 @@ fn step(
             if input.is_dead() {
                 log(shared, "The input device stopped.".into());
                 return false;
+            }
+            let st = input.stats();
+            for line in r
+                .drops
+                .update(st.frames_captured, st.dropped_frames, st.xruns)
+            {
+                log(shared, line);
             }
             let frames = input.available_frames().min(8192);
             if frames == 0 {
@@ -1000,6 +1069,9 @@ fn publish(shared: &Arc<Mutex<Shared>>, r: &mut Run, force: bool) {
     g.pictures = pictures;
     g.voices = voices;
     g.seconds = r.samples as f64 / r.rate;
+    g.dropped_share = r.drops.share;
+    g.dropped_frames = r.drops.dropped;
+    g.xruns = r.drops.xruns;
     g.version += 1;
 }
 
@@ -1092,6 +1164,23 @@ fn transmit(
 mod tests {
     use super::*;
     use decdsss_rig::testing::FakeRig;
+
+    #[test]
+    fn dropped_audio_is_a_share_of_what_was_captured_and_logged_once() {
+        let mut w = DropWatch::default();
+        assert!(w.update(4410, 0, 0).is_empty());
+        assert_eq!(w.share, 0.0);
+        // A fifth of the next 44 100 frames thrown away.
+        std::thread::sleep(Duration::from_millis(110));
+        let lines = w.update(48_510, 8820, 0);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!((w.share - 0.2).abs() < 1e-9, "{}", w.share);
+        // Still dropping: no second log line; a driver loss gets its own.
+        let lines = w.update(52_920, 9702, 1);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("driver"));
+        assert_eq!((w.dropped, w.xruns), (9702, 1));
+    }
 
     /// Plays two seconds of a tone through `transmit` into VB-Audio cable A
     /// (silent) with a stand-in rig: the rig is keyed before the first sample

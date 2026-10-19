@@ -21,9 +21,11 @@ pub mod testrig;
 use crate::framing::Header;
 use acq::{Acquirer, Detection};
 use decdsss_core::{Band, Profile};
-use frontend::{Buf, Frontend, SPS};
+use decdsss_dsp::decimate::Decimator;
+use frontend::{Buf, Frontend, MAX_OFFSET_HZ, SPS};
 use header::{HeaderOutcome, HeaderResult, HeaderView, HeaderWatch, demod_header};
 use payload::{BlockResult, PayloadRx};
+use rayon::prelude::*;
 use preamble::{PreambleLock, PreambleTracker, State};
 use std::collections::VecDeque;
 
@@ -518,6 +520,10 @@ const LEAK_MARGIN_DB: f64 = 6.0;
 /// are dropped.
 pub struct MultiReceiver {
     rx: Vec<Receiver>,
+    /// Brings a fast sound card down to about three times the highest band edge
+    /// for all the bands at once; `None` when the card is already slow enough.
+    decimator: Option<Decimator>,
+    /// The sound card's rate (the receivers run at `rate / factor`).
     rate: f64,
     samples: u64,
     heard: Vec<Heard>,
@@ -534,11 +540,11 @@ impl MultiReceiver {
 
     /// One receiver per band: for the 500 Hz profile, several slots side by side.
     pub fn with_bands(bands: &[Band], sample_rate: f64) -> MultiReceiver {
+        let decimator = shared_decimator(bands, sample_rate);
+        let band_rate = sample_rate / decimator.as_ref().map_or(1, |d| d.factor()) as f64;
         MultiReceiver {
-            rx: bands
-                .iter()
-                .map(|&b| Receiver::at(b, sample_rate))
-                .collect(),
+            rx: bands.iter().map(|&b| Receiver::at(b, band_rate)).collect(),
+            decimator,
             rate: sample_rate,
             samples: 0,
             heard: Vec::new(),
@@ -560,9 +566,26 @@ impl MultiReceiver {
 
     pub fn push(&mut self, audio: &[f32]) -> Vec<Tagged> {
         self.samples += audio.len() as u64;
+        // `decimated` lives out here so the slice borrowed from it below stays
+        // valid for the rest of the function; without a decimator `audio` is
+        // passed through untouched.
+        let mut decimated = Vec::new();
+        let audio = match &mut self.decimator {
+            Some(d) => {
+                decimated.reserve(audio.len() / d.factor() + 1);
+                d.process(audio, &mut decimated);
+                &decimated[..]
+            }
+            None => audio,
+        };
+        // The bands are independent, so they run side by side on rayon's thread
+        // pool (one worker a core, started once; a fresh OS thread per band per
+        // push cost more than it saved). `par_iter_mut` hands each worker its own
+        // `&mut Receiver`, which the borrow checker allows because no two get the
+        // same one; `collect` keeps the bands' order.
+        let batches: Vec<Vec<Event>> = self.rx.par_iter_mut().map(|r| r.push(audio)).collect();
         let mut out = Vec::new();
-        for i in 0..self.rx.len() {
-            let events = self.rx[i].push(audio);
+        for (i, events) in batches.into_iter().enumerate() {
             let (profile, band) = (self.rx[i].profile, self.rx[i].band);
             for event in events {
                 // The channel an event belongs to, and whether it opens one.
@@ -626,6 +649,24 @@ impl MultiReceiver {
         });
         false
     }
+}
+
+/// The decimator in front of all the bands: a whole factor that leaves at least
+/// three times the highest band edge (carrier offset included), so the low-pass
+/// can pass that edge and stop at the new Nyquist frequency with room between.
+/// At 44.1 or 48 kHz with every band on that is ÷4, to 11 025 or 12 000 Hz; at
+/// 8, 12 or 16 kHz there is nothing to gain and no decimator.
+fn shared_decimator(bands: &[Band], rate: f64) -> Option<Decimator> {
+    let top = bands
+        .iter()
+        .map(|b| b.edges_hz().1 + MAX_OFFSET_HZ)
+        .fold(0.0, f64::max);
+    if top <= 0.0 {
+        return None;
+    }
+    let factor = (rate / (3.0 * top)).floor() as usize;
+    // `bool::then` builds the `Some` only when the condition holds.
+    (factor >= 2).then(|| Decimator::new(rate, factor, top, rate / factor as f64 / 2.0))
 }
 
 /// Samples a chip after the front end, re-exported for callers that talk

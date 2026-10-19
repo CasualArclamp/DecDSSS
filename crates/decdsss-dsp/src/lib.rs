@@ -2,6 +2,7 @@
 //! DSP building blocks: RRC pulses, the transmitter's shaper, resampling,
 //! the matched filter, interpolation and FFT helpers.
 
+pub mod decimate;
 pub mod fir;
 pub mod hilbert;
 pub mod interp;
