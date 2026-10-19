@@ -15,7 +15,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: decdsss-gui [--demo | --wav FILE] [--speed X] [--profile 500,2k4,3k] \
-[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--record-for SECS [--mic NAME]] | --write-demo OUT.wav";
+[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--record-for SECS [--mic NAME]] [--view rx|tx|both] | --write-demo OUT.wav";
 
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
@@ -96,6 +96,7 @@ fn main() -> eframe::Result {
             "--tx-file" => auto.tx_file = Some(PathBuf::from(value("--tx-file"))),
             "--record-for" => auto.record_for = value("--record-for").parse().ok(),
             "--mic" => auto.mic = Some(value("--mic")),
+            "--view" => auto.view = Some(value("--view")),
             "--window-size" => {
                 let v = value("--window-size");
                 if let Some((w, h)) = v.split_once('x')

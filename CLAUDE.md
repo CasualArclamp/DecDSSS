@@ -15,7 +15,7 @@ cargo run -p decdsss-cli -- modes       # the mode ladder and its rates
 cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --picture --air 120 -o pic.wav   # a picture sized to the air time
 cargo run --release -p decdsss-cli -- tx speech.wav --call VK2ABC --voice -o voice.wav   # Codec2 speech
 cargo run --release -p decdsss-cli -- sweep --mode ds8-1/2 --ebn0 2 6 1   # frame loss vs Eb/N0, whole receiver
-powershell -ExecutionPolicy Bypass -File scriptsuild-portable.ps1   # portable exes into exe\ (git-ignored)
+powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1   # portable exes into exe\ (git-ignored)
 cargo run --release -p decdsss-gui -- --demo   # the window; --screenshot OUT.png --after 20 for pictures
 ```
 
@@ -24,6 +24,9 @@ cargo run --release -p decdsss-gui -- --demo   # the window; --screenshot OUT.pn
 - **Licence:** GPL-3.0-or-later. Code copied from DecSAT, voicemodem or COFDMtv
   (same author) gets a comment naming where it came from; anything borrowed
   from third-party code credits its source at the function or module.
+- **Rebuild the exes after every change** (Rory runs them from `exe\`): `powershell
+  -ExecutionPolicy Bypass -File scripts\build-portable.ps1`, then say so. Build from a
+  tree without half-done experiments; `exe\` is git-ignored and is not a release.
 - **Never commit** recordings (`*.wav`, `*.cf32`), reference clones
   (`reference/`) or built exes.
 - **Commit identity:** `Arclamp <45412977+CasualArclamp@users.noreply.github.com>`

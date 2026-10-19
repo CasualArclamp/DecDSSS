@@ -91,7 +91,6 @@ fn prepare(key: &PicKey, cached: Option<Arc<Source>>) -> (Option<Arc<Source>>, P
 }
 
 pub struct TxPanel {
-    pub open: bool,
     file: Option<PathBuf>,
     call: String,
     profile: Profile,
@@ -127,7 +126,6 @@ pub struct TxPanel {
 impl Default for TxPanel {
     fn default() -> Self {
         TxPanel {
-            open: false,
             file: None,
             call: String::new(),
             profile: Profile::W2400,
@@ -186,10 +184,9 @@ impl TxPanel {
         }
     }
 
-    /// Opens the window in voice mode and starts recording (for `--record-for`).
+    /// Switches to voice and starts recording (for `--record-for`).
     pub fn auto_record(&mut self, devices_in: &[String], hint: &str) {
         self.voice = true;
-        self.open = true;
         self.vp.record_on(devices_in, hint);
     }
 
@@ -198,7 +195,7 @@ impl TxPanel {
         self.vp.finish();
     }
 
-    /// Opens the window with a file chosen, as if from the dialog.
+    /// Chooses a file, as if from the dialog.
     pub fn preload(&mut self, path: PathBuf) {
         if path
             .extension()
@@ -214,7 +211,6 @@ impl TxPanel {
             self.picture = is_picture(&path);
             self.file = Some(path);
         }
-        self.open = true;
     }
 
     /// The output device chosen and the rate it runs at.
@@ -590,23 +586,24 @@ impl TxPanel {
         })
     }
 
+    /// What runs whether or not the transmit controls are on show: the picture
+    /// being prepared and a recording being taken. Call every frame.
+    pub fn background(&mut self, ctx: &Context) {
+        self.drive_picture(ctx);
+        self.vp.tick(ctx);
+    }
+
+    /// The transmit controls, drawn into `ui`.
     pub fn show(
         &mut self,
-        ctx: &Context,
+        ui: &mut egui::Ui,
         engine: &Engine,
         state: &TxState,
         devices_out: &[(String, u32)],
         devices_in: &[String],
         _out_dir: &Path,
     ) {
-        self.drive_picture(ctx);
-        self.vp.tick(ctx);
-        let mut open = self.open;
-        egui::Window::new("Transmit")
-            .open(&mut open)
-            .default_width(380.0)
-            .show(ctx, |ui| {
-                ui.label(
+        ui.label(
                     RichText::new(
                         "Plays audio to a sound card (or saves a WAV). You key the radio. \
                          Spread spectrum is restricted on HF in some countries: check your licence.",
@@ -614,211 +611,230 @@ impl TxPanel {
                     .weak()
                     .size(11.0),
                 );
-                egui::Grid::new("txgrid").num_columns(2).show(ui, |ui| {
-                    ui.label(if self.voice { "Speech" } else { "File" });
-                    ui.horizontal(|ui| {
-                        if self.voice {
-                            ui.label(RichText::new("record, or choose a WAV, below").weak());
-                        } else if ui.button("Choose…").clicked()
-                            && let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Pictures", &PICTURE_EXTENSIONS)
-                                .add_filter("All files", &["*"])
-                                .pick_file()
-                        {
-                            // A picture is sent as one unless the box is cleared.
-                            self.picture = is_picture(&p);
-                            self.file = Some(p);
-                        }
-                        if !self.voice {
-                            ui.label(
-                                self.file
-                                    .as_ref()
-                                    .and_then(|p| p.file_name())
-                                    .map_or("none".into(), |n| n.to_string_lossy().into_owned()),
-                            );
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Send as");
-                    ui.horizontal(|ui| {
-                        let mut kind = if self.voice {
-                            2
-                        } else {
-                            usize::from(self.picture)
-                        };
-                        ui.radio_value(&mut kind, 0, "file");
-                        ui.radio_value(&mut kind, 1, "picture")
-                            .on_hover_text("Scaled and compressed to the air time");
-                        ui.radio_value(&mut kind, 2, "voice")
-                            .on_hover_text("Speech, as Codec2");
-                        let was_voice = self.voice;
-                        self.picture = kind == 1;
-                        self.voice = kind == 2;
-                        if self.voice
-                            && !was_voice
-                            && let Some(vm) = Mode::voice(self.profile)
-                        {
-                            self.mode = vm.name();
-                        }
-                    });
-                    ui.end_row();
-                    if self.picture {
-                        ui.label("Air time");
-                        ui.add(
-                            egui::Slider::new(&mut self.air, 20.0..=900.0)
-                                .suffix(" s a pass")
-                                .logarithmic(true),
-                        );
-                        ui.end_row();
-                        ui.label("Quality at least");
-                        ui.add(egui::Slider::new(&mut self.min_quality, 5..=90));
-                        ui.end_row();
-                    }
-                    ui.label("Callsign");
-                    ui.text_edit_singleline(&mut self.call);
-                    ui.end_row();
-                    ui.label("VOX");
-                    ui.checkbox(&mut self.vox, "a tone ahead of the signal, to key the radio")
-                        .on_hover_text("0.4 s of 1 kHz and a pause, so the radio is transmitting before the preamble");
-                    ui.end_row();
-                    ui.label("Bandwidth");
-                    ui.horizontal(|ui| {
-                        for p in Profile::ALL {
-                            ui.selectable_value(&mut self.profile, p, p.label());
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Mode");
-                    egui::ComboBox::from_id_salt("txmode")
-                        .selected_text(&self.mode)
-                        .show_ui(ui, |ui| {
-                            for m in Mode::all() {
-                                ui.selectable_value(
-                                    &mut self.mode,
-                                    m.name(),
-                                    format!("{}   {:.0} bit/s, needs ≈ {:.0} dB SNR", m.name(), m.info_bit_rate(self.profile), m.snr_offset_db(self.profile) + 4.0),
-                                );
-                            }
-                        });
-                    ui.end_row();
-                    ui.label("Depth");
-                    ui.horizontal(|ui| {
-                        for d in DEPTHS {
-                            ui.selectable_value(&mut self.depth, d, d.to_string());
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Preamble every");
-                    ui.add(egui::Slider::new(&mut self.resync, 15.0..=300.0).suffix(" s").logarithmic(true));
-                    ui.end_row();
-                    // Speech has no coded frames or passes: it goes out once, as it is.
-                    if !self.voice {
-                        ui.label("Coded frames");
-                        ui.add(egui::Slider::new(&mut self.parity, 0.0..=100.0).suffix(" % extra"));
-                        ui.end_row();
-                        ui.label("Passes");
-                        ui.add(egui::Slider::new(&mut self.repeat, 1..=5));
-                        ui.end_row();
-                    }
-                    ui.label("Level");
-                    ui.add(egui::Slider::new(&mut self.level, 0.02..=0.3));
-                    ui.end_row();
-                    ui.label("Output");
-                    egui::ComboBox::from_id_salt("txdev")
-                        .selected_text(if self.device == 0 {
-                            "System default".to_string()
-                        } else {
-                            devices_out
-                                .get(self.device - 1)
-                                .map(|d| d.0.clone())
-                                .unwrap_or_default()
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.device, 0, "System default");
-                            for (i, d) in devices_out.iter().enumerate() {
-                                ui.selectable_value(&mut self.device, i + 1, format!("{} ({} Hz)", d.0, d.1));
-                            }
-                        });
-                    ui.end_row();
-                });
-                if let Some(layout) = Mode::from_name(&self.mode).map(|m| Layout::new(self.profile, m, self.depth)) {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} data bytes a frame, {:.1} s a block",
-                            layout.frame_bytes(),
-                            layout.seconds()
-                        ))
-                        .weak()
-                        .size(11.0),
-                    );
-                }
-                if self.picture {
-                    self.picture_status(ui);
-                }
+        egui::Grid::new("txgrid").num_columns(2).show(ui, |ui| {
+            ui.label(if self.voice { "Speech" } else { "File" });
+            ui.horizontal(|ui| {
                 if self.voice {
-                    self.voice_section(ui, devices_in, engine, devices_out);
+                    ui.label(RichText::new("record, or choose a WAV, below").weak());
+                } else if ui.button("Choose…").clicked()
+                    && let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Pictures", &PICTURE_EXTENSIONS)
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                {
+                    // A picture is sent as one unless the box is cleared.
+                    self.picture = is_picture(&p);
+                    self.file = Some(p);
                 }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!state.active, |ui| {
-                        if ui.button("▶ Play to the sound card").clicked() {
-                            let rate = self.device_rate(devices_out);
-                            match self.build(rate) {
-                                Ok(plan) => {
-                                    self.note = format!(
-                                        "{} frames in {} segment(s), {:.0} s of audio",
-                                        plan.frames, plan.segments, plan.seconds
-                                    );
-                                    engine.send(Cmd::Transmit {
-                                        audio: plan.audio,
-                                        rate,
-                                        device: if self.device == 0 {
-                                            None
-                                        } else {
-                                            devices_out.get(self.device - 1).map(|d| d.0.clone())
-                                        },
-                                    });
-                                }
-                                Err(e) => self.note = e,
-                            }
-                        }
-                        if ui.button("Save WAV…").clicked() {
-                            match self.build(self.rate) {
-                                Ok(plan) => {
-                                    if let Some(p) = rfd::FileDialog::new()
-                                        .add_filter("WAV audio", &["wav"])
-                                        .set_file_name("transmission.wav")
-                                        .save_file()
-                                    {
-                                        self.note = match wav::write(&p, &plan.audio, self.rate) {
-                                            Ok(_) => format!(
-                                                "saved {} ({} frames, {:.0} s)",
-                                                p.display(),
-                                                plan.frames,
-                                                plan.seconds
-                                            ),
-                                            Err(e) => e.to_string(),
-                                        };
-                                    }
-                                }
-                                Err(e) => self.note = e,
-                            }
-                        }
-                    });
-                });
-                if state.active {
-                    ui.add(
-                        egui::ProgressBar::new((state.played / state.seconds.max(1.0)) as f32)
-                            .text(format!("sending {:.0} / {:.0} s", state.played, state.seconds)),
+                if !self.voice {
+                    ui.label(
+                        self.file
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map_or("none".into(), |n| n.to_string_lossy().into_owned()),
                     );
-                }
-                if let Some(e) = &state.error {
-                    ui.colored_label(crate::scope::col::BAD, e);
-                }
-                if !self.note.is_empty() {
-                    ui.label(RichText::new(&self.note).size(11.0));
                 }
             });
-        self.open = open;
+            ui.end_row();
+            ui.label("Send as");
+            ui.horizontal(|ui| {
+                let mut kind = if self.voice {
+                    2
+                } else {
+                    usize::from(self.picture)
+                };
+                ui.radio_value(&mut kind, 0, "file");
+                ui.radio_value(&mut kind, 1, "picture")
+                    .on_hover_text("Scaled and compressed to the air time");
+                ui.radio_value(&mut kind, 2, "voice")
+                    .on_hover_text("Speech, as Codec2");
+                let was_voice = self.voice;
+                self.picture = kind == 1;
+                self.voice = kind == 2;
+                if self.voice
+                    && !was_voice
+                    && let Some(vm) = Mode::voice(self.profile)
+                {
+                    self.mode = vm.name();
+                }
+            });
+            ui.end_row();
+            if self.picture {
+                ui.label("Air time");
+                ui.add(
+                    egui::Slider::new(&mut self.air, 20.0..=900.0)
+                        .suffix(" s a pass")
+                        .logarithmic(true),
+                );
+                ui.end_row();
+                ui.label("Quality at least");
+                ui.add(egui::Slider::new(&mut self.min_quality, 5..=90));
+                ui.end_row();
+            }
+            ui.label("Callsign");
+            ui.text_edit_singleline(&mut self.call);
+            ui.end_row();
+            ui.label("VOX");
+            ui.checkbox(
+                &mut self.vox,
+                "a tone ahead of the signal, to key the radio",
+            )
+            .on_hover_text(
+                "0.4 s of 1 kHz and a pause, so the radio is transmitting before the preamble",
+            );
+            ui.end_row();
+            ui.label("Bandwidth");
+            ui.horizontal(|ui| {
+                for p in Profile::ALL {
+                    ui.selectable_value(&mut self.profile, p, p.label());
+                }
+            });
+            ui.end_row();
+            ui.label("Mode");
+            egui::ComboBox::from_id_salt("txmode")
+                .selected_text(&self.mode)
+                .show_ui(ui, |ui| {
+                    for m in Mode::all() {
+                        ui.selectable_value(
+                            &mut self.mode,
+                            m.name(),
+                            format!(
+                                "{}   {:.0} bit/s, needs ≈ {:.0} dB SNR",
+                                m.name(),
+                                m.info_bit_rate(self.profile),
+                                m.snr_offset_db(self.profile) + 4.0
+                            ),
+                        );
+                    }
+                });
+            ui.end_row();
+            ui.label("Depth");
+            ui.horizontal(|ui| {
+                for d in DEPTHS {
+                    ui.selectable_value(&mut self.depth, d, d.to_string());
+                }
+            });
+            ui.end_row();
+            ui.label("Preamble every");
+            ui.add(
+                egui::Slider::new(&mut self.resync, 15.0..=300.0)
+                    .suffix(" s")
+                    .logarithmic(true),
+            );
+            ui.end_row();
+            // Speech has no coded frames or passes: it goes out once, as it is.
+            if !self.voice {
+                ui.label("Coded frames");
+                ui.add(egui::Slider::new(&mut self.parity, 0.0..=100.0).suffix(" % extra"));
+                ui.end_row();
+                ui.label("Passes");
+                ui.add(egui::Slider::new(&mut self.repeat, 1..=5));
+                ui.end_row();
+            }
+            ui.label("Level");
+            ui.add(egui::Slider::new(&mut self.level, 0.02..=0.3));
+            ui.end_row();
+            ui.label("Output");
+            egui::ComboBox::from_id_salt("txdev")
+                .selected_text(if self.device == 0 {
+                    "System default".to_string()
+                } else {
+                    devices_out
+                        .get(self.device - 1)
+                        .map(|d| d.0.clone())
+                        .unwrap_or_default()
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.device, 0, "System default");
+                    for (i, d) in devices_out.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.device,
+                            i + 1,
+                            format!("{} ({} Hz)", d.0, d.1),
+                        );
+                    }
+                });
+            ui.end_row();
+        });
+        if let Some(layout) =
+            Mode::from_name(&self.mode).map(|m| Layout::new(self.profile, m, self.depth))
+        {
+            ui.label(
+                RichText::new(format!(
+                    "{} data bytes a frame, {:.1} s a block",
+                    layout.frame_bytes(),
+                    layout.seconds()
+                ))
+                .weak()
+                .size(11.0),
+            );
+        }
+        if self.picture {
+            self.picture_status(ui);
+        }
+        if self.voice {
+            self.voice_section(ui, devices_in, engine, devices_out);
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!state.active, |ui| {
+                if ui.button("▶ Play to the sound card").clicked() {
+                    let rate = self.device_rate(devices_out);
+                    match self.build(rate) {
+                        Ok(plan) => {
+                            self.note = format!(
+                                "{} frames in {} segment(s), {:.0} s of audio",
+                                plan.frames, plan.segments, plan.seconds
+                            );
+                            engine.send(Cmd::Transmit {
+                                audio: plan.audio,
+                                rate,
+                                device: if self.device == 0 {
+                                    None
+                                } else {
+                                    devices_out.get(self.device - 1).map(|d| d.0.clone())
+                                },
+                            });
+                        }
+                        Err(e) => self.note = e,
+                    }
+                }
+                if ui.button("Save WAV…").clicked() {
+                    match self.build(self.rate) {
+                        Ok(plan) => {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .add_filter("WAV audio", &["wav"])
+                                .set_file_name("transmission.wav")
+                                .save_file()
+                            {
+                                self.note = match wav::write(&p, &plan.audio, self.rate) {
+                                    Ok(_) => format!(
+                                        "saved {} ({} frames, {:.0} s)",
+                                        p.display(),
+                                        plan.frames,
+                                        plan.seconds
+                                    ),
+                                    Err(e) => e.to_string(),
+                                };
+                            }
+                        }
+                        Err(e) => self.note = e,
+                    }
+                }
+            });
+        });
+        if state.active {
+            ui.add(
+                egui::ProgressBar::new((state.played / state.seconds.max(1.0)) as f32).text(
+                    format!("sending {:.0} / {:.0} s", state.played, state.seconds),
+                ),
+            );
+        }
+        if let Some(e) = &state.error {
+            ui.colored_label(crate::scope::col::BAD, e);
+        }
+        if !self.note.is_empty() {
+            ui.label(RichText::new(&self.note).size(11.0));
+        }
     }
 }

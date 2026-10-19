@@ -25,6 +25,34 @@ pub enum SourceKind {
     Demo,
 }
 
+/// What the window shows: the receiver, the transmitter, or both side by side
+/// (the transmit controls on the left, as in FreeDV).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Rx,
+    Tx,
+    Both,
+}
+
+impl View {
+    fn name(self) -> &'static str {
+        match self {
+            View::Rx => "rx",
+            View::Tx => "tx",
+            View::Both => "both",
+        }
+    }
+
+    fn from_name(s: &str) -> Option<View> {
+        match s {
+            "rx" => Some(View::Rx),
+            "tx" => Some(View::Tx),
+            "both" => Some(View::Both),
+            _ => None,
+        }
+    }
+}
+
 /// Unattended runs for documentation and smoke tests.
 #[derive(Default, Clone)]
 pub struct Automation {
@@ -37,6 +65,8 @@ pub struct Automation {
     /// input named `mic` (part of its name), starting at launch.
     pub record_for: Option<f64>,
     pub mic: Option<String>,
+    /// Start on this view: rx, tx or both.
+    pub view: Option<String>,
     pub requested_at: Option<Instant>,
 }
 
@@ -60,6 +90,7 @@ pub struct App {
     waterfall_version: u64,
     heat: [HeatTexture; 3],
     tx: TxPanel,
+    view: View,
     /// `--record-for` has started its recording.
     recording_started: bool,
     /// The last view of each station, kept after its segment ends so the card
@@ -103,8 +134,17 @@ impl App {
             Prefs::load()
         };
         let mut tx = TxPanel::default();
-        tx.open = auto.open_tx;
         tx.restore(&prefs);
+        let mut view = prefs
+            .get("view")
+            .and_then(View::from_name)
+            .unwrap_or(View::Rx);
+        if auto.open_tx || auto.tx_file.is_some() || auto.record_for.is_some() {
+            view = View::Tx;
+        }
+        if let Some(v) = auto.view.as_deref().and_then(View::from_name) {
+            view = v;
+        }
         if let Some(p) = auto.tx_file.clone() {
             tx.preload(p);
         }
@@ -137,6 +177,7 @@ impl App {
             waterfall_version: u64::MAX,
             heat: Default::default(),
             tx,
+            view,
             recording_started: false,
             stations: Default::default(),
             pictures: Default::default(),
@@ -184,6 +225,15 @@ impl App {
     fn top_bar(&mut self, ui: &mut Ui, sh: &Shared) {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("DecDSSS").strong().size(16.0));
+            // Tabs: the receiver, the transmitter, or both on one page.
+            let before = self.view;
+            for (v, label) in [(View::Rx, "RX"), (View::Tx, "TX"), (View::Both, "RX + TX")] {
+                ui.selectable_value(&mut self.view, v, label);
+            }
+            if self.view != before && self.auto.screenshot.is_none() {
+                self.prefs.set("view", self.view.name());
+                self.prefs.save();
+            }
             ui.separator();
             ui.add_enabled_ui(!sh.running, |ui| {
                 egui::ComboBox::from_id_salt("source")
@@ -720,6 +770,29 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
+
+    /// The right-hand panel: every station being received, with its instruments.
+    fn stations_panel(&mut self, ui: &mut Ui, sh: &Shared) {
+        egui::Panel::right("stations")
+            .resizable(true)
+            .default_size(560.0)
+            .min_size(380.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if sh.snapshots.is_empty() {
+                        ui.label(RichText::new("Nothing is being received.").weak());
+                    }
+                    let snaps = sh.snapshots.clone();
+                    for (i, s) in snaps.iter().enumerate() {
+                        let idx = Profile::ALL
+                            .iter()
+                            .position(|p| *p == s.profile)
+                            .unwrap_or(i);
+                        self.profile_section(ui, s, idx, &sh.transfers);
+                    }
+                });
+            });
+    }
 }
 
 fn open_path(p: &std::path::Path) -> std::io::Result<()> {
@@ -853,6 +926,7 @@ fn channel_card(ui: &mut Ui, c: &ChannelView, tr: Option<&Transfer>, w: f32, is_
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tx.background(ctx);
         self.automate(ctx);
         ctx.request_repaint_after(Duration::from_millis(40));
     }
@@ -912,6 +986,33 @@ impl eframe::App for App {
         };
 
         egui::Panel::top("bar").show(ui, |ui| self.top_bar(ui, &sh));
+        let devices_out = self.devices_out.clone();
+        let devices_in = self.devices_in.clone();
+        if self.view == View::Both {
+            egui::Panel::left("transmit")
+                .resizable(true)
+                .default_size(400.0)
+                .min_size(330.0)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.label(RichText::new("Transmit").strong().size(15.0));
+                        self.tx.show(
+                            ui,
+                            &self.engine,
+                            &sh.tx,
+                            &devices_out,
+                            &devices_in,
+                            &self.out_dir,
+                        );
+                    });
+                });
+        }
+        if self.view != View::Tx {
+            self.stations_panel(ui, &sh);
+        }
+        // The side panels are laid out first, so they run the full height under the
+        // bar and the files, log and pictures sit in the column beside them rather
+        // than cutting the instruments off.
         egui::Panel::bottom("log")
             .resizable(false)
             .show(ui, |ui| self.files_and_log(ui, &sh));
@@ -920,50 +1021,33 @@ impl eframe::App for App {
                 .resizable(false)
                 .show(ui, |ui| self.pictures_panel(ui, &sh.pictures, &sh.voices));
         }
-        egui::Panel::right("stations")
-            .resizable(true)
-            .default_size(560.0)
-            .min_size(380.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if sh.snapshots.is_empty() {
-                        ui.label(RichText::new("Nothing is being received.").weak());
-                    }
-                    let snaps = sh.snapshots.clone();
-                    for (i, s) in snaps.iter().enumerate() {
-                        let idx = Profile::ALL
-                            .iter()
-                            .position(|p| *p == s.profile)
-                            .unwrap_or(i);
-                        self.profile_section(ui, s, idx, &sh.transfers);
-                    }
-                });
-            });
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Transmit…").clicked() {
-                        self.tx.open = !self.tx.open;
-                    }
-                    ui.label(RichText::new("Received files go to").weak());
-                    ui.label(
-                        RichText::new(self.out_dir.display().to_string())
-                            .weak()
-                            .monospace(),
-                    );
-                });
-                self.band_view(ui, &sh);
+                if self.view == View::Tx {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Transmit").strong().size(15.0));
+                        self.tx.show(
+                            ui,
+                            &self.engine,
+                            &sh.tx,
+                            &devices_out,
+                            &devices_in,
+                            &self.out_dir,
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Received files go to").weak());
+                        ui.label(
+                            RichText::new(self.out_dir.display().to_string())
+                                .weak()
+                                .monospace(),
+                        );
+                    });
+                    self.band_view(ui, &sh);
+                }
             });
-        let devices_out = self.devices_out.clone();
-        let devices_in = self.devices_in.clone();
-        self.tx.show(
-            ui.ctx(),
-            &self.engine,
-            &sh.tx,
-            &devices_out,
-            &devices_in,
-            &self.out_dir,
-        );
     }
 }

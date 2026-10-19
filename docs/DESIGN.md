@@ -321,6 +321,14 @@ CRC-16 (headers) and CRC-32 (payload frames).
 Built (egui, glow renderer), in DecSAT's instrument-panel look: dark faces,
 hairline frames, one muted hue per quantity.
 
+*Layout.* Tabs in the top bar: **RX**, **TX** and **RX + TX** (the transmit controls
+in a left column beside the receiver, as in FreeDV; the last choice is
+remembered). The side columns (transmit on the left, the stations' instruments on
+the right) run the full height under the bar; the band view, the received
+pictures and speech, the files and the log sit in the column between them, so
+nothing cuts the instruments off. A recording or a picture being prepared keeps
+going when the TX tab is not showing.
+
 - **Band view** — the audio spectrum 0–4 kHz with the three profile bands
   shaded, the noise floor (15th percentile of 300–3300 Hz), and a label at each
   locked carrier; a waterfall below it (levels from the floor to the strongest
