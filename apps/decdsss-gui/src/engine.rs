@@ -75,6 +75,21 @@ pub enum Cmd {
     Quit,
 }
 
+/// A text message that arrived whole (a CQ call, chat).
+#[derive(Clone, Debug)]
+pub struct Message {
+    /// Seconds into the run it was complete.
+    pub at_s: f64,
+    pub call: String,
+    pub session: u8,
+    /// The band it was heard in (the 500 Hz slot, for that profile).
+    pub band: String,
+    pub text: String,
+}
+
+/// Messages kept for the display.
+const MESSAGES_MAX: usize = 200;
+
 #[derive(Clone, Debug)]
 pub struct FileEntry {
     pub file: ReceivedFile,
@@ -158,6 +173,8 @@ pub struct Shared {
     pub spectrum: Option<SpectrumView>,
     pub log: VecDeque<String>,
     pub files: Vec<FileEntry>,
+    /// Text messages received, oldest first.
+    pub messages: Vec<Message>,
     pub transfers: Vec<Transfer>,
     /// Pictures received or arriving, oldest first.
     pub pictures: Vec<Arc<PictureView>>,
@@ -763,7 +780,11 @@ fn handle_event(
                 if let Some(tr) = r.transfers.get_mut(&(f.call.clone(), f.session)) {
                     tr.done = true;
                 }
-                save(shared, r, t, f);
+                if f.ptype == PayloadType::Text {
+                    save_text(shared, r, t, &p, &f);
+                } else {
+                    save(shared, r, t, f);
+                }
             }
         }
         Event::SegmentEnd { .. } => {}
@@ -832,6 +853,42 @@ fn unique(dir: &Path, name: &str) -> PathBuf {
         .map(|i| dir.join(format!("{stem}-{i}{ext}")))
         .find(|p| !p.exists())
         .expect("a free name")
+}
+
+/// A received message goes to the message list and the log, and is appended to
+/// `messages.log` in the output folder, not saved as a file.
+fn save_text(shared: &Arc<Mutex<Shared>>, r: &Run, t: f64, band: &str, f: &ReceivedFile) {
+    use std::io::Write;
+    let text = decdsss_link::text::read(f).unwrap_or_default();
+    log(
+        shared,
+        format!("[{t:6.1}s] TEXT from {} ({band}): {text}", f.call),
+    );
+    let line = format!(
+        "[{t:7.1}s] {} ({band}): {}\n",
+        f.call,
+        text.replace('\n', " / ")
+    );
+    let wrote = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r.out_dir.join("messages.log"))
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+    if let Err(e) = wrote {
+        log(shared, format!("cannot write messages.log: {e}"));
+    }
+    let mut g = shared.lock().unwrap();
+    g.messages.push(Message {
+        at_s: t,
+        call: f.call.clone(),
+        session: f.session,
+        band: band.to_string(),
+        text,
+    });
+    if g.messages.len() > MESSAGES_MAX {
+        g.messages.remove(0);
+    }
+    g.version += 1;
 }
 
 fn save(shared: &Arc<Mutex<Shared>>, r: &Run, t: f64, f: ReceivedFile) {

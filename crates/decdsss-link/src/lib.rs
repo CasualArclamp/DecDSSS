@@ -11,10 +11,12 @@ pub mod container;
 pub mod erasure;
 pub mod live;
 pub mod send;
+pub mod text;
 pub mod voice;
 
 pub use assemble::{
     Assembler, Front, LiveChunk, Progress, ReceivedFile, ReceivedVoice, VoiceProgress,
 };
 pub use send::{Plan, SendSpec, air_seconds, max_stream_bytes, plan, segments};
+pub use text::plan_text;
 pub use voice::{VoicePlan, VoiceSpec, plan_voice};

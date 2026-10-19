@@ -136,6 +136,9 @@ pub struct TxPanel {
     pic_tex: Option<(PicKey, TextureHandle)>,
     /// Send speech: a recording or a WAV, as Codec2.
     voice: bool,
+    /// Send a text message (a CQ call, chat) instead of a file.
+    text: bool,
+    message: String,
     vp: VoicePanel,
     /// The Codec2 mode; `None` is the profile's own (450 on 2.4 kHz, 700C on 3 kHz).
     codec: Option<Codec>,
@@ -173,6 +176,8 @@ impl Default for TxPanel {
             pic_result: None,
             pic_tex: None,
             voice: false,
+            text: false,
+            message: String::new(),
             vp: VoicePanel::default(),
             codec: None,
             vox: false,
@@ -300,6 +305,35 @@ impl TxPanel {
         self.vp.finish();
     }
 
+    /// Sets the bandwidth, and for 500 Hz the slot, from `500@+500` (for `--tx-band`).
+    pub fn preset_band(&mut self, spec: &str) {
+        let (prof, slot) = match spec.split_once('@') {
+            Some((p, s)) => (p, Slot::from_name(s)),
+            None => (spec, None),
+        };
+        if let Some(p) = Profile::from_name(prof) {
+            self.profile = p;
+        }
+        if let Some(s) = slot {
+            self.slot = s;
+        }
+    }
+
+    /// Switches to a text message (for `--tx-text`); `cq` writes a CQ call.
+    pub fn preload_text(&mut self, msg: String) {
+        if self.call.is_empty() {
+            self.call = "VK2ABC".into();
+        }
+        self.text = true;
+        self.picture = false;
+        self.voice = false;
+        self.message = if msg.eq_ignore_ascii_case("cq") {
+            decdsss_link::text::cq(&normalise_call(&self.call).unwrap_or_default())
+        } else {
+            msg
+        };
+    }
+
     /// Chooses a file, as if from the dialog.
     pub fn preload(&mut self, path: PathBuf) {
         if path
@@ -398,6 +432,45 @@ impl TxPanel {
             }
             Err(e) => self.note = e,
         }
+    }
+
+    /// The message box with a CQ button that writes a CQ call from the callsign.
+    fn message_editor(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.message)
+                    .desired_rows(3)
+                    .desired_width(300.0)
+                    .hint_text("type a message, or press CQ"),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .button("CQ")
+                    .on_hover_text("Fill in a CQ call from your callsign")
+                    .clicked()
+                {
+                    match normalise_call(&self.call) {
+                        Some(call) => self.message = decdsss_link::text::cq(&call),
+                        None => {
+                            self.note =
+                                "enter your callsign (letters, digits and /, up to 9)".into();
+                        }
+                    }
+                }
+                if ui.button("Clear").clicked() {
+                    self.message.clear();
+                }
+                let bytes = decdsss_link::text::tidy(&self.message).len();
+                ui.label(
+                    RichText::new(format!(
+                        "{bytes} / {} bytes",
+                        decdsss_link::text::MAX_TEXT_BYTES
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+            });
+        });
     }
 
     /// Keys up and starts streaming the microphone.
@@ -758,6 +831,31 @@ impl TxPanel {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs())
             % 64) as u8;
+        if self.text {
+            let mode = Mode::from_name(&self.mode).ok_or("choose a mode")?;
+            let spec = SendSpec {
+                profile: self.profile,
+                mode,
+                depth: 1,
+                call,
+                session,
+                ptype: PayloadType::Text,
+                resync_s: self.resync,
+                parity: self.parity / 100.0,
+                passes: self.repeat.max(1),
+            };
+            let plan = decdsss_link::plan_text(&spec, &self.message)?;
+            let chips = transmission_chips(&plan.segments).ok_or("cannot build the header")?;
+            let audio =
+                chips_to_audio_at(&chips, self.band(), f64::from(rate), self.level, 1.0, 1.0);
+            let audio = self.with_vox(rate, audio);
+            return Ok(Plan {
+                frames: plan.frames(),
+                segments: plan.segments.len(),
+                seconds: audio.len() as f64 / f64::from(rate),
+                audio,
+            });
+        }
         if self.voice {
             let clip = self
                 .vp
@@ -859,8 +957,19 @@ impl TxPanel {
                     .size(11.0),
                 );
         egui::Grid::new("txgrid").num_columns(2).show(ui, |ui| {
-            ui.label(if self.voice { "Speech" } else { "File" });
-            ui.horizontal(|ui| {
+            ui.label(if self.voice {
+                "Speech"
+            } else if self.text {
+                "Message"
+            } else {
+                "File"
+            });
+            // The message box is taller than a line, so it is not inside a horizontal
+            // layout (which would size the row to one line and let it spill over the next).
+            if self.text {
+                self.message_editor(ui);
+            } else {
+                ui.horizontal(|ui| {
                 if self.voice {
                     ui.label(RichText::new("record, or choose a WAV, below").weak());
                 } else if ui.button("Choose…").clicked()
@@ -881,12 +990,15 @@ impl TxPanel {
                             .map_or("none".into(), |n| n.to_string_lossy().into_owned()),
                     );
                 }
-            });
+                });
+            }
             ui.end_row();
             ui.label("Send as");
             ui.horizontal(|ui| {
                 let mut kind = if self.voice {
                     2
+                } else if self.text {
+                    3
                 } else {
                     usize::from(self.picture)
                 };
@@ -895,9 +1007,12 @@ impl TxPanel {
                     .on_hover_text("Scaled and compressed to the air time");
                 ui.radio_value(&mut kind, 2, "voice")
                     .on_hover_text("Speech, as Codec2");
+                ui.radio_value(&mut kind, 3, "text")
+                    .on_hover_text("A CQ call or a few lines of chat, shown as text on the receiver");
                 let was_voice = self.voice;
                 self.picture = kind == 1;
                 self.voice = kind == 2;
+                self.text = kind == 3;
                 if self.voice
                     && !was_voice
                     && let Some(vm) = Mode::voice(self.profile)
@@ -1052,8 +1167,10 @@ impl TxPanel {
                 });
             ui.end_row();
         });
+        // A message goes out at depth 1: a deeper block would pad it with empty frames.
+        let depth = if self.text { 1 } else { self.depth };
         if let Some(layout) =
-            Mode::from_name(&self.mode).map(|m| Layout::new(self.profile, m, self.depth))
+            Mode::from_name(&self.mode).map(|m| Layout::new(self.profile, m, depth))
         {
             ui.label(
                 RichText::new(format!(

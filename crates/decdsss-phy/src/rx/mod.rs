@@ -490,9 +490,39 @@ impl Receiver {
     }
 }
 
+/// A transmission some band has heard, to recognise the same one in another band.
+struct Heard {
+    key: (Profile, String, u8, u16),
+    band: Band,
+    channel: usize,
+    snr_db: f64,
+    /// Samples fed when it was heard.
+    at: u64,
+}
+
+/// How long a header is remembered against a copy in another slot, seconds.
+const HEARD_S: f64 = 120.0;
+
+/// A header must be this much stronger (dB of symbol SNR) in one slot than in another
+/// for the weaker to be taken for the other's leakage.
+const LEAK_MARGIN_DB: f64 = 6.0;
+
 /// A receiver per band, fed the same audio.
+///
+/// A strong station in one 500 Hz slot is also found, faintly, by the receivers of
+/// the other slots: the preamble search correlates at one sample a chip, so a signal
+/// 500 Hz away folds onto 100 Hz (500 mod 400, the chip rate) after the matched
+/// filter has taken some 40 dB off it, and a station 50 dB or more over the noise
+/// is still above the detection threshold there. The same header decoded in two slots
+/// is the one transmission, in the slot where it is stronger: the other copy's events
+/// are dropped.
 pub struct MultiReceiver {
     rx: Vec<Receiver>,
+    rate: f64,
+    samples: u64,
+    heard: Vec<Heard>,
+    /// (band, channel) whose events are dropped: a weaker copy of a transmission.
+    muted: Vec<(Band, usize)>,
 }
 
 impl MultiReceiver {
@@ -509,24 +539,92 @@ impl MultiReceiver {
                 .iter()
                 .map(|&b| Receiver::at(b, sample_rate))
                 .collect(),
+            rate: sample_rate,
+            samples: 0,
+            heard: Vec::new(),
+            muted: Vec::new(),
         }
     }
 
     pub fn snapshots(&self, search_cols: usize) -> Vec<Snapshot> {
-        self.rx.iter().map(|r| r.snapshot(search_cols)).collect()
+        self.rx
+            .iter()
+            .map(|r| {
+                let mut s = r.snapshot(search_cols);
+                let band = s.band;
+                s.channels.retain(|c| !self.muted.contains(&(band, c.id)));
+                s
+            })
+            .collect()
     }
 
     pub fn push(&mut self, audio: &[f32]) -> Vec<Tagged> {
+        self.samples += audio.len() as u64;
         let mut out = Vec::new();
-        for r in &mut self.rx {
-            let (profile, band) = (r.profile, r.band);
-            out.extend(r.push(audio).into_iter().map(|event| Tagged {
-                profile,
-                band,
-                event,
-            }));
+        for i in 0..self.rx.len() {
+            let events = self.rx[i].push(audio);
+            let (profile, band) = (self.rx[i].profile, self.rx[i].band);
+            for event in events {
+                // The channel an event belongs to, and whether it opens one.
+                let (channel, opens) = match &event {
+                    Event::Header { channel, .. } => (Some(*channel), true),
+                    Event::Block { channel, .. }
+                    | Event::SegmentEnd { channel }
+                    | Event::EndOfTransmission { channel, .. } => (Some(*channel), false),
+                    _ => (None, false),
+                };
+                if let Some(c) = channel {
+                    if opens && self.is_leakage(profile, band, c, &event) {
+                        continue;
+                    }
+                    if self.muted.contains(&(band, c)) {
+                        continue;
+                    }
+                }
+                out.push(Tagged {
+                    profile,
+                    band,
+                    event,
+                });
+            }
         }
         out
+    }
+
+    /// Whether this header is the weaker copy, in another slot, of a transmission
+    /// already heard (and if it is the stronger one, mutes the copy heard before).
+    fn is_leakage(&mut self, profile: Profile, band: Band, channel: usize, event: &Event) -> bool {
+        let Event::Header { header, snr_db, .. } = event else {
+            return false;
+        };
+        let key = (profile, header.call.clone(), header.session, header.frame0);
+        let horizon = (HEARD_S * self.rate) as u64;
+        let now = self.samples;
+        self.heard.retain(|h| now.saturating_sub(h.at) < horizon);
+        let snr = *snr_db;
+        if let Some(h) = self
+            .heard
+            .iter_mut()
+            .find(|h| h.key == key && h.band != band)
+        {
+            if snr > h.snr_db + LEAK_MARGIN_DB {
+                // This one is the real slot: the copy heard first is the leak.
+                self.muted.push((h.band, h.channel));
+                (h.band, h.channel, h.snr_db, h.at) = (band, channel, snr, now);
+                return false;
+            }
+            // Weaker or about equal: the copy.
+            self.muted.push((band, channel));
+            return true;
+        }
+        self.heard.push(Heard {
+            key,
+            band,
+            channel,
+            snr_db: snr,
+            at: now,
+        });
+        false
     }
 }
 
@@ -857,6 +955,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A very strong station (no noise at all, as over a cable) in the upper slot is
+    /// found a little by the other slots' preamble searches, folded by the chip rate;
+    /// it must be reported once, by the slot it is in, with no copy from another and
+    /// no channel left open in another's snapshot.
+    #[test]
+    fn a_strong_station_is_reported_by_its_own_slot_only() {
+        let high = Band::new(Profile::N500, Slot::High);
+        let (seg, audio) = station("VK2ABC", 3, high, "ds4-1/2", 0.0, 1.0);
+        let mut mix = audio;
+        mix.extend(vec![0.0; (4.0 * FS) as usize]);
+        let mut mr = MultiReceiver::with_bands(&Band::ALL[..3], FS);
+        let (mut events, mut snapshots_with_channels) = (Vec::new(), 0usize);
+        for c in mix.chunks(4800) {
+            events.extend(mr.push(c));
+            for s in mr.snapshots(0) {
+                if s.band != high {
+                    snapshots_with_channels += s.channels.len();
+                }
+            }
+        }
+        let headers: Vec<Band> = events
+            .iter()
+            .filter(|t| matches!(t.event, Event::Header { .. }))
+            .map(|t| t.band)
+            .collect();
+        assert_eq!(headers, vec![high], "one header, from the slot it is in");
+        let got = delivered(&events);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got.get(&("VK2ABC".to_string(), high)),
+            Some(&seg.frames.len())
+        );
+        assert_eq!(
+            snapshots_with_channels, 0,
+            "no ghost channel in another slot"
+        );
     }
 
     fn eots(events: &[Event]) -> usize {

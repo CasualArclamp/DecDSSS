@@ -8,7 +8,9 @@ use decdsss_chan::{Channel, Watterson};
 use decdsss_codec2::Mode as Codec;
 use decdsss_core::{Band, Mode, Profile, Slot};
 use decdsss_link::voice::default_codec;
-use decdsss_link::{Assembler, SendSpec, VoiceSpec, container, max_stream_bytes, plan, plan_voice};
+use decdsss_link::{
+    Assembler, SendSpec, VoiceSpec, container, max_stream_bytes, plan, plan_text, plan_voice, text,
+};
 use decdsss_phy::codes::{normalise_call, own_code};
 use decdsss_phy::framing::{Layout, PayloadType};
 use decdsss_phy::rx::{Event, MultiReceiver};
@@ -38,8 +40,15 @@ enum Command {
     Devices,
     /// Turn a file into a transmission (a WAV of audio to feed a radio).
     Tx {
-        /// The file to send.
-        file: PathBuf,
+        /// The file to send (not needed with --text or --cq).
+        #[arg(required_unless_present_any = ["text", "cq"])]
+        file: Option<PathBuf>,
+        /// Send this text instead of a file: a message the receiver shows as text.
+        #[arg(long, conflicts_with_all = ["file", "picture", "voice", "cq"])]
+        text: Option<String>,
+        /// Send a CQ call from --call (as text): "CQ CQ CQ de CALL CALL CALL pse K".
+        #[arg(long, conflicts_with_all = ["file", "picture", "voice"])]
+        cq: bool,
         /// Your callsign (also picks the spreading code your data rides on).
         #[arg(long)]
         call: String,
@@ -202,6 +211,8 @@ fn main() -> Result<()> {
         Command::Devices => devices(),
         Command::Tx {
             file,
+            text,
+            cq,
             call,
             profile,
             slot,
@@ -225,7 +236,7 @@ fn main() -> Result<()> {
             output,
             play,
         } => tx(
-            &file,
+            file.as_deref(),
             &call,
             &profile,
             &slot,
@@ -234,7 +245,11 @@ fn main() -> Result<()> {
             resync,
             parity,
             repeat,
-            if voice {
+            if cq {
+                Payload::Text(None)
+            } else if let Some(t) = text {
+                Payload::Text(Some(t))
+            } else if voice {
                 Payload::Voice(VoiceOpts { codec })
             } else if picture {
                 Payload::Picture(PictureOpts {
@@ -316,6 +331,21 @@ fn main() -> Result<()> {
     }
 }
 
+/// Adds a received message to `messages.log` in the output folder: when (seconds into
+/// the recording), who, which band, what. A failure is reported, not fatal.
+fn append_message(dir: &Path, t: f64, call: &str, band: &str, msg: &str) {
+    use std::io::Write;
+    let line = format!("[{t:7.1}s] {call} ({band}): {}\n", msg.replace('\n', " / "));
+    let r = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("messages.log"))
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+    if let Err(e) = r {
+        println!("cannot write messages.log: {e}");
+    }
+}
+
 fn parse_profile(s: &str) -> Result<Profile> {
     Profile::from_name(s).with_context(|| format!("unknown profile {s:?}: use 500, 2k4 or 3k"))
 }
@@ -390,7 +420,7 @@ fn modes(profile: Option<&str>) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn tx(
-    file: &Path,
+    file: Option<&Path>,
     call: &str,
     profile: &str,
     slot: &str,
@@ -433,7 +463,7 @@ fn tx(
         bail!("depth must be 1, 2, 4 or 8");
     }
     let mut name = file
-        .file_name()
+        .and_then(Path::file_name)
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".into());
     // A session number from the clock unless one is given.
@@ -444,14 +474,42 @@ fn tx(
         (t % 64) as u8
     });
     let layout = Layout::new(profile, mode, depth);
-    let (segs, summary): (Vec<Segment>, String) = if let Payload::Voice(v) = &payload {
+    let (segs, summary): (Vec<Segment>, String) = if let Payload::Text(msg) = &payload {
+        // A message: always depth 1 (see `decdsss_link::text`).
+        let msg = msg.clone().unwrap_or_else(|| text::cq(&call));
+        let spec = SendSpec {
+            profile,
+            mode,
+            depth,
+            call: call.clone(),
+            session: session & 63,
+            ptype: PayloadType::Text,
+            resync_s: resync,
+            parity: parity / 100.0,
+            passes: repeat.max(1),
+        };
+        let plan = plan_text(&spec, &msg).map_err(anyhow::Error::msg)?;
+        let summary = format!(
+            "text {:?}: {} data + {} coded frames in the first pass ({} pass(es), {} frames of {} bytes in all, {} segment(s)), {} {} depth 1",
+            text::tidy(&msg),
+            plan.data_frames,
+            plan.coded_first_pass,
+            plan.passes,
+            plan.frames(),
+            Layout::new(profile, mode, 1).frame_bytes(),
+            plan.segments.len(),
+            band.label(),
+            mode,
+        );
+        (plan.segments, summary)
+    } else if let Payload::Voice(v) = &payload {
         let codec = match &v.codec {
             Some(c) => Codec::from_name(c)
                 .with_context(|| format!("unknown Codec2 mode {c:?}: use 450 or 700C"))?,
             None => default_codec(profile)
                 .context("500 Hz is too slow for voice: use --profile 2k4 or 3k")?,
         };
-        let speech = load_speech(file)?;
+        let speech = load_speech(file.context("give the WAV to send")?)?;
         let vs = VoiceSpec {
             profile,
             mode,
@@ -493,11 +551,15 @@ fn tx(
         };
         let data = match &payload {
             Payload::Picture(opts) => {
-                let (picture_name, jpeg) = prepare_picture(file, &spec, opts)?;
+                let (picture_name, jpeg) =
+                    prepare_picture(file.context("give the picture to send")?, &spec, opts)?;
                 name = picture_name;
                 jpeg
             }
-            _ => std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?,
+            _ => {
+                let file = file.context("give the file to send")?;
+                std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?
+            }
         };
         let stream = container::pack(&name, &data);
         let plan = plan(&spec, &stream).map_err(anyhow::Error::msg)?;
@@ -541,6 +603,8 @@ fn tx(
 
 /// What `tx` sends.
 enum Payload {
+    /// A message; `None` is a CQ call from the callsign.
+    Text(Option<String>),
     File,
     Picture(PictureOpts),
     Voice(VoiceOpts),
@@ -664,6 +728,8 @@ struct RxRun {
     out_dir: PathBuf,
     verbose: bool,
     files: usize,
+    /// Text messages received.
+    messages: usize,
     headers: usize,
     frames_ok: usize,
     frames_bad: usize,
@@ -680,6 +746,7 @@ impl RxRun {
             out_dir: out_dir.to_path_buf(),
             verbose,
             files: 0,
+            messages: 0,
             headers: 0,
             frames_ok: 0,
             frames_bad: 0,
@@ -764,7 +831,12 @@ impl RxRun {
                             Err(e) => println!("cannot write the speech: {e}"),
                         }
                     }
-                    if let Some(f) = file {
+                    if let Some(f) = file.as_ref().filter(|f| f.ptype == PayloadType::Text) {
+                        let msg = text::read(f).unwrap_or_default();
+                        println!("[{t:7.1}s] TEXT from {} ({p}): {msg}", f.call);
+                        self.messages += 1;
+                        append_message(&self.out_dir, t, &f.call, &p, &msg);
+                    } else if let Some(f) = file {
                         let path = unique(&self.out_dir, &sanitize(&f.name));
                         match std::fs::write(&path, &f.data) {
                             Ok(()) => {
@@ -800,8 +872,8 @@ impl RxRun {
 
     fn summary(&self) {
         println!(
-            "{} header(s), {} frames decoded, {} lost, {} file(s) complete",
-            self.headers, self.frames_ok, self.frames_bad, self.files
+            "{} header(s), {} frames decoded, {} lost, {} file(s) complete, {} message(s)",
+            self.headers, self.frames_ok, self.frames_bad, self.files, self.messages
         );
         for (call, session) in &self.open {
             if let Some(vp) = self.asm.voice_progress(call, *session)

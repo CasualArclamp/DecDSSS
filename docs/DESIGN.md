@@ -14,7 +14,7 @@ milestones. Update it when a decision changes.
 
 | Question | Answer |
 |---|---|
-| Payloads | Digital voice (Codec2), SSTV-style pictures, files. No text/chat mode. |
+| Payloads | Digital voice (Codec2), SSTV-style pictures, files. (Text was left out at first; a text mode for CQ calls and chat was added on Rory's request later the same day.) |
 | Spreading | Both families as modes: DS-PSK with a spreading-factor ladder, and M-ary code-shift keying (CSK). |
 | Channels | HF SSB skywave; sound card / virtual cable first. |
 | Bandwidths | 2.4 kHz (300–2700 Hz) and 3 kHz (300–3300 Hz), plus a 500 Hz weak-signal profile. |
@@ -64,8 +64,33 @@ frequency or moved away from the weak station, lost with it 25 Hz toward it; at 
 lost, except a neighbour below and 25 Hz further down (delivered, lost at 70 dB). So
 the isolation between slots is about 40 to 60 dB in this simulation (the shaping
 filter at the transmitter and the matched filter at the receiver, not separated); a
-real radio's filter skirts and a neighbour's splatter are not modelled. Three stations at once, one per slot, are all received
+real radio's filter skirts and a neighbour's splatter are not modelled. A station
+far above the noise (over a cable, 58 dB symbol SNR) is also found, faintly, by the
+other slots' preamble searches, which correlate at one sample a chip, so a signal
+500 Hz away folds onto 100 Hz (500 mod the 400 chip/s) after the matched filter has
+taken some off it (seen: the middle slot decoding the +500 Hz station at "carrier
++100.00 Hz", symbol SNR 1 dB against 57 dB in its own slot). The same header decoded
+in two slots is one transmission, reported by the slot where it is stronger by 6 dB or
+more (the first to hear it otherwise), and the other copy's events and channel are
+dropped (`MultiReceiver`; `rx::tests::a_strong_station_is_reported_by_its_own_slot_only`).
+Three stations at once, one per slot, are all received
 (`rx::tests::three_500_hz_stations_share_the_passband`).
+
+*Why a receiver per slot, not one wide receiver.* One front end could cover all
+three slots (their 1500 Hz fits the 1600 Hz complex rate of a 500 Hz receiver), but
+it would not be cheaper or simpler. *Measured* (release build, 47.9 s of audio through
+`decdsss rx`): one 500 Hz receiver 0.65 s, the three slots 1.48 s (including decoding
+one transmission), all five bands 2.82 s, so about 1.4 % of a core for the first and
+3 % for the three. A wide search would cover ±600 Hz where three narrow ones cover
+3 × ±100 Hz, so it would do more work, not less. The search correlates at one
+sample a chip, where 100 Hz and 500 Hz are the same frequency (the alias above), so
+a wide search would have to work at four samples a chip or in two stages. And each
+signal found still needs its own mixer and matched filter, which is what a slot's
+receiver already is. What a wide receiver would give is free tuning: a station
+anywhere in the passband, not only within ±100 Hz of a slot centre (today a station
+at +250 Hz is in no slot's search). That would be a channelizer (one wide search, then
+a mixer and filter per candidate) and is the thing to build if the 500 Hz channels
+should not sit on a fixed grid.
 
 On `2k4` and `3k`, a chip is short against HF delay spreads (0.5–3 ms), so
 multipath resolves into separate paths a rake receiver can combine. On `500`,
@@ -312,6 +337,20 @@ CRC-16 (headers) and CRC-32 (payload frames).
 
 ## Payloads and link layer
 
+- **Text** (done): a CQ call or a few lines of chat, up to 1000 bytes of UTF-8, as
+  a payload of its own (`PayloadType::Text`, `link::text`). It rides the file
+  machinery (the container with no file name, erasure-coded frames, `--parity` and
+  `--repeat`), so it has the same protection, and the receiver shows it as a message
+  (the GUI's Messages panel, `TEXT from …` in the CLI, and a line in `messages.log`
+  in the output folder) instead of saving a file. It always goes out at depth 1: a
+  message is a frame or two, and a deeper block would pad it with empty frames and
+  take that many times the air time. `tx --cq` (CLI) and the CQ button (GUI) write
+  "CQ CQ CQ de CALL CALL CALL pse K"; the callsign is in every header as well. The
+  start-up (preamble and header, 6.6 s or more) is most of the air time of a short
+  message, so a robust mode costs little extra: a CQ at DS8 1/2 on 2.4 kHz is 17 s of
+  audio including the postamble. Any bandwidth and any 500 Hz slot (checked end to
+  end through the simulator on 2.4 kHz and in the +500 Hz slot, `tests/text.rs`, and
+  through the cables in the GUI).
 - **Files** (done): one-way, erasure-coded. The file goes into a small container
   (name, length, CRC-32), is cut into `K` data shards, and the sender adds coded
   shards (Cauchy Reed–Solomon over GF(2^16), ported from COFDMtv, itself from

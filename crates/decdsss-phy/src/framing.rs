@@ -32,6 +32,8 @@ pub enum PayloadType {
     Voice = 3,
     /// Codec2 450 speech.
     Voice450 = 4,
+    /// A text message (see `decdsss-link`'s text module).
+    Text = 5,
 }
 
 impl PayloadType {
@@ -42,6 +44,7 @@ impl PayloadType {
             2 => Some(PayloadType::Picture),
             3 => Some(PayloadType::Voice),
             4 => Some(PayloadType::Voice450),
+            5 => Some(PayloadType::Text),
             _ => None,
         }
     }

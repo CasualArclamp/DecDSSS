@@ -61,6 +61,10 @@ pub struct Automation {
     pub open_tx: bool,
     /// Open the transmit window with this file chosen.
     pub tx_file: Option<PathBuf>,
+    /// Open the transmit window set to send this text (a message; `cq` for a CQ call).
+    pub tx_text: Option<String>,
+    /// With `tx_text` or `tx_file`: the profile, and for 500 Hz a slot, as `500@+500`.
+    pub tx_band: Option<String>,
     /// Record speech in the transmit window for this many seconds from the
     /// input named `mic` (part of its name), starting at launch.
     pub record_for: Option<f64>,
@@ -186,6 +190,7 @@ impl App {
             .unwrap_or(View::Rx);
         if auto.open_tx
             || auto.tx_file.is_some()
+            || auto.tx_text.is_some()
             || auto.record_for.is_some()
             || auto.ptt_for.is_some()
             || auto.live_for.is_some()
@@ -197,6 +202,12 @@ impl App {
         }
         if let Some(p) = auto.tx_file.clone() {
             tx.preload(p);
+        }
+        if let Some(b) = auto.tx_band.as_deref() {
+            tx.preset_band(b);
+        }
+        if let Some(m) = auto.tx_text.clone() {
+            tx.preload_text(m);
         }
         let out_dir = out_dir.or_else(|| prefs.get("out_dir").map(PathBuf::from));
         let device_in = initial_device
@@ -875,6 +886,34 @@ impl App {
         });
     }
 
+    /// Received text, newest at the bottom, each line the time, who sent it, in which
+    /// band, and the message.
+    fn messages_panel(&mut self, ui: &mut Ui, messages: &[crate::engine::Message]) {
+        ui.label(RichText::new("Messages").strong());
+        egui::ScrollArea::vertical()
+            .max_height(110.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for m in messages {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{:02}:{:02}",
+                                m.at_s as u64 / 60,
+                                m.at_s as u64 % 60
+                            ))
+                            .weak()
+                            .monospace(),
+                        );
+                        ui.label(RichText::new(&m.call).strong().color(col::LOCK))
+                            .on_hover_text(format!("session {}", m.session));
+                        ui.label(RichText::new(format!("({})", m.band)).weak().size(11.0));
+                        ui.label(&m.text);
+                    });
+                }
+            });
+    }
+
     fn files_and_log(&mut self, ui: &mut Ui, sh: &Shared) {
         if !sh.files.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -1418,6 +1457,7 @@ impl eframe::App for App {
             spectrum,
             log,
             files,
+            messages,
             transfers,
             pictures,
             voices,
@@ -1440,6 +1480,7 @@ impl eframe::App for App {
                     .cloned()
                     .collect::<std::collections::VecDeque<_>>(),
                 g.files.clone(),
+                g.messages.clone(),
                 g.transfers.clone(),
                 g.pictures.clone(),
                 g.voices.clone(),
@@ -1456,6 +1497,7 @@ impl eframe::App for App {
             spectrum,
             log,
             files,
+            messages,
             transfers,
             pictures,
             voices,
@@ -1498,6 +1540,11 @@ impl eframe::App for App {
         egui::Panel::bottom("log")
             .resizable(false)
             .show(ui, |ui| self.files_and_log(ui, &sh));
+        if !sh.messages.is_empty() {
+            egui::Panel::bottom("messages")
+                .resizable(false)
+                .show(ui, |ui| self.messages_panel(ui, &sh.messages));
+        }
         if !sh.pictures.is_empty() || !sh.voices.is_empty() {
             egui::Panel::bottom("pictures")
                 .resizable(false)

@@ -24,7 +24,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: decdsss-gui [--demo | --wav FILE] [--speed X] [--profile 500,2k4,3k] \
-[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--record-for SECS [--mic NAME]] [--view rx|tx|both] [--monitor OUTPUT] | --write-demo OUT.wav";
+[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--tx-text MSG|cq] [--tx-band 500@+500] [--record-for SECS [--mic NAME]] [--view rx|tx|both] [--monitor OUTPUT] | --write-demo OUT.wav";
 
 /// Attaches to the console of the process that started this one (a terminal), if
 /// there is one; harmless when output is redirected or there is no terminal.
@@ -123,6 +123,8 @@ fn main() -> eframe::Result {
             "--screenshot" => auto.screenshot = Some(PathBuf::from(value("--screenshot"))),
             "--tx" => auto.open_tx = true,
             "--tx-file" => auto.tx_file = Some(PathBuf::from(value("--tx-file"))),
+            "--tx-text" => auto.tx_text = Some(value("--tx-text")),
+            "--tx-band" => auto.tx_band = Some(value("--tx-band")),
             "--record-for" => auto.record_for = value("--record-for").parse().ok(),
             "--mic" => auto.mic = Some(value("--mic")),
             "--view" => auto.view = Some(value("--view")),
