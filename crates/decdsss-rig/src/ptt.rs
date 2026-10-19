@@ -132,7 +132,55 @@ fn same_port(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
+/// The longest lead or tail time accepted, milliseconds.
+pub const MAX_DELAY_MS: u32 = 2000;
+
 impl Config {
+    /// The settings as `key=value` pairs, the keys the GUI's preferences file
+    /// keeps them under (the CLI reads the same file, so both keep to one set).
+    pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
+        let flag = |b: bool| if b { "1" } else { "0" }.to_string();
+        vec![
+            ("rig_cat", flag(self.cat)),
+            ("rig_model", self.rig.model.code().to_string()),
+            ("rig_port", self.rig.port.clone()),
+            ("rig_baud", self.rig.baud.to_string()),
+            ("rig_civ", format!("{:02X}", self.rig.civ)),
+            ("rig_ptt", self.method.code().to_string()),
+            ("rig_ptt_port", self.ptt_port.clone()),
+            ("rig_force_dtr", flag(self.force_dtr)),
+            ("rig_force_rts", flag(self.force_rts)),
+            ("rig_lead_ms", self.lead_ms.to_string()),
+            ("rig_tail_ms", self.tail_ms.to_string()),
+        ]
+    }
+
+    /// The settings from `get`, which looks a key up; what is missing or not
+    /// understood is the default.
+    pub fn from_lookup<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Self {
+        let d = Config::default();
+        let flag = |k: &str, default: bool| get(k).map_or(default, |v| v == "1");
+        let number = |k: &str, default: u32| get(k).and_then(|v| v.parse().ok()).unwrap_or(default);
+        let model = get("rig_model")
+            .and_then(Model::parse)
+            .unwrap_or(d.rig.model);
+        let mut rig = Settings::new(model, get("rig_port").unwrap_or(""));
+        rig.baud = number("rig_baud", rig.baud);
+        if let Some(civ) = get("rig_civ").and_then(|v| u8::from_str_radix(v, 16).ok()) {
+            rig.civ = civ;
+        }
+        Config {
+            cat: flag("rig_cat", d.cat),
+            rig,
+            method: get("rig_ptt").and_then(Method::parse).unwrap_or(d.method),
+            ptt_port: get("rig_ptt_port").unwrap_or("").to_string(),
+            force_dtr: flag("rig_force_dtr", d.force_dtr),
+            force_rts: flag("rig_force_rts", d.force_rts),
+            lead_ms: number("rig_lead_ms", d.lead_ms).min(MAX_DELAY_MS),
+            tail_ms: number("rig_tail_ms", d.tail_ms).min(MAX_DELAY_MS),
+        }
+    }
+
     /// Whether there is anything to connect to: the rig is to be found, or a
     /// line is to key.
     pub fn wants_link(&self) -> bool {

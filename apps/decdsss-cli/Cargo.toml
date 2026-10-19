@@ -23,6 +23,8 @@ decdsss-phy = { path = "../../crates/decdsss-phy" }
 decdsss-rig = { path = "../../crates/decdsss-rig" }
 anyhow.workspace = true
 clap = { version = "4.5", features = ["derive"] }
+# Ctrl-C while the transmitter is keyed: let go before the program ends.
+ctrlc = "3"
 
 [build-dependencies]
 # Puts assets/decdsss.ico into the Windows executable (see build.rs).

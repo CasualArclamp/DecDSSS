@@ -636,8 +636,15 @@ audio through VB-Audio cable A with a stand-in rig (`cargo test -p decdsss-gui -
 `ID;` with 0800 on both of its COM ports (the Standard one at 4800 baud, the
 Enhanced one at 38400). *Not checked:* keying a real transmitter (Rory's to do),
 the IC-7300 against a real one, CI-V and `rigctld` against real rigs, and DTR/RTS
-on a real interface. There is no CAT keying on the command line yet (`tx --play`
-does not key). Not done from the WSJT-X dialog: OmniRig, a separate PTT input
+on a real interface. `tx --play` keys the same way, with the same settings: it reads the `rig_*` lines of the GUI's
+preferences file, and `--ptt vox|cat|dtr|rts`, `--rig`, `--rig-port`, `--rig-baud`
+and `--ptt-port` change them for one run. **So once the dialog is set to key, a plain
+`tx --play` keys the radio; a test into a virtual cable passes `--ptt vox`.** Ctrl-C
+during playback lets go before the program ends; a settings error is refused before
+anything is opened. Checked through cable A with a stand-in `rigctld` on a local
+socket: it saw `T 1`, then `T 0` 17.5 s later, and the CLI printed "keyed", "playing"
+and "let go" in that order (timing against the first sample was not measured here; the
+GUI path's ordering is tested in `engine::tests`). Not done from the WSJT-X dialog: OmniRig, a separate PTT input
 (CTS), the left-channel VOX tone (the Transmit panel's VOX box sends a tone ahead
 of the signal) and the rest of Hamlib's models other than through `rigctld`.
 

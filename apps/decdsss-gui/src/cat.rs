@@ -13,14 +13,11 @@
 use crate::prefs::Prefs;
 use crate::radio::{Lamp, Radio};
 use crate::scope::col;
-use decdsss_rig::{Config, Method, Model, Port, Settings};
+use decdsss_rig::{Config, MAX_DELAY_MS, Method, Model, Port};
 use eframe::egui::{self, Color32, RichText, Ui};
 
 /// The CAT rates the radios' menus offer between them.
 const RATES: [u32; 6] = [4800, 9600, 19_200, 38_400, 57_600, 115_200];
-
-/// The longest lead or tail the dialog allows, milliseconds.
-const MAX_DELAY_MS: u32 = 2000;
 
 pub struct CatDialog {
     pub open: bool,
@@ -34,46 +31,13 @@ pub struct CatDialog {
 
 /// The settings in `prefs`, or the defaults.
 pub fn restore(p: &Prefs) -> Config {
-    let d = Config::default();
-    let flag = |k: &str, default: bool| p.get(k).map_or(default, |v| v == "1");
-    let number = |k: &str, default: u32| p.get(k).and_then(|v| v.parse().ok()).unwrap_or(default);
-    let model = p
-        .get("rig_model")
-        .and_then(Model::parse)
-        .unwrap_or(d.rig.model);
-    let mut rig = Settings::new(model, p.get("rig_port").unwrap_or(""));
-    rig.baud = number("rig_baud", rig.baud);
-    if let Some(civ) = p
-        .get("rig_civ")
-        .and_then(|v| u8::from_str_radix(v, 16).ok())
-    {
-        rig.civ = civ;
-    }
-    Config {
-        cat: flag("rig_cat", d.cat),
-        rig,
-        method: p.get("rig_ptt").and_then(Method::parse).unwrap_or(d.method),
-        ptt_port: p.get("rig_ptt_port").unwrap_or("").to_string(),
-        force_dtr: flag("rig_force_dtr", d.force_dtr),
-        force_rts: flag("rig_force_rts", d.force_rts),
-        lead_ms: number("rig_lead_ms", d.lead_ms).min(MAX_DELAY_MS),
-        tail_ms: number("rig_tail_ms", d.tail_ms).min(MAX_DELAY_MS),
-    }
+    Config::from_lookup(|k| p.get(k))
 }
 
 pub fn remember(c: &Config, p: &mut Prefs) {
-    let flag = |b: bool| if b { "1" } else { "0" };
-    p.set("rig_cat", flag(c.cat));
-    p.set("rig_model", c.rig.model.code());
-    p.set("rig_port", c.rig.port.clone());
-    p.set("rig_baud", c.rig.baud.to_string());
-    p.set("rig_civ", format!("{:02X}", c.rig.civ));
-    p.set("rig_ptt", c.method.code());
-    p.set("rig_ptt_port", c.ptt_port.clone());
-    p.set("rig_force_dtr", flag(c.force_dtr));
-    p.set("rig_force_rts", flag(c.force_rts));
-    p.set("rig_lead_ms", c.lead_ms.to_string());
-    p.set("rig_tail_ms", c.tail_ms.to_string());
+    for (k, v) in c.to_pairs() {
+        p.set(k, v);
+    }
 }
 
 impl CatDialog {
@@ -353,6 +317,7 @@ enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use decdsss_rig::Settings;
 
     #[test]
     fn settings_survive_the_preferences_file() {

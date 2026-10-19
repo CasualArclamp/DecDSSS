@@ -17,6 +17,8 @@ use decdsss_phy::framing::{Layout, PayloadType};
 use decdsss_phy::rx::{Event, MultiReceiver};
 use decdsss_phy::tx::{Segment, chips_to_audio_at, transmission_chips};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Parser)]
 #[command(
@@ -29,6 +31,9 @@ struct Cli {
     command: Command,
 }
 
+// `Tx` carries every option of a transmission, so it is the large variant; a
+// command line is parsed once.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Print the mode ladder with rates for each bandwidth profile.
@@ -144,9 +149,27 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Play the audio on this output device (a name or part of one; "default"
-        /// for the system default). You key the radio.
+        /// for the system default). The transmitter is keyed as the GUI's CAT / PTT
+        /// dialog has it set (see --ptt), VOX if it was never set up.
         #[arg(long)]
         play: Option<String>,
+        /// With --play, what keys the transmitter: vox (nothing: the radio is on
+        /// VOX or you key it), cat, dtr or rts. Default: the GUI's setting.
+        #[arg(long)]
+        ptt: Option<String>,
+        /// With --play, the rig for CAT (ic7300, ft710 or rigctld); turns CAT on.
+        /// Default: the GUI's setting.
+        #[arg(long)]
+        rig: Option<String>,
+        /// The rig's serial port (COM7) or, for rigctld, its address (localhost:4532).
+        #[arg(long)]
+        rig_port: Option<String>,
+        /// The CAT rate to try first.
+        #[arg(long)]
+        rig_baud: Option<u32>,
+        /// The serial port a DTR or RTS key is on (empty: the CAT port).
+        #[arg(long)]
+        ptt_port: Option<String>,
     },
     /// Receive: decode a WAV recording and save the files in it.
     Rx {
@@ -265,6 +288,11 @@ fn main() -> Result<()> {
             vox,
             output,
             play,
+            ptt,
+            rig,
+            rig_port,
+            rig_baud,
+            ptt_port,
         } => tx(
             file.as_deref(),
             &call,
@@ -298,6 +326,13 @@ fn main() -> Result<()> {
             vox,
             output.as_deref(),
             play.as_deref(),
+            &KeyOpts {
+                ptt,
+                rig,
+                rig_port,
+                rig_baud,
+                ptt_port,
+            },
         ),
         Command::Rx {
             input,
@@ -468,6 +503,7 @@ fn tx(
     vox: bool,
     output: Option<&Path>,
     play: Option<&str>,
+    keying: &KeyOpts,
 ) -> Result<()> {
     if output.is_none() && play.is_none() {
         bail!("give -o FILE.wav to write the audio and/or --play DEVICE to play it");
@@ -636,9 +672,68 @@ fn tx(
         );
     }
     if let Some(dev) = play {
-        play_audio(&audio, rate, dev)?;
+        play_audio(&audio, rate, dev, &key_config(keying)?)?;
     }
     Ok(())
+}
+
+/// The command line's say in what keys the transmitter for `--play`.
+struct KeyOpts {
+    ptt: Option<String>,
+    rig: Option<String>,
+    rig_port: Option<String>,
+    rig_baud: Option<u32>,
+    ptt_port: Option<String>,
+}
+
+/// The CAT and PTT settings the GUI's dialog keeps in its preferences file
+/// (`%APPDATA%\DecDSSS\prefs.txt`, the same `key=value` lines the GUI reads);
+/// the defaults (no keying) if there is none.
+fn gui_rig_config() -> decdsss_rig::Config {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    });
+    let text = base
+        .and_then(|b| std::fs::read_to_string(b.join("DecDSSS").join("prefs.txt")).ok())
+        .unwrap_or_default();
+    let map: std::collections::BTreeMap<&str, &str> = text
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim(), v.trim()))
+        .collect();
+    decdsss_rig::Config::from_lookup(|k| map.get(k).copied())
+}
+
+/// The GUI's settings with the command line's changes on top, checked.
+fn key_config(o: &KeyOpts) -> Result<decdsss_rig::Config> {
+    apply_key_opts(gui_rig_config(), o)
+}
+
+fn apply_key_opts(mut c: decdsss_rig::Config, o: &KeyOpts) -> Result<decdsss_rig::Config> {
+    if let Some(m) = &o.rig {
+        c.rig.model = decdsss_rig::Model::parse(m)
+            .with_context(|| format!("no rig {m:?}: ic7300, ft710 or rigctld"))?;
+        c.rig.baud = c.rig.model.default_baud();
+        c.cat = true;
+    }
+    if let Some(p) = &o.rig_port {
+        c.rig.port = p.clone();
+        c.cat = true;
+    }
+    if let Some(b) = o.rig_baud {
+        c.rig.baud = b;
+    }
+    if let Some(p) = &o.ptt_port {
+        c.ptt_port = p.clone();
+    }
+    if let Some(m) = &o.ptt {
+        c.method = decdsss_rig::Method::parse(m)
+            .with_context(|| format!("no PTT method {m:?}: vox, cat, dtr or rts"))?;
+    }
+    c.check().map_err(anyhow::Error::msg)?;
+    Ok(c)
 }
 
 /// What `tx` sends.
@@ -1106,7 +1201,7 @@ fn rig(model: Option<&str>, port: Option<&str>, baud: Option<u32>, civ: Option<u
 }
 
 /// Plays mono audio on an output device, blocking until it has played.
-fn play_audio(audio: &[f32], rate: u32, dev: &str) -> Result<()> {
+fn play_audio(audio: &[f32], rate: u32, dev: &str, keying: &decdsss_rig::Config) -> Result<()> {
     let mut out = OutputStream::open(&OutputOptions {
         device: device_name(dev),
         sample_rate: Some(rate),
@@ -1122,9 +1217,31 @@ fn play_audio(audio: &[f32], rate: u32, dev: &str) -> Result<()> {
             fmt.sample_rate
         );
     }
+    // Ctrl-C ends the loop below like any error, so the key is let go (a killed
+    // process would leave the transmitter on).
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let flag = Arc::clone(&interrupted);
+        // A second handler in one process would fail to be set; that is no loss.
+        let _ = ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed));
+    }
+    // Key the transmitter with the stream open, so that only the rig's answer
+    // and the lead time stand between the key and the first sample. Declared
+    // after `out`: any way out of here lets go of the key first.
+    let hold = if keying.keys() {
+        let ptt = Arc::new(decdsss_rig::Ptt::open(keying.clone()));
+        let hold = ptt.hold().map_err(anyhow::Error::msg)?;
+        println!("transmitter keyed ({})", keying.summary());
+        Some(hold)
+    } else {
+        None
+    };
     println!("playing on {} ({fmt})", out.device_name());
     let ch = fmt.channels.max(1);
     for block in audio.chunks(rate as usize / 10) {
+        if interrupted.load(Ordering::Relaxed) {
+            bail!("interrupted: the transmitter is let go");
+        }
         let mut frames = Vec::with_capacity(block.len() * ch);
         for &v in block {
             frames.extend(std::iter::repeat_n(v, ch));
@@ -1132,6 +1249,10 @@ fn play_audio(audio: &[f32], rate: u32, dev: &str) -> Result<()> {
         out.write_blocking(&frames, std::time::Duration::from_secs(5))?;
     }
     out.drain(std::time::Duration::from_secs(10));
+    if let Some(h) = hold {
+        h.finish();
+        println!("transmitter let go");
+    }
     println!("done");
     Ok(())
 }
@@ -1262,4 +1383,56 @@ fn sweep(
         x += step;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> KeyOpts {
+        KeyOpts {
+            ptt: None,
+            rig: None,
+            rig_port: None,
+            rig_baud: None,
+            ptt_port: None,
+        }
+    }
+
+    #[test]
+    fn with_nothing_set_the_radio_is_not_keyed() {
+        let c = apply_key_opts(decdsss_rig::Config::default(), &opts()).unwrap();
+        assert!(!c.keys());
+    }
+
+    #[test]
+    fn the_command_line_changes_what_the_dialog_had() {
+        let c = apply_key_opts(
+            decdsss_rig::Config::default(),
+            &KeyOpts {
+                ptt: Some("cat".into()),
+                rig: Some("IC-7300".into()),
+                rig_port: Some("COM9".into()),
+                rig_baud: Some(19_200),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert!(c.cat && c.keys());
+        assert_eq!(
+            (c.rig.model, c.rig.port.as_str(), c.rig.baud),
+            (decdsss_rig::Model::Ic7300, "COM9", 19_200)
+        );
+        // A line with no port to be on is refused before anything is opened.
+        for ptt in ["rts", "nonsense"] {
+            let e = apply_key_opts(
+                decdsss_rig::Config::default(),
+                &KeyOpts {
+                    ptt: Some(ptt.into()),
+                    ..opts()
+                },
+            );
+            assert!(e.is_err(), "{ptt}");
+        }
+    }
 }

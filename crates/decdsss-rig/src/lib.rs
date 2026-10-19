@@ -21,7 +21,7 @@ pub mod testing;
 mod yaesu;
 
 pub use link::{Line, Link, Port, RIGCTLD_PORT, Serial, Tcp, ports, with_default_port};
-pub use ptt::{Config, Hold, KEY_WAIT, Links, Method, Phase, Ptt, Status, UNKEY_WAIT};
+pub use ptt::{Config, Hold, KEY_WAIT, Links, MAX_DELAY_MS, Method, Phase, Ptt, Status, UNKEY_WAIT};
 
 /// A rig this crate can key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

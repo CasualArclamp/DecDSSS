@@ -12,6 +12,7 @@ cargo check --workspace --all-targets   # fast feedback
 cargo test --workspace                  # unit tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p decdsss-cli -- modes       # the mode ladder and its rates
+cargo run -p decdsss-cli -- tx f.bin --call VK2ABC --play "CABLE-A Input" --ptt vox   # --ptt vox: tx --play otherwise keys the radio as the GUI's CAT / PTT dialog is set
 cargo run -p decdsss-cli -- rig         # serial ports; add --model ft710 --port COM7 to check a rig answers (never keys)
 cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --picture --air 120 -o pic.wav   # a picture sized to the air time
 cargo run --release -p decdsss-cli -- tx speech.wav --call VK2ABC --voice -o voice.wav   # Codec2 speech
