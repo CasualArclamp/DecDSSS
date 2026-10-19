@@ -7,7 +7,7 @@ use crate::prefs::Prefs;
 use crate::voice::{Play, VoicePanel};
 use decdsss_audio::wav;
 use decdsss_codec2::Mode as Codec;
-use decdsss_core::{Mode, Profile};
+use decdsss_core::{Family, Mode, Profile};
 use decdsss_image::Source;
 use decdsss_link::voice::{default_codec, render_speech};
 use decdsss_link::{
@@ -57,6 +57,25 @@ struct PicJob {
 fn is_picture(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| PICTURE_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
+/// The `family` mode nearest `from` in information rate, for switching family
+/// without jumping along the ladder; the family's fastest mode without a `from`.
+/// `snr_offset_db` is 10·log10(Rb / B) with B fixed by the profile, so the nearest
+/// offset is the nearest rate on a log scale.
+fn nearest_mode(family: Family, from: Option<Mode>, profile: Profile) -> Option<Mode> {
+    let mut modes = Mode::all().into_iter().filter(|m| m.family == family);
+    let Some(from) = from else {
+        return modes.next();
+    };
+    let target = from.snr_offset_db(profile);
+    // `total_cmp` orders f64s (NaN included), which `min_by` needs: plain f64
+    // is only `PartialOrd`.
+    modes.min_by(|a, b| {
+        (a.snr_offset_db(profile) - target)
+            .abs()
+            .total_cmp(&(b.snr_offset_db(profile) - target).abs())
+    })
 }
 
 fn picture_name(path: &Path) -> String {
@@ -758,11 +777,39 @@ impl TxPanel {
                 }
             });
             ui.end_row();
+            // The family is read from the chosen mode rather than kept beside it,
+            // so the two cannot disagree (a voice mode or a saved setting moves both).
+            let current = Mode::from_name(&self.mode);
+            let family = current.map_or(Family::DsPsk, |m| m.family);
+            ui.label("Spreading");
+            ui.horizontal(|ui| {
+                for (f, label, tip) in [
+                    (
+                        Family::DsPsk,
+                        "DS-PSK",
+                        "Direct sequence: a QPSK symbol held for SF chips, coherent, pilot-aided",
+                    ),
+                    (
+                        Family::Csk,
+                        "CSK",
+                        "Code-shift keying: one of L Walsh codes of L chips, log2(L) bits a \
+                         symbol, noncoherent",
+                    ),
+                ] {
+                    if ui.radio(family == f, label).on_hover_text(tip).clicked()
+                        && family != f
+                        && let Some(m) = nearest_mode(f, current, self.profile)
+                    {
+                        self.mode = m.name();
+                    }
+                }
+            });
+            ui.end_row();
             ui.label("Mode");
             egui::ComboBox::from_id_salt("txmode")
                 .selected_text(&self.mode)
                 .show_ui(ui, |ui| {
-                    for m in Mode::all() {
+                    for m in Mode::all().into_iter().filter(|m| m.family == family) {
                         ui.selectable_value(
                             &mut self.mode,
                             m.name(),
@@ -902,5 +949,35 @@ impl TxPanel {
         if !self.note.is_empty() {
             ui.label(RichText::new(&self.note).size(11.0));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn m(s: &str) -> Mode {
+        Mode::from_name(s).unwrap()
+    }
+
+    #[test]
+    fn family_switch_keeps_the_rate() {
+        let p = Profile::W3000;
+        // 32.8 bit/s: CSK's nearest is csk256-1/2 at 37.5 (0.6 dB away), and
+        // back again lands where it started.
+        assert_eq!(
+            nearest_mode(Family::Csk, Some(m("ds64-1/2")), p),
+            Some(m("csk256-1/2"))
+        );
+        assert_eq!(
+            nearest_mode(Family::DsPsk, Some(m("csk256-1/2")), p),
+            Some(m("ds64-1/2"))
+        );
+        // Faster than any CSK mode: the fastest CSK mode.
+        assert_eq!(
+            nearest_mode(Family::Csk, Some(m("ds4-3/4")), p),
+            Some(m("csk32-3/4"))
+        );
+        assert_eq!(nearest_mode(Family::Csk, None, p), Some(m("csk32-3/4")));
     }
 }

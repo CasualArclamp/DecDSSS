@@ -518,16 +518,13 @@ seeds at both 9 dB and 12 dB in-band SNR. In `crates/decdsss-link/tests/picture.
 a 96×72 picture goes through the same chain in the test suite and is drawn after
 every block on the way (the front and the scans grow monotonically).
 
-**A limit found:** the same photograph at DS4 ¾ (147×222, 5319 bytes, two
-segments) through moderate fading was delivered on four of five seeds at 25 dB
-(seeds 1, 2, 4, 5); on the fifth the whole second segment (28 of 68 frames) was
-lost at every SNR from 6 to 25 dB, so it is not noise. The likely cause (not
-confirmed) is the delay spread of the moderate channel, 1 ms or about 2 chips
-at 1920 chip/s, half a DS4 symbol: the rake cannot clear the interference between
-symbols, which puts a floor under the symbol SNR that more signal does not lift
-(the blocks of the lost segment report 0–10 dB symbol SNR at 25 dB in-band). Use
-SF 8 or more, or CSK, on skywave until this is looked into (an equaliser or a
-decision-feedback step would be the cure if the fast modes matter on HF).
+**A limit found (see Voice, "The DS4 floor"):** the same photograph at DS4 3/4
+(147×222, 5319 bytes, two segments) through moderate fading was delivered on four
+of five seeds at 25 dB (seeds 1, 2, 4, 5); on the fifth the whole second segment
+(28 of 68 frames) was lost at every SNR from 6 to 25 dB, so it is not noise. The
+delay-spread explanation I first gave for it (self-interference at SF 4) did not
+hold up; what was found, and the small change made, is under Voice. That
+transmission was not re-run after the change.
 
 ### Voice
 
@@ -542,17 +539,27 @@ On the Watterson channels (12 and 20 dB in-band SNR, six seeds each): *good*
 frames, at both SNRs).
 
 **The DS4 floor.** The loss at high SNR is not noise. Over 64 transmissions at
-24 and at 30 dB Eb/N0 on the moderate channel (`decdsss sweep … --trials 64`),
-DS4 ⅔ lost 0.39 % of its frames (one block, at either SNR), DS4 ¾ 0.59 %, and DS8 ½
-nothing. The payload's symbol SNR on that channel is 2–12 dB even where the
-header reads 22–26 dB: two comparable paths 2 chips apart at spreading factor 4
-interfere with each other (about 1/SF of a path's power lands in the other's
-despreading window as noise, so the symbol SNR cannot pass roughly SF/ρ, 6–9 dB
-for two paths of power ratio ρ ≈ 0.5–1), and rate-⅔ LDPC needs about 4 dB. More
-power does not lift it; a chip-level equaliser or multipath interference
-cancellation would. That is next, because voice needs the fast modes.
-(`cargo test --release -p decdsss-phy debug_ds4_floor -- --ignored --nocapture`
-finds failing seeds.)
+24 and at 30 dB Eb/N0 on the moderate channel (`decdsss sweep ... --trials 64`),
+DS4 2/3 lost 0.39 % of its frames (one block, at either SNR), DS4 3/4 0.59 %, and
+DS8 1/2 nothing. My first explanation, interference between two paths 2 chips
+apart at spreading factor 4, did not survive a closer look: a hunt with a
+genie start (true timing, carrier and paths given, so the preamble and header are
+out of it; `cargo test --release -p decdsss-phy debug_genie_floor -- --ignored
+--nocapture`, with `DEBUG_TRIAL`, `DEBUG_NONOISE`, `DEBUG_FADE`, `DEBUG_ERRS` and
+`DEBUG_FREEZE=refresh|adopt|ghosts|all` to look into one) loses 2 frames in 960 at
+30 dB, with the same block failing without any noise at all. The failing block
+had lost its second finger (two paths, both faded for about a second, one block
+after another), and freezing the post-block refresh (the refinement of timing,
+clock and carrier from the decoded chips, and the re-pick of the fingers) makes the
+loss go away, so the refresh and the fingers are implicated, not the SNR.
+*Change made:* a path that drops out of the measured profile stays a finger for
+three blocks (`set_fingers`, a ghost at 0.3 of the main path), as a path in a fade
+comes back. Measured over the same 64 transmissions (moderate fading, offset 5 Hz,
+10 ppm): DS4 2/3 at 30 dB 0.39 % to 0, at 14 dB Eb/N0 0.59 % to 0.20 %, at 10 dB
+8.59 % to 8.20 %; DS8 1/2 at 10 dB 1.95 % to 0.78 %, at 6 dB 31.3 % to 30.1 %;
+CSK64 and the high-SNR points unchanged at 0. The genie hunt still loses its two
+frames, so the cause is not fully understood: the refined track after a fade is the
+next thing to look at.
 
 ### Not yet measured
 

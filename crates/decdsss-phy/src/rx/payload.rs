@@ -74,6 +74,10 @@ const FREQ_COHERENCE: f32 = 0.4;
 const FREQ_MAX_STEP: f64 = 0.3;
 /// The carrier is kept within this many Hz of where the header found it.
 const FREQ_MAX_EXCURSION: f64 = 10.0;
+/// A path that has dropped out of the measured profile (a fade, as on HF) stays a
+/// finger for this many blocks, so it is there when it comes back instead of
+/// being lost to the block that follows.
+const GHOST_BLOCKS: u8 = 3;
 /// Samples ahead of a symbol the buffer must hold: the longest finger lag the
 /// profile grid allows, the late arm and the interpolation.
 const AHEAD_CHIPS: f64 = 24.0;
@@ -84,6 +88,14 @@ pub const LIVE_POINTS: usize = 384;
 pub const LIVE_STRIP: usize = 192;
 /// Rows of the correlator-bank display.
 pub const LIVE_ROWS: usize = 40;
+
+/// Test-only switch (DEBUG_FREEZE): keep the fingers and reference as the start
+/// gave them, to tell finger management from the channel itself.
+fn debug_frozen(what: &str) -> bool {
+    cfg!(test)
+        && std::env::var("DEBUG_FREEZE")
+            .is_ok_and(|v| v == "all" || v.split(',').any(|w| w == what))
+}
 
 /// The carrier correction from `acc`, a sum of successive-measurement
 /// products (`norm` the sum of their magnitudes) taken `interval_s` apart;
@@ -297,6 +309,9 @@ pub struct PayloadRx {
     scr: Scrambler,
     pub track: Track,
     pub fingers: Vec<Finger>,
+    /// Blocks each finger has gone unmeasured (0: measured), parallel to
+    /// `fingers`.
+    finger_age: Vec<u8>,
     /// The carrier the header found; the loop stays near it.
     f0: f64,
     chip0: usize,
@@ -323,6 +338,7 @@ impl PayloadRx {
             header,
             track: h.track,
             fingers: h.fingers.clone(),
+            finger_age: Vec::new(),
             f0: h.track.freq,
             chip0: 0,
             next_block: 0,
@@ -513,7 +529,7 @@ impl PayloadRx {
         self.live.soft = coded[coded.len() - n..].to_vec();
         let (frames, iterations) = self.decode(llrs);
         let first_frame = usize::from(self.header.frame0) + self.next_block * self.layout.depth;
-        if frames.iter().all(Option::is_some) {
+        if frames.iter().all(Option::is_some) && !debug_frozen("refresh") {
             self.refresh_fingers(buf, &frames, block_start);
         }
         self.live.fingers = self.fingers.clone();
@@ -545,17 +561,44 @@ impl PayloadRx {
                 super::refine::fingers_from_profile(&p)
             }
         };
-        match refined {
-            Some(r) => {
-                self.track.pos = r.pos_end + shift * r.step;
-                self.track.step = r.step;
-                self.track.freq = r.freq;
-                self.track.phase = 0.0;
-                self.dll.reset();
+        if !debug_frozen("track") {
+            match refined {
+                Some(r) => {
+                    self.track.pos = r.pos_end + shift * r.step;
+                    self.track.step = r.step;
+                    self.track.freq = r.freq;
+                    self.track.phase = 0.0;
+                    self.dll.reset();
+                }
+                None => self.track.pos += shift * self.track.step,
             }
-            None => self.track.pos += shift * self.track.step,
         }
-        self.fingers = fingers;
+        if !debug_frozen("fingers") {
+            self.set_fingers(fingers, shift);
+        }
+    }
+
+    /// Takes the fingers just measured (lags relative to the reference after it
+    /// has moved `shift` chips), and keeps a finger that was there before but is
+    /// not now (its lag moved to the new reference) for a few blocks, as long as
+    /// there is a slot: a path in a fade is likely to come back, and the rake
+    /// cannot use it if it was dropped.
+    fn set_fingers(&mut self, measured: Vec<Finger>, shift: f64) {
+        let mut next = measured;
+        let mut ages = vec![0u8; next.len()];
+        for (i, old) in self.fingers.iter().enumerate() {
+            let lag = old.lag - shift;
+            if next.iter().any(|f| (f.lag - lag).abs() < 0.6) {
+                continue;
+            }
+            let age = self.finger_age.get(i).copied().unwrap_or(0) + 1;
+            if age <= GHOST_BLOCKS && next.len() < SLOTS && !debug_frozen("ghosts") {
+                next.push(Finger { lag, power: 0.3 });
+                ages.push(age);
+            }
+        }
+        self.fingers = next;
+        self.finger_age = ages;
     }
 
     /// Re-places the reference and the fingers from a measured profile, if the
@@ -570,7 +613,7 @@ impl PayloadRx {
             return None;
         }
         let (fingers, shift) = super::refine::fingers_from_profile(profile);
-        self.fingers = fingers;
+        self.set_fingers(fingers, shift);
         self.live.fingers = self.fingers.clone();
         Some(shift)
     }
@@ -992,7 +1035,10 @@ impl PayloadRx {
             wk.t.advance(l);
             if (s + 1 - wk.s_lo) >= chunk && s + 1 < wk.s_count {
                 let profile = self.profile_ds(buf, &wk.tc, &wk.scr, wk.s_lo, s + 1);
-                if let Some(shift) = self.adopt_track(&profile) {
+                if let Some(shift) = self
+                    .adopt_track(&profile)
+                    .filter(|_| !debug_frozen("adopt"))
+                {
                     let (step0, chips) = (wk.step0, ((s + 1 - wk.s_lo) * l) as f64);
                     self.apply_shift(&mut wk.t, shift, chips, step0);
                 }
@@ -1180,6 +1226,133 @@ mod tests {
             }
         });
         results.into_inner().unwrap()
+    }
+
+    fn seg_block_seconds(seg: &crate::tx::Segment) -> f64 {
+        Layout::new(seg.header.profile, seg.header.mode, seg.header.depth).seconds()
+    }
+
+    /// Hunts transmissions that lose frames at a high Eb/N0 with a genie start:
+    /// fading and the demodulator, with the preamble and header out of it.
+    #[test]
+    #[ignore]
+    fn debug_genie_floor() {
+        let mode = std::env::var("DEBUG_MODE").unwrap_or_else(|_| "ds4-2/3".into());
+        let profile = Profile::W2400;
+        let m = decdsss_core::Mode::from_name(&mode).unwrap();
+        let (mut lost, mut total, mut shown) = (0, 0, 0);
+        let only: Option<usize> = std::env::var("DEBUG_TRIAL")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        for trial in 0..120usize {
+            if only.is_some_and(|t| t != trial) {
+                continue;
+            }
+            let seg = segment(profile, &mode, 2, 4);
+            let mut ch = channel(profile, 30.0 + m.snr_offset_db(profile));
+            if std::env::var("DEBUG_NONOISE").is_ok() {
+                ch.snr_db = None;
+            }
+            ch.seed = 9000 + trial as u64;
+            ch.fading = Some(Watterson::MODERATE);
+            ch.offset_hz = -10.0 + (trial % 7) as f64 * 3.0;
+            ch.clock_ppm = -30.0 + (trial % 5) as f64 * 15.0;
+            let audio = through(&seg, &ch);
+            if only.is_some() && std::env::var("DEBUG_FADE").is_ok() {
+                // The channel's own fading, regenerated from its seed: total path
+                // power every 0.25 s, with the block boundaries.
+                use decdsss_dsp::rng::Rng;
+                let n = audio.len() as f64 / (1.0 + ch.clock_ppm * 1e-6);
+                let n = n as usize;
+                let w = Watterson::MODERATE;
+                let mut rng = Rng::new(ch.seed);
+                let g0 = decdsss_chan::tap_process(n, 48_000.0, w.spread_hz, &mut rng);
+                let g1 = decdsss_chan::tap_process(n, 48_000.0, w.spread_hz, &mut rng);
+                let t0 = 1.0 + crate::tx::lead_chips(profile) as f64 / 1920.0;
+                let blk = seg_block_seconds(&seg);
+                let mut t = t0 - 0.5;
+                while t < t0 + 4.0 * blk {
+                    let i = (t * 48_000.0) as usize;
+                    let (a, b) = (g0[i].norm_sqr(), g1[i].norm_sqr());
+                    let tot = 0.5 * (a + b);
+                    println!(
+                        "t {:6.2} block {:5.2}  path0 {:6.1} dB  path1 {:6.1} dB  total {:6.1} dB",
+                        t,
+                        (t - t0) / blk,
+                        10.0 * a.max(1e-9).log10(),
+                        10.0 * b.max(1e-9).log10(),
+                        10.0 * tot.max(1e-9).log10()
+                    );
+                    t += 0.25;
+                }
+            }
+            let (mut rx, buf) = genie(&seg, &ch, &audio);
+            let t0 = rx.track;
+            let block_chips =
+                Layout::new(seg.header.profile, seg.header.mode, seg.header.depth).chips() as f64;
+            let mut line = String::new();
+            let mut bad = 0;
+            while let Some(r) = rx.step(&buf) {
+                let ok = r
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, f)| f.as_ref() == Some(&seg.frames[r.first_frame + i]))
+                    .count();
+                if only.is_some() && std::env::var("DEBUG_ERRS").is_ok() {
+                    let layout = Layout::new(seg.header.profile, seg.header.mode, seg.header.depth);
+                    let from = r.first_frame - usize::from(seg.header.frame0);
+                    let bits =
+                        crate::tx::block_bits(&layout, &seg.frames[from..from + layout.depth]);
+                    let llr = &rx.last_llrs;
+                    let n = llr.len().min(bits.len());
+                    let wrong: Vec<bool> =
+                        (0..n).map(|j| (llr[j] < 0.0) != (bits[j] == 1)).collect();
+                    let flip = wrong.iter().filter(|w| **w).count() > n / 2;
+                    let slices = 12;
+                    let mut row = String::new();
+                    for q in 0..slices {
+                        let (a, b) = (q * n / slices, (q + 1) * n / slices);
+                        let e = (a..b).filter(|&j| wrong[j] != flip).count();
+                        let mag = llr[a..b].iter().map(|v| v.abs()).sum::<f32>() / (b - a) as f32;
+                        row += &format!(" {:3}%/{:5.1}", 100 * e / (b - a), mag);
+                    }
+                    println!(
+                        "  block {} bit errors per twelfth (err%/mean|llr|):{row}",
+                        r.index
+                    );
+                }
+                if only.is_some() {
+                    // How far the refined track is from the truth the genie started with.
+                    let want = t0.pos + (r.index + 1) as f64 * block_chips * t0.step;
+                    println!(
+                        "  after block {}: position {:+.2} chips, clock {:+.0} ppm, carrier {:+.2} Hz off",
+                        r.index,
+                        (rx.track.pos - want) / t0.step,
+                        (rx.track.step / t0.step - 1.0) * 1e6,
+                        rx.track.freq - ch.offset_hz
+                    );
+                }
+                total += r.frames.len();
+                lost += r.frames.len() - ok;
+                bad += r.frames.len() - ok;
+                line += &format!(
+                    " b{}:{}/{} fingers {:?}",
+                    r.index,
+                    ok,
+                    r.frames.len(),
+                    r.fingers
+                        .iter()
+                        .map(|f| (f.lag * 100.0).round() / 100.0)
+                        .collect::<Vec<_>>()
+                );
+            }
+            if bad > 0 && shown < 6 {
+                println!("trial {trial} seed {}:{line}", ch.seed);
+                shown += 1;
+            }
+        }
+        println!("{mode}: {lost} of {total} frames lost");
     }
 
     /// Frame error rate against Eb/N0 for every mode; run with
