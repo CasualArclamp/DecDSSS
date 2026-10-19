@@ -526,13 +526,40 @@ mod tests {
     #[test]
     #[ignore]
     fn pick_seed() {
-        let targets: [(&str, usize, usize, usize, Vec<usize>, f64, usize); 4] = [
-            ("payload 1/2", 48, 12, 24, weights(12, 12), 2.0, 800),
-            ("payload 2/3", 48, 8, 24, weights(16, 8), 2.6, 800),
-            ("payload 3/4", 48, 6, 24, weights(18, 6), 3.2, 1500),
-            ("header", 16, 8, 16, header_weights(8, 8), 2.6, 3000),
+        struct Target {
+            name: &'static str,
+            z: usize,
+            mb: usize,
+            nb: usize,
+            w: Vec<usize>,
+            ebn0: f64,
+            frames: usize,
+        }
+        let t = |name, z, mb, nb, w, ebn0, frames| Target {
+            name,
+            z,
+            mb,
+            nb,
+            w,
+            ebn0,
+            frames,
+        };
+        let targets = [
+            t("payload 1/2", 48, 12, 24, weights(12, 12), 2.0, 800),
+            t("payload 2/3", 48, 8, 24, weights(16, 8), 2.6, 800),
+            t("payload 3/4", 48, 6, 24, weights(18, 6), 3.2, 1500),
+            t("header", 16, 8, 16, header_weights(8, 8), 2.6, 3000),
         ];
-        for (name, z, mb, nb, w, ebn0, frames) in targets {
+        for Target {
+            name,
+            z,
+            mb,
+            nb,
+            w,
+            ebn0,
+            frames,
+        } in targets
+        {
             let mut res: Vec<(usize, u64)> = (0..40u64)
                 .map(|i| {
                     let seed = 0x100 * (i + 1) + 0x11;
