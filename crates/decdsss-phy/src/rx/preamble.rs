@@ -503,6 +503,13 @@ mod tests {
 /// raised-cosine pulse of the chip shaping (roll-off 0.25, the root-raised
 /// cosine at both ends), squared.
 pub fn pulse_power(t: f64) -> f64 {
+    pulse(t).powi(2)
+}
+
+/// The raised-cosine pulse itself (amplitude, 1 at `t` = 0, zero at the other
+/// whole chips): what one path puts into the matched filter's output `t`
+/// chips from its own instant.
+pub fn pulse(t: f64) -> f64 {
     use decdsss_core::profile::ROLLOFF;
     let x = t.abs();
     let sinc = if x < 1e-9 {
@@ -511,12 +518,11 @@ pub fn pulse_power(t: f64) -> f64 {
         (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
     };
     let den = 1.0 - (2.0 * ROLLOFF * x).powi(2);
-    let r = if den.abs() < 1e-6 {
+    if den.abs() < 1e-6 {
         // The removable singularity at 1/(2·roll-off).
         let y = 1.0 / (2.0 * ROLLOFF);
         std::f64::consts::FRAC_PI_4 * (std::f64::consts::PI * y).sin() / (std::f64::consts::PI * y)
     } else {
         sinc * (std::f64::consts::PI * ROLLOFF * x).cos() / den
-    };
-    r * r
+    }
 }

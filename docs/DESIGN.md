@@ -297,7 +297,24 @@ of ±100 and ±300 ppm change nothing at 4 dB.
    At the end of the block: DS-PSK combines with smoothed, interpolated pilot
    gains shrunk by power subtraction where a finger is not clearly above its
    estimation noise; CSK sums a log-Bessel metric over fingers; then
-   de-interleave and LDPC. A block whose codewords all decode is re-modulated and
+   de-interleave and LDPC. DS-PSK is combined twice: by a G-RAKE first (below),
+   and by the rake for any codeword the G-RAKE's LLRs do not decode.
+
+**G-RAKE** (`rx/grake.rs`; Bottomley, Ottosson and Wang, IEEE JSAC 2000, the
+parametric form). The symbols are despread again on a half-chip grid reaching
+three chips either side of each finger (at most 40 delays) and combined with
+w = Q⁻¹p₀, where p₀ is the paths' composite response on the grid and Q the
+neighbouring chips' share of it plus the matched filter's noise. Followed by
+despreading this is the chip-level LMMSE equaliser. The paths come from the
+smoothed pilot gains by deconvolving the pulse overlap between fingers, so the
+weights follow a fade pilot by pilot as the rake's do; the noise is the main
+finger's pilot-gain scatter less the model's own inter-chip share. The QPSK
+LLRs are then exactly 2√2·L·Re(wᴴy). *Derived* (tests in `grake.rs`): with two
+paths a whole chip apart the rake's chip SIR stops at
+(|a₀|²+|a₁|²)²/(2|a₀|²|a₁|²), 3 dB for equal paths, at any SNR; the G-RAKE
+reaches 10.7 dB there (equal paths leave a null in the band) and 27.9 dB with the
+second path at half amplitude, at 30 dB. What it does on the simulator is under
+Verification: nothing measurable yet. A block whose codewords all decode is re-modulated and
    the refinement above runs on it, so the clock and carrier are re-learned
    every block.
 
@@ -831,6 +848,33 @@ comes back. Measured over the same 64 transmissions (moderate fading, offset 5 H
 CSK64 and the high-SNR points unchanged at 0. The genie hunt still loses its two
 frames, so the cause is not fully understood: the refined track after a fade is the
 next thing to look at.
+
+### G-RAKE against the rake (2026-10-19)
+
+One build, the G-RAKE switched off by `DECDSSS_RAKE_ONLY` for the comparison,
+`decdsss sweep --trials 128 --offset 5 --clock-ppm 10`, depth 4, 2.4 kHz, Eb/N0
+6 to 30 dB in 4 dB steps: DS4 3/4, 2/3, 1/2 and DS8 1/2 on moderate and on good
+fading, and DS4 3/4 and DS8 1/2 on AWGN. Frame loss was the same to the frame at
+every point but three, where the G-RAKE lost one or two frames fewer (DS4 3/4:
+good 18 dB 7.81 % to 7.32 %, moderate 6 dB 89.06 % to 88.96 %, AWGN 4 dB
+34.38 % to 33.79 %). The receiver took 1.6 % longer.
+
+Why so little: the Watterson paths are 0.96 and 1.92 chips apart, near whole
+chips, and CLEAN puts the fingers on them, so the rake's decisions are already
+nearly clean where the frames are lost (at 30 dB on moderate fading 0 to 5 of
+2310 hard bits differ between the two). The loss at high SNR is whole
+transmissions: 3.12 % of DS4 3/4 on moderate fading is four of 128 transmissions,
+headers decoded. That is the receiver losing the signal, not combining badly.
+The G-RAKE is kept on: it can only add frames, and it is what a faster mode (SF 2
+or 1) would need, where the rake's 3 dB ceiling is the whole symbol SINR.
+
+Off air (40 m, VK4SUS heard on the ironstonerange WebSDR, nine recordings), an
+offline study against the known preamble (a least-squares channel fit in 30 ms
+windows, held-out chips) put the in-band SNR at 1 to 5.5 dB: the WebSDR's AGC
+and SSB filter make the band look 25 dB above a floor that is outside the
+filter. There a chip-level LMMSE gained 0.7 dB of chip SINR over a rake on
+average (0 to 1.2 dB a recording), and the receiver decoded the same frames with
+and without the G-RAKE.
 
 ### Not yet measured
 

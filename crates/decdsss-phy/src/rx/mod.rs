@@ -11,6 +11,7 @@
 pub mod acq;
 pub mod despread;
 pub mod frontend;
+pub mod grake;
 pub mod header;
 pub mod payload;
 pub mod preamble;

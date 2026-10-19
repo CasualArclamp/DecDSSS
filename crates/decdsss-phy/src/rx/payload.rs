@@ -5,9 +5,10 @@
 //! arrive. It walks the symbols once, despreading each rake finger and keeping
 //! what the second needs: for CSK the Walsh correlations, for DS-PSK the
 //! despread symbols and the pilot gains. At the end of the block the second
-//! turns that into bit LLRs (a noncoherent Bessel metric for CSK, pilot-aided
-//! maximal-ratio combining for DS-PSK), de-interleaves, and LDPC-decodes each
-//! codeword. While it works it publishes [`Live`], the data behind the
+//! turns that into bit LLRs (a noncoherent Bessel metric for CSK; for DS-PSK a
+//! G-RAKE, MMSE combining on a half-chip grid of delays, with pilot-aided
+//! maximal-ratio combining on the fingers as the fallback for any codeword it
+//! does not decode), de-interleaves, and LDPC-decodes each codeword. While it works it publishes [`Live`], the data behind the
 //! scopes: constellation, correlator bank, early/prompt/late, strips.
 //!
 //! Timing is held by an early/late loop driven by the sum over all fingers
@@ -20,6 +21,7 @@
 
 use super::despread::{Track, csk_bit_llrs, despread, ln_i0, sum, walsh_correlate, walsh_one};
 use super::frontend::Buf;
+use super::grake;
 use super::header::{Finger, HeaderResult};
 use super::preamble::DelayProfile;
 use crate::codes::{Scrambler, own_code};
@@ -31,6 +33,7 @@ use decdsss_core::mode::PILOT_INTERVAL;
 use decdsss_dsp::Iq;
 use decdsss_fec::interleave::Interleaver;
 use decdsss_fec::ldpc::Decoder;
+use num_complex::Complex64;
 use std::f64::consts::TAU;
 
 /// Rake fingers kept (the header's pick is limited the same way).
@@ -96,6 +99,15 @@ fn debug_frozen(what: &str) -> bool {
     cfg!(test)
         && std::env::var("DEBUG_FREEZE")
             .is_ok_and(|v| v == "all" || v.split(',').any(|w| w == what))
+}
+
+/// Measurement switch (environment `DECDSSS_RAKE_ONLY`, any value): DS-PSK
+/// blocks are combined by the rake alone, as before the G-RAKE, so the two can
+/// be compared in one build (`decdsss sweep`). Read once.
+fn rake_only() -> bool {
+    // OnceLock: a value computed on first use and then shared, thread-safe.
+    static RAKE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RAKE_ONLY.get_or_init(|| std::env::var_os("DECDSSS_RAKE_ONLY").is_some())
 }
 
 /// The carrier correction from `acc`, a sum of successive-measurement
@@ -292,6 +304,13 @@ struct DsWork {
     u: Vec<Iq>,
     ue: Vec<Iq>,
     ul: Vec<Iq>,
+    /// The track each symbol was despread on, and the chips the fingers had
+    /// been moved by then (`shifted` at the time): the G-RAKE despreads the
+    /// block again from these at the end.
+    ts: Vec<(Track, f64)>,
+    /// Chips the reference has moved inside the block (the fingers moved back
+    /// as far, so a path stays where it is).
+    shifted: f64,
     /// The previous displayed symbol, for the differential plot.
     prev_z: Option<Iq>,
     /// Running mean of the squared distance of a displayed symbol from its
@@ -591,6 +610,8 @@ impl PayloadRx {
                     u: blank(),
                     ue: blank(),
                     ul: blank(),
+                    ts: Vec::with_capacity(s_count),
+                    shifted: 0.0,
                     prev_z: None,
                     err2: 0.5,
                 })));
@@ -620,7 +641,16 @@ impl PayloadRx {
         (frames, iters)
     }
 
-    fn finish(&mut self, buf: &Buf, llrs: &[f32], snr_db: f64, block_start: Track) -> BlockResult {
+    /// Decodes a block's LLRs and finishes it. A codeword `llrs` does not decode
+    /// is tried again from `fallback` (the rake's, behind the G-RAKE's).
+    fn finish(
+        &mut self,
+        buf: &Buf,
+        llrs: &[f32],
+        fallback: Option<&[f32]>,
+        snr_db: f64,
+        block_start: Track,
+    ) -> BlockResult {
         #[cfg(test)]
         {
             self.last_llrs = llrs.to_vec();
@@ -630,7 +660,16 @@ impl PayloadRx {
         let coded =
             Interleaver::new(self.layout.coded_bits()).invert(&llrs[..self.layout.coded_bits()]);
         self.live.soft = coded[coded.len() - n..].to_vec();
-        let (frames, iterations) = self.decode(llrs);
+        let (mut frames, mut iterations) = self.decode(llrs);
+        if let Some(fb) = fallback.filter(|_| frames.iter().any(Option::is_none)) {
+            let (frames2, iterations2) = self.decode(fb);
+            for (i, f2) in frames2.into_iter().enumerate() {
+                if frames[i].is_none() && f2.is_some() {
+                    frames[i] = f2;
+                    iterations[i] = iterations2[i];
+                }
+            }
+        }
         let first_frame = usize::from(self.header.frame0) + self.next_block * self.layout.depth;
         self.fresh = false;
         if frames.iter().all(Option::is_some) && !debug_frozen("refresh") {
@@ -1049,7 +1088,7 @@ impl PayloadRx {
             csk_bit_llrs(&metric, bits, &mut llrs);
         }
         let snr = 10.0 * (amp2[0] / sigma2[0].max(1e-30)).log10();
-        self.finish(buf, &llrs, snr, wk.start)
+        self.finish(buf, &llrs, None, snr, wk.start)
     }
 
     /// Processes DS-PSK symbols while the buffer holds them; true when the
@@ -1067,6 +1106,7 @@ impl PayloadRx {
                 return false;
             }
             let s = wk.s;
+            wk.ts.push((wk.t, wk.shifted));
             let sc = &wk.scr[s * l..(s + 1) * l];
             let (mut e_sum, mut l_sum, mut p_sum) = (0.0f64, 0.0f64, 0.0f64);
             for (fi, f) in self.fingers.iter().enumerate().take(SLOTS) {
@@ -1154,6 +1194,7 @@ impl PayloadRx {
                 {
                     let (step0, chips) = (wk.step0, ((s + 1 - wk.s_lo) * l) as f64);
                     self.apply_shift(&mut wk.t, shift, chips, step0);
+                    wk.shifted += shift;
                 }
                 wk.tc = wk.t;
                 wk.s_lo = s + 1;
@@ -1236,7 +1277,82 @@ impl PayloadRx {
             llrs.push(4.0 * z.re);
             llrs.push(4.0 * z.im);
         }
-        self.finish(buf, &llrs, snr, wk.start)
+        let var_g0 = if n_cnt > 0 { n_acc / n_cnt as f64 } else { f64::NAN };
+        let grake = if debug_frozen("grake") || rake_only() {
+            None
+        } else {
+            self.grake_llrs(buf, &wk, &hs, var_g0)
+        };
+        match grake {
+            Some(g) => self.finish(buf, &g, Some(&llrs), snr, wk.start),
+            None => self.finish(buf, &llrs, None, snr, wk.start),
+        }
+    }
+
+    /// The G-RAKE's LLRs for a DS-PSK block (see [`grake`]): at every pilot, the
+    /// paths from the smoothed gains and the weights on a half-chip grid around
+    /// the fingers; every data symbol despread on that grid along the track it
+    /// was first taken on, combined with the weights interpolated between its
+    /// pilots. `var_g0` is the impairment of one pilot gain at the main finger.
+    /// None when there is nothing to model.
+    fn grake_llrs(
+        &self,
+        buf: &Buf,
+        wk: &DsWork,
+        hs: &[[Iq; SLOTS]],
+        var_g0: f64,
+    ) -> Option<Vec<f32>> {
+        let l = usize::from(self.header.mode.spread);
+        let per = PILOT_INTERVAL as usize;
+        let nf = self.fingers.len().min(SLOTS);
+        if nf == 0 || !(var_g0.is_finite() && var_g0 > 0.0) || wk.ts.len() < wk.s_count {
+            return None;
+        }
+        let lags: Vec<f64> = self.fingers[..nf].iter().map(|f| f.lag).collect();
+        let grid = grake::grid(&lags);
+        let c64 = |z: Iq| Complex64::new(f64::from(z.re), f64::from(z.im));
+        let a: Vec<Vec<Complex64>> = hs
+            .iter()
+            .map(|h| grake::paths(&lags, &h[..nf].iter().map(|&z| c64(z)).collect::<Vec<_>>()))
+            .collect();
+        // The matched filter's noise per chip: a pilot gain at the main finger
+        // carries the neighbours' chips and the noise, over L chips. What the
+        // model says the neighbours are is taken off (not below a tenth, so an
+        // over-estimate of the paths cannot leave no noise at all).
+        let isi = a.iter().map(|a| grake::isi_power(lags[0], &lags, a)).sum::<f64>() / a.len() as f64;
+        let total = l as f64 * var_g0;
+        let sigma2 = (total - isi).max(0.1 * total);
+        // `collect` into Option<Vec<_>>: None as soon as one pilot's model is
+        // degenerate (then the rake decodes the block).
+        let w: Vec<Vec<Complex64>> = a
+            .iter()
+            .map(|a| grake::weights(&grid, &lags, a, sigma2).map(|(w, _)| w))
+            .collect::<Option<_>>()?;
+        let scale = 2.0 * std::f64::consts::SQRT_2 * l as f64;
+        let mut u = vec![Iq::new(0.0, 0.0); l];
+        let mut y = vec![Complex64::new(0.0, 0.0); grid.len()];
+        let mut llrs = Vec::with_capacity(self.layout.data_symbols() * 2);
+        for s in (0..wk.s_count).filter(|&s| !self.layout.is_pilot(s)) {
+            let (t, moved) = &wk.ts[s];
+            // The grid is on the fingers' lags at the end of the block; a symbol
+            // taken before the reference last moved sits that much later.
+            let back = wk.shifted - moved;
+            let sc = &wk.scr[s * l..(s + 1) * l];
+            for (yj, &d) in y.iter_mut().zip(&grid) {
+                despread(buf, t, sc, d + back, &mut u);
+                *yj = c64(sum(&u));
+            }
+            let (k, f) = (s / per, (s % per) as f64 / per as f64);
+            let z: Complex64 = w[k]
+                .iter()
+                .zip(&w[k + 1])
+                .zip(&y)
+                .map(|((w0, w1), y)| (w0 * (1.0 - f) + w1 * f).conj() * y)
+                .sum();
+            llrs.push((scale * z.re) as f32);
+            llrs.push((scale * z.im) as f32);
+        }
+        Some(llrs)
     }
 }
 
@@ -1466,6 +1582,78 @@ mod tests {
             }
         }
         println!("{mode}: {lost} of {total} frames lost");
+    }
+
+    /// A stretch of audio cut out of (negative) or silence put into (positive)
+    /// the middle of block 2, as a sound card that drops or repeats a buffer
+    /// does; which blocks decode after it, on a clean channel and on moderate
+    /// fading. `cargo test --release -p decdsss-phy sync_slip_curve -- --ignored
+    /// --nocapture`
+    #[test]
+    #[ignore]
+    fn sync_slip_curve() {
+        let profile = Profile::W2400;
+        for mode in ["ds4-2/3", "ds8-1/2", "csk64-1/2"] {
+            let m = decdsss_core::Mode::from_name(mode).unwrap();
+            let layout = Layout::new(profile, m, 2);
+            let nblocks = 6u16;
+            for fading in [None, Some(Watterson::MODERATE)] {
+                for ms in [-50.0f64, -20.0, -5.0, -1.0, 0.0, 1.0, 5.0, 20.0, 50.0] {
+                    let mut row = String::new();
+                    let mut ok_all = 0;
+                    for trial in 0..4u64 {
+                        let seg = segment(profile, mode, 2, nblocks);
+                        let ebn0 = if fading.is_some() { 20.0 } else { 10.0 };
+                        let mut ch = channel(profile, ebn0 + m.snr_offset_db(profile));
+                        ch.seed = 500 + trial;
+                        ch.fading = fading;
+                        ch.offset_hz = 3.0;
+                        ch.clock_ppm = 20.0;
+                        let mut audio = through(&seg, &ch);
+                        // Middle of block 2: the payload ends a second before the end.
+                        let end = audio.len() as f64 - FS;
+                        let at = end - (f64::from(nblocks) - 2.5) * layout.seconds() * FS;
+                        let at = at as usize;
+                        let n = (ms.abs() * 1e-3 * FS) as usize;
+                        if ms < 0.0 {
+                            audio.drain(at..at + n);
+                        } else {
+                            audio.splice(at..at, std::iter::repeat_n(0.0, n));
+                        }
+                        let Ok(run) = to_header(&audio, profile) else {
+                            row += " no header";
+                            continue;
+                        };
+                        let mut rx = PayloadRx::new(&run.header, run.fe.out_rate()).unwrap();
+                        let mut fe = crate::rx::frontend::Frontend::new(profile, FS);
+                        let mut rest = Vec::new();
+                        fe.push(&audio, &mut rest);
+                        let mut buf = crate::rx::frontend::Buf::default();
+                        buf.push(&rest);
+                        row.push(' ');
+                        while let Some(r) = rx.step(&buf) {
+                            let good = r
+                                .frames
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, f)| f.as_ref() == Some(&seg.frames[r.first_frame + i]))
+                                .count();
+                            ok_all += good;
+                            row.push(match good {
+                                0 => 'x',
+                                g if g == r.frames.len() => 'o',
+                                _ => '/',
+                            });
+                        }
+                    }
+                    println!(
+                        "{mode:10} {:8} {ms:+5.0} ms: {ok_all:3}/{:3}  {row}",
+                        if fading.is_some() { "moderate" } else { "awgn" },
+                        4 * usize::from(nblocks) * 2
+                    );
+                }
+            }
+        }
     }
 
     /// Frame error rate against Eb/N0 for every mode; run with
