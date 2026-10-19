@@ -22,7 +22,7 @@ use decdsss_fec::ldpc::Code;
 
 /// The header's CSK alphabet and symbol count: 256 chips a symbol, 8 bits each.
 pub const HEADER_CSK: usize = 256;
-pub const HEADER_SYMBOLS: usize = 256 / 8;
+pub const HEADER_SYMBOLS: usize = 512 / 8;
 
 /// The known value of the k-th pilot of a block: QPSK from an m-sequence.
 pub fn pilot_symbol(k: usize) -> Iq {
@@ -57,8 +57,8 @@ pub fn preamble_chips(profile: Profile) -> Vec<Iq> {
     v
 }
 
-/// Chips of the header: 128 information bits to the 256-bit header
-/// codeword, interleaved, 32 CSK256 symbols on the call code.
+/// Chips of the header: 128 information bits to the 512-bit header
+/// codeword (rate 1/4), interleaved, 64 CSK256 symbols on the call code.
 pub fn header_chips(h: &Header) -> Option<Vec<Iq>> {
     let info = h.pack()?;
     let cw = Code::header().encode(&info);
@@ -245,6 +245,11 @@ mod tests {
                 "{mode}"
             );
         }
+    }
+
+    #[test]
+    fn header_symbol_count_matches_the_code() {
+        assert_eq!(HEADER_SYMBOLS * 8, Code::header().n());
     }
 
     #[test]

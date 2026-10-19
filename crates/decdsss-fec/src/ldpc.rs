@@ -21,12 +21,16 @@ use std::sync::OnceLock;
 /// Design seeds, picked by `tests::pick_seed` as the best of 40 on simulated
 /// frame errors.
 const PAYLOAD_SEEDS: [u64; 3] = [2321, 5393, 1041];
-const HEADER_SEED: u64 = 1809;
+const HEADER_SEED: u64 = 48445;
 
 /// A code: its base matrix (shift, or −1 for a null block) and the lifting.
 #[derive(Debug)]
 pub struct Code {
     pub name: &'static str,
+    /// The decoder's check-message normalisation, picked per code by
+    /// `tests::alpha_sweep` (0.8 left frames stuck on a single wrong
+    /// degree-1 parity bit, plain min-sum lost 2 dB on the header).
+    pub alpha: f32,
     pub z: usize,
     pub mb: usize,
     pub nb: usize,
@@ -64,6 +68,7 @@ impl Code {
             .collect();
         Code {
             name,
+            alpha: if name == "header" { 0.85 } else { 0.9 },
             z,
             mb,
             nb,
@@ -90,10 +95,10 @@ impl Code {
         }
     }
 
-    /// The header code: Z = 16, 16 block columns, rate 1/2: n = 256, k = 128.
+    /// The header code: Z = 32, 16 block columns, rate 1/4: n = 512, k = 128.
     pub fn header() -> &'static Code {
         static CODE: OnceLock<Code> = OnceLock::new();
-        CODE.get_or_init(|| design_with("header", 16, 8, 16, HEADER_SEED, &header_weights(8, 8)))
+        CODE.get_or_init(|| design_with("header", 32, 12, 16, HEADER_SEED, &header_weights(4, 12)))
     }
 
     /// Codeword (info followed by parity, one bit a byte) for `info`.
@@ -165,11 +170,11 @@ fn weights(kb: usize, mb: usize) -> Vec<usize> {
     (0..kb).map(|j| if j < 6 { mb.min(5) } else { 3 }).collect()
 }
 
-/// The header code's weights: the first third of the columns at 6.
+/// The header code's weights: with only four info columns each one must
+/// reach many checks; weight 8 on all of them measured best (weights 3-12
+/// compared at Eb/N0 = 2 dB).
 fn header_weights(kb: usize, mb: usize) -> Vec<usize> {
-    (0..kb)
-        .map(|j| if j < kb / 3 { mb.min(6) } else { 3 })
-        .collect()
+    vec![mb.min(8); kb]
 }
 
 /// Designs a code: parity part fixed, info part by seeded search.
@@ -267,7 +272,7 @@ pub struct Outcome {
 /// be called any number of times.
 pub struct Decoder<'a> {
     code: &'a Code,
-    /// Normalisation of the check message (0.75–0.9 is typical).
+    /// Normalisation of the check message; starts as the code's own.
     pub alpha: f32,
     post: Vec<f32>,
     msgs: Vec<f32>,
@@ -286,7 +291,7 @@ impl<'a> Decoder<'a> {
         }
         Decoder {
             code,
-            alpha: 0.8,
+            alpha: code.alpha,
             post: vec![0.0; code.n()],
             msgs: vec![0.0; total],
             offs,
@@ -379,8 +384,21 @@ impl SimResult {
 /// BPSK over AWGN at `ebn0_db` (Eb per information bit), `frames` random
 /// codewords, true-LLR input.
 pub fn simulate(code: &Code, ebn0_db: f64, frames: usize, seed: u64, max_iter: usize) -> SimResult {
+    simulate_alpha(code, ebn0_db, frames, seed, max_iter, code.alpha)
+}
+
+/// [`simulate`] with a chosen check-message normalisation.
+pub fn simulate_alpha(
+    code: &Code,
+    ebn0_db: f64,
+    frames: usize,
+    seed: u64,
+    max_iter: usize,
+    alpha: f32,
+) -> SimResult {
     let mut rng = Rng::new(seed);
     let mut dec = Decoder::new(code);
+    dec.alpha = alpha;
     let ebn0 = 10f64.powf(ebn0_db / 10.0);
     let sigma2 = 1.0 / (2.0 * code.rate() * ebn0);
     let sigma = sigma2.sqrt();
@@ -430,7 +448,7 @@ mod tests {
                 0x1e4b_a430_c3ca_4d79,
                 0x8ed1_cf08_fdef_3d97,
                 0xb451_e744_d14e_dcb5,
-                0x4036_4c91_a9a7_1eb5
+                0x1a28_505d_c8c9_3ca1
             ]
         );
     }
@@ -446,7 +464,7 @@ mod tests {
         );
         assert_eq!(Code::payload(CodeRate::R2_3).k(), 768);
         assert_eq!(Code::payload(CodeRate::R3_4).k(), 864);
-        assert_eq!((Code::header().n(), Code::header().k()), (256, 128));
+        assert_eq!((Code::header().n(), Code::header().k()), (512, 128));
     }
 
     #[test]
@@ -520,6 +538,32 @@ mod tests {
         assert_eq!(&d.bits()[..c.k()], &info[..]);
     }
 
+    /// Normalisation sweep; run with
+    /// `cargo test -p decdsss-fec --release -- --ignored --nocapture alpha_sweep`.
+    #[test]
+    #[ignore]
+    fn alpha_sweep() {
+        let cases: [(&Code, f64, usize); 6] = [
+            (Code::payload(CodeRate::R1_2), 2.4, 2000),
+            (Code::payload(CodeRate::R1_2), 3.6, 20000),
+            (Code::payload(CodeRate::R3_4), 3.2, 2000),
+            (Code::payload(CodeRate::R3_4), 4.4, 20000),
+            (Code::header(), 2.6, 2000),
+            (Code::header(), 3.8, 20000),
+        ];
+        for (c, e, n) in cases {
+            let mut line = format!("{:12} {e:.1} dB ({n} frames):", c.name);
+            for alpha in [0.7f32, 0.8, 0.85, 0.9, 0.95, 1.0] {
+                let r = simulate_alpha(c, e, n, 31, 50, alpha);
+                line += &format!(
+                    "  a={alpha}: {} ({:.1} it)",
+                    r.frame_errors, r.avg_iterations
+                );
+            }
+            println!("{line}");
+        }
+    }
+
     /// Seed selection; run with
     /// `cargo test -p decdsss-fec --release -- --ignored --nocapture pick_seed`.
     /// Prints the five best of 40 design seeds per code.
@@ -548,7 +592,7 @@ mod tests {
             t("payload 1/2", 48, 12, 24, weights(12, 12), 2.0, 800),
             t("payload 2/3", 48, 8, 24, weights(16, 8), 2.6, 800),
             t("payload 3/4", 48, 6, 24, weights(18, 6), 3.2, 1500),
-            t("header", 16, 8, 16, header_weights(8, 8), 2.6, 3000),
+            t("header", 32, 12, 16, header_weights(4, 12), 2.2, 2000),
         ];
         for Target {
             name,
@@ -562,7 +606,11 @@ mod tests {
         {
             let mut res: Vec<(usize, u64)> = (0..40u64)
                 .map(|i| {
-                    let seed = 0x100 * (i + 1) + 0x11;
+                    let seed = if name == "header" {
+                        0x9000 + 313 * i
+                    } else {
+                        0x100 * (i + 1) + 0x11
+                    };
                     let c = design_with("x", z, mb, nb, seed, &w);
                     (simulate(&c, ebn0, frames, 1234, 50).frame_errors, seed)
                 })
@@ -590,7 +638,7 @@ mod tests {
                 "payload 1/2" => 0.8,
                 "payload 2/3" => 1.9,
                 "payload 3/4" => 2.6,
-                _ => 1.8,
+                _ => 1.0,
             };
             for step in 0..5 {
                 let e = base + 0.4 * step as f64;

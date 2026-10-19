@@ -27,6 +27,9 @@ pub const MAX_WINDOWS: usize = 8;
 pub const MIN_WINDOWS: usize = 3;
 /// False-alarm probability per window (all cells together).
 pub const P_FA_WINDOW: f64 = 1e-4;
+/// Windows to go on accumulating after the threshold is first crossed, so
+/// the first (usually partial) window does not decide the peak.
+pub const SETTLE_WINDOWS: usize = 2;
 
 /// A detection.
 #[derive(Clone, Debug)]
@@ -81,6 +84,8 @@ pub struct Acquirer {
     /// Starts of the windows in the ring.
     starts: VecDeque<i64>,
     scratch: Vec<Iq>,
+    /// Windows since the threshold was first crossed.
+    crossed: Option<usize>,
 }
 
 impl Acquirer {
@@ -121,6 +126,7 @@ impl Acquirer {
             next: 0,
             starts: VecDeque::new(),
             scratch: vec![Iq::new(0.0, 0.0); n],
+            crossed: None,
         }
     }
 
@@ -138,6 +144,7 @@ impl Acquirer {
         self.ring.clear();
         self.starts.clear();
         self.sum.clear();
+        self.crossed = None;
         self.next = from;
     }
 
@@ -172,10 +179,17 @@ impl Acquirer {
                     *s -= v;
                 }
             }
-            if self.ring.len() >= MIN_WINDOWS
-                && let Some(d) = self.detect(start)
-            {
-                return Some(d);
+            if self.ring.len() >= MIN_WINDOWS {
+                match (self.detect(start), self.crossed) {
+                    (Some(_), None) => self.crossed = Some(0),
+                    (Some(d), Some(n)) if n + 1 >= SETTLE_WINDOWS => {
+                        self.crossed = None;
+                        return Some(d);
+                    }
+                    (Some(_), Some(n)) => self.crossed = Some(n + 1),
+                    // The peak faded back under the threshold: it was noise.
+                    (None, _) => self.crossed = None,
+                }
             }
         }
         None
@@ -386,6 +400,26 @@ mod tests {
                 "{profile}: freq {}",
                 d.freq_hz
             );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_freq() {
+        for (snr, off) in [
+            (0.0, -1.0),
+            (0.0, 5.0),
+            (-10.0, -1.0),
+            (10.0, -1.0),
+            (-17.0, -1.0),
+        ] {
+            for seed in [507u64, 3] {
+                let (d, _) = acquire(Profile::W2400, snr, off, 5.0, seed).unwrap();
+                println!(
+                    "snr {snr} off {off} seed {seed}: freq {:.2} margin {:.1} dB (surface peak row {} of {})",
+                    d.freq_hz, d.margin_db, d.surface.peak_row, d.surface.rows
+                );
+            }
         }
     }
 

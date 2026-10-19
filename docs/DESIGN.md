@@ -116,23 +116,30 @@ and files can use the deep end.
 
 ### Over structure
 
-An *over* (one transmission) is:
+A transmission is one or more *segments*; a segment is:
 
-1. **Preamble** — K periods of an m-sequence on the call code, repeated so the
-   receiver can search code phase × frequency with FFT circular correlation.
-   There are two preamble sequences. One announces a *fast* header (CSK64), for
-   DS modes and CSK32/64. The other announces a *robust* header (CSK256), for
-   CSK128/256. The receiver searches for both.
-2. **Header** — CSK on the call code, carrying a short LDPC codeword with a CRC.
-   It holds the version, profile, mode, payload type, callsign (base-37 packed),
-   payload length or "stream", the session ID and, for ARQ, the destination.
-3. **Payload frames** — on the station's own code, in the header's mode,
-   LDPC-coded and time-interleaved, with depth set per payload: short for voice,
-   long for files.
-4. **Resync blocks** — every ~15 s of air time, a short preamble and a header on
-   the call code with the frame number, so late joiners can lock and receivers
-   can recover after a deep fade.
-5. **End of over** — a marker block on the call code.
+1. **Preamble** — twelve periods of the profile's m-sequence A (511 chips on
+   `2k4`/`3k`, 127 on `500`), then two periods of a second m-sequence B of the
+   same length. Real BPSK chips, unscrambled, so every station's preamble is
+   the same and any receiver finds it by FFT circular correlation. A body is
+   found by A; the two B periods mark exactly where the header starts. (A
+   sign-flip pattern was considered and dropped: it breaks the one-period
+   windows the search relies on.) 4.3 s on `2k4`, 3.4 s on `3k`, 5.1 s on `500`.
+2. **Header** — 128 bits (version, profile, mode, depth, payload type,
+   callsign, session, first frame number, blocks in this segment, frames in the
+   whole transmission, CRC-16) in a rate-¼ n = 512 LDPC codeword, interleaved,
+   as 64 CSK256 symbols on the call code. Always CSK256 whatever the payload,
+   so it is decodable wherever any payload mode is. 8.5 s on `2k4`, 6.8 s on
+   `3k`, 41 s on `500`. (A rate-½ n = 256 header was built first; it needed
+   about 3.4 dB more signal, which made it the limit of the whole system.)
+3. **Payload blocks** — `nblocks` blocks on the station's own code, each
+   `depth` LDPC codewords interleaved together. DS-PSK blocks carry a known
+   pilot every eighth symbol and a closing pilot, so each block decodes alone.
+   Each frame is data bytes plus a CRC-32.
+4. **Resync** — a long transmission is cut into segments, each a fresh preamble
+   and header with its first frame number, so late joiners can start and a
+   receiver that lost the signal can find its place. How often is the sender's
+   choice (≈ 60 s keeps the overhead near 15 %).
 
 Several stations may transmit at once: their preambles overlap only by
 coincidence, their payloads sit on different codes, and the receiver opens one
@@ -159,16 +166,20 @@ samples/chip around the profile centre. Every profile is searched at once.
 DecDSSS's own quasi-cyclic LDPC codes: IRA (a block zig-zag accumulator as the
 parity part), so encoding is a running XOR. The payload codes are n = 1152
 (Z = 48, 24 block columns) at rates ½, ⅔ and ¾ (k = 576 / 768 / 864); the header
-code is n = 256, k = 128 (Z = 16). The info part is designed here: six columns
-of weight 5 and the rest weight 3 (the best of six weight patterns tried), rows
+code is rate ¼, n = 512, k = 128 (Z = 32). The payload info part is designed here:
+six columns of weight 5 and the rest weight 3 (the best of six weight patterns
+tried; the header's four columns all have weight 8, best of 3–12), rows
 filled evenly, and circulant shifts drawn from a seeded PCG32 so the lifted
 graph has no 4-cycle (tested by brute force). The design seed is the best of 40
 on simulated frame errors. The designs are regenerated from the seeds at start-
 up and pinned by a fingerprint test, so a change that would make old
 transmissions undecodable fails CI.
 
-The decoder is layered normalised min-sum (α = 0.8) on float LLRs, stopping as
-soon as the syndrome is zero.
+The decoder is layered normalised min-sum on float LLRs, stopping as soon as
+the syndrome is zero. The normalisation α was tuned per code on frame errors
+at threshold and 1.2 dB above it: α = 0.9 for the payload codes, 0.85 for the
+header (0.8, the first guess, left some frames stuck on a single wrong degree-1
+parity bit and plain min-sum lost 2 dB on the header).
 
 Measured on BPSK/AWGN, 400 frames a point, true-LLR input, noise the seed
 selection never saw (`cargo test -p decdsss-fec --release -- --ignored
@@ -176,16 +187,16 @@ selection never saw (`cargo test -p decdsss-fec --release -- --ignored
 
 | Code | Eb/N0 for FER 10⁻² | Normal-approximation limit | Gap |
 |---|---|---|---|
-| payload ½ (n = 1152) | ≈ 2.4 dB | 0.85 dB | ≈ 1.5 dB |
-| payload ⅔ | ≈ 2.7 dB | 1.65 dB | ≈ 1.0 dB |
-| payload ¾ | ≈ 3.0 dB | 2.19 dB | ≈ 0.8 dB |
-| header ½ (n = 256) | ≈ 3.1 dB | 1.47 dB | ≈ 1.6 dB |
+| payload ½ (n = 1152) | ≈ 1.85 dB | 0.85 dB | ≈ 1.0 dB |
+| payload ⅔ | ≈ 2.5 dB | 1.65 dB | ≈ 0.85 dB |
+| payload ¾ | ≈ 2.9 dB | 2.19 dB | ≈ 0.7 dB |
+| header ¼ (n = 512) | ≈ 2.3 dB | 0.52 dB | ≈ 1.8 dB |
 
 The limit is the normal approximation to the finite-length capacity of the
 BI-AWGN channel (Polyanskiy–Poor–Verdú: R ≈ C − √(V/n)·Q⁻¹(ε) + log₂n / 2n),
 computed by numerical integration for this code size, rate and FER. It is an
-approximation, not a bound that a real code cannot beat. The ½-rate codes have
-the most room left.
+approximation, not a bound that a real code cannot beat. The header has the
+most room left.
 
 The time interleaver is a golden-ratio stride permutation over a block of
 codewords: a run of B consecutive faded bits comes from B coding positions about
