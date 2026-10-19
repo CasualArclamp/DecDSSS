@@ -163,7 +163,7 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(size)
         .with_min_inner_size([980.0, 600.0])
-        .with_title("DecDSSS");
+        .with_title(format!("DecDSSS v{}", app::VERSION));
     match eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/decdsss-256.png")) {
         Ok(icon) => viewport = viewport.with_icon(icon),
         Err(e) => eprintln!("decdsss-gui: window icon: {e}"),

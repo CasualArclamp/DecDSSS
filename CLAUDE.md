@@ -19,7 +19,7 @@ cargo run --release -p decdsss-cli -- tx speech.wav --call VK2ABC --voice -o voi
 cargo run --release -p decdsss-cli -- tx file.bin --call VK2ABC --profile 500 --slot +500 -o f.wav   # a 500 Hz slot (-500, 0 or +500)
 cargo run --release -p decdsss-cli -- tx --cq --call VK2ABC -o cq.wav   # a CQ packet: the callsign alone in a header, two copies (--copies N); or --text "message"
 cargo run --release -p decdsss-cli -- sweep --mode ds8-1/2 --ebn0 2 6 1   # frame loss vs Eb/N0, whole receiver
-powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1   # portable exes into exe\ (git-ignored)
+powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1   # portable exes into exe\ (git-ignored), named with the version: decdsss-gui-v0.0.1.exe
 cargo run --release -p decdsss-gui -- --demo   # the window; --screenshot OUT.png --after 20 for pictures
 ```
 

@@ -20,6 +20,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The version of this build, from the workspace's `Cargo.toml` (the same number the
+/// executables' file names carry).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     Device,
@@ -358,6 +362,8 @@ impl App {
     fn top_bar(&mut self, ui: &mut Ui, sh: &Shared) {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("DecDSSS").strong().size(16.0));
+            ui.label(RichText::new(format!("v{VERSION}")).weak().size(12.0))
+                .on_hover_text(format!("decdsss-gui {VERSION}"));
             // Tabs: the receiver, the transmitter, or both on one page.
             let before = self.view;
             for (v, label) in [(View::Rx, "RX"), (View::Tx, "TX"), (View::Both, "RX + TX")] {
