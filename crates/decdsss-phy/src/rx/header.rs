@@ -196,7 +196,9 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome 
         return HeaderOutcome::Bad("header CRC failed");
     };
     // The header is now known: refine timing, clock and carrier against its
-    // exact chips, from where the preamble put the start.
+    // exact chips, from where the preamble put the start, and re-derive the
+    // rake fingers from them, on the refined reference.
+    let mut fingers = fingers;
     if let Some(known) = crate::tx::header_chips(&header) {
         let t0 = Track {
             pos: lock.header_start,
@@ -206,14 +208,11 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome 
             rate,
         };
         let cr = rate / super::frontend::SPS as f64;
-        if let Some(r) = super::refine::refine(
-            buf,
-            &t0,
-            &known,
-            fingers[main].lag,
-            super::refine::segment_chips(cr),
-        ) {
-            t.pos = r.pos_end;
+        let seg = super::refine::segment_chips(cr);
+        if let Some(r) = super::refine::refine(buf, &t0, &known, fingers[main].lag, seg, 300e-6) {
+            let (f, shift) = super::refine::tail_fingers(buf, &r, &t0, &known, seg);
+            fingers = f;
+            t.pos = r.pos_end + shift * r.step;
             t.step = r.step;
             t.freq = r.freq;
             t.phase = 0.0;

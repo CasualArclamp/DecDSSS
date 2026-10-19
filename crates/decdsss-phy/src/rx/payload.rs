@@ -22,14 +22,40 @@ use decdsss_fec::interleave::Interleaver;
 use decdsss_fec::ldpc::Decoder;
 use std::f64::consts::TAU;
 
-/// Delay-locked loop noise bandwidth, Hz.
+/// Delay-locked loop noise bandwidth, Hz: wide for the first seconds of a
+/// segment, so a clock error left over from the start-up estimates is pulled in
+/// at once, then narrow.
+const DLL_BW_WIDE_HZ: f64 = 1.0;
 const DLL_BW_HZ: f64 = 0.25;
+/// Seconds of payload the wide bandwidth lasts.
+const DLL_WIDE_S: f64 = 12.0;
 /// Seconds of symbols the early/late powers are averaged over per update.
 const DLL_GROUP_S: f64 = 0.05;
 /// The frequency estimate is revised about every this many seconds.
 const FREQ_UPDATE_S: f64 = 1.5;
 /// LDPC iterations.
 const MAX_ITER: usize = 50;
+/// A carrier update needs the phase steps it is built from to agree: the sum
+/// of products must be at least this fraction of the sum of their magnitudes.
+/// In a fade the steps are random and the ratio is small.
+const FREQ_COHERENCE: f32 = 0.4;
+/// One update moves the carrier by at most this fraction of the frequency at
+/// which one measurement interval is a half turn.
+const FREQ_MAX_STEP: f64 = 0.3;
+/// The carrier is kept within this many Hz of where the header found it.
+const FREQ_MAX_EXCURSION: f64 = 10.0;
+
+/// The carrier correction from `acc`, a sum of successive-measurement
+/// products (`norm` the sum of their magnitudes) taken `interval_s` apart;
+/// zero when the products do not agree (a fade).
+fn freq_correction(acc: Iq, norm: f32, interval_s: f64) -> f64 {
+    if norm <= 0.0 || acc.norm() < FREQ_COHERENCE * norm {
+        return 0.0;
+    }
+    let raw = 0.5 * f64::from(acc.arg()) / (TAU * interval_s);
+    let limit = FREQ_MAX_STEP / (2.0 * interval_s);
+    raw.clamp(-limit, limit)
+}
 
 /// What one block gave.
 #[derive(Clone, Debug)]
@@ -61,6 +87,8 @@ fn loop_gains(bn_hz: f64, update_s: f64) -> (f64, f64) {
 struct Dll {
     kp: f64,
     ki: f64,
+    wide: (f64, f64),
+    narrow: (f64, f64),
     group: usize,
     e: f64,
     l: f64,
@@ -72,16 +100,25 @@ struct Dll {
 impl Dll {
     fn new(symbol_s: f64) -> Dll {
         let group = ((DLL_GROUP_S / symbol_s).ceil() as usize).max(1);
-        let (kp, ki) = loop_gains(DLL_BW_HZ, group as f64 * symbol_s);
+        let update_s = group as f64 * symbol_s;
+        let narrow = loop_gains(DLL_BW_HZ, update_s);
+        let wide = loop_gains(DLL_BW_WIDE_HZ, update_s);
         Dll {
-            kp,
-            ki,
+            kp: wide.0,
+            ki: wide.1,
+            wide,
+            narrow,
             group,
             e: 0.0,
             l: 0.0,
             n: 0,
             rate: 0.0,
         }
+    }
+
+    /// Wide gains while the segment is young, narrow after.
+    fn set_wide(&mut self, wide: bool) {
+        (self.kp, self.ki) = if wide { self.wide } else { self.narrow };
     }
 
     fn reset(&mut self) {
@@ -119,6 +156,8 @@ pub struct PayloadRx {
     scr: Scrambler,
     pub track: Track,
     pub fingers: Vec<Finger>,
+    /// The carrier the header found; the loop stays near it.
+    f0: f64,
     chip0: usize,
     next_block: usize,
     dll: Dll,
@@ -139,6 +178,7 @@ impl PayloadRx {
             header,
             track: h.track,
             fingers: h.fingers.clone(),
+            f0: h.track.freq,
             chip0: 0,
             next_block: 0,
             dll: Dll::new(symbol_s),
@@ -177,6 +217,8 @@ impl PayloadRx {
         if need > buf.end() as f64 {
             return None;
         }
+        let cr = f64::from(self.header.profile.chip_rate());
+        self.dll.set_wide((self.chip0 as f64) / cr < DLL_WIDE_S);
         let result = match self.layout.mode.family {
             Family::Csk => self.block_csk(buf),
             Family::DsPsk => self.block_ds(buf),
@@ -238,64 +280,35 @@ impl PayloadRx {
     }
 
     /// With every codeword of the block decoded, the transmitted chips are
-    /// known: correlate the received signal against them at each lag to get
-    /// the block's delay profile, and re-pick the fingers from it.
+    /// known: refine timing, clock and carrier against them, then correlate at
+    /// each lag for the block's delay profile and re-pick the fingers from it.
     fn refresh_fingers(&mut self, buf: &Buf, frames: &[Option<Vec<u8>>], start: Track) {
-        use super::preamble::DelayProfile;
         let data: Vec<Vec<u8>> = frames.iter().map(|f| f.clone().unwrap()).collect();
         let chips = block_chips(&self.layout, &data, &self.scr, self.chip0);
-        // Timing, clock and carrier against the exact chips first.
         let main_lag = self
             .fingers
             .iter()
             .max_by(|a, b| a.power.total_cmp(&b.power))
             .map_or(0.0, |f| f.lag);
         let cr = self.rate / super::frontend::SPS as f64;
-        if let Some(r) = super::refine::refine(
-            buf,
-            &start,
-            &chips,
-            main_lag,
-            super::refine::segment_chips(cr),
-        ) {
-            self.track.pos = r.pos_end;
-            self.track.step = r.step;
-            self.track.freq = r.freq;
-            self.track.phase = 0.0;
-            self.dll.reset();
-        }
-        let seg = 1024.min(chips.len());
-        let mut power = vec![0.0f32; DelayProfile::LAGS];
-        let t = start;
-        let dphi = t.dphase();
-        for (i, pw) in power.iter_mut().enumerate() {
-            let lag = DelayProfile::lag(i);
-            let mut k0 = 0;
-            while k0 + seg <= chips.len() {
-                let mut acc = Iq::new(0.0, 0.0);
-                for (k, chip) in chips.iter().enumerate().skip(k0).take(seg) {
-                    let ph = t.phase + k as f64 * dphi;
-                    let (s, c) = ph.sin_cos();
-                    let r = buf.at(t.pos + (k as f64 + lag) * t.step);
-                    acc += r * Iq::new(c as f32, -(s as f32)) * chip.conj();
-                }
-                *pw += (acc / seg as f32).norm_sqr();
-                k0 += seg;
+        let seg = super::refine::segment_chips(cr);
+        let refined = super::refine::refine(buf, &start, &chips, main_lag, seg, 60e-6);
+        let (fingers, shift) = match &refined {
+            Some(r) => super::refine::tail_fingers(buf, r, &start, &chips, seg),
+            None => {
+                let p = super::refine::profile_known(buf, &start, &chips, seg);
+                super::refine::fingers_from_profile(&p)
             }
-        }
-        let profile = DelayProfile { power };
-        let mut fingers = super::header::pick_fingers(&profile, 3);
-        // Keep the main finger at lag 0: move the reference onto it.
-        if let Some(main) = fingers
-            .iter()
-            .max_by(|a, b| a.power.total_cmp(&b.power))
-            .copied()
-            && main.lag.abs() >= 0.5
-        {
-            self.track.pos += main.lag * self.track.step;
-            for f in &mut fingers {
-                f.lag -= main.lag;
+        };
+        match refined {
+            Some(r) => {
+                self.track.pos = r.pos_end + shift * r.step;
+                self.track.step = r.step;
+                self.track.freq = r.freq;
+                self.track.phase = 0.0;
+                self.dll.reset();
             }
+            None => self.track.pos += shift * self.track.step,
         }
         self.fingers = fingers;
     }
@@ -318,6 +331,7 @@ impl PayloadRx {
         let freq_every = ((FREQ_UPDATE_S / t_sym).ceil() as usize).max(4);
         let mut peak_prev: Option<Iq> = None;
         let mut freq_acc = Iq::new(0.0, 0.0);
+        let mut freq_norm = 0.0f32;
         let mut weights = vec![0.0f32; nf];
         for (wt, f) in weights.iter_mut().zip(&self.fingers) {
             *wt = f.power;
@@ -353,22 +367,17 @@ impl PayloadRx {
             let peak = w[at + main * l + m];
             if let Some(p) = peak_prev {
                 freq_acc += peak * p.conj();
+                freq_norm += peak.norm() * p.norm();
             }
             peak_prev = Some(peak);
             t.advance(l);
             if (s + 1) % freq_every == 0 {
-                if std::env::var("DSSS_DEBUG").is_ok() {
-                    eprintln!(
-                        "blk {} sym {s}: freq_acc {:?} -> {:+.3} Hz, pos {:.2}, peak |{:.0}| m={m}",
-                        self.next_block,
-                        freq_acc,
-                        f64::from(freq_acc.arg()) / (TAU * t_sym),
-                        t.pos,
-                        peak.norm()
-                    );
-                }
-                t.freq += 0.5 * f64::from(freq_acc.arg()) / (TAU * t_sym);
+                t.freq += freq_correction(freq_acc, freq_norm, t_sym);
+                t.freq = t
+                    .freq
+                    .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
                 freq_acc = Iq::new(0.0, 0.0);
+                freq_norm = 0.0;
             }
         }
         self.track = t;
@@ -406,11 +415,45 @@ impl PayloadRx {
         self.finish(buf, &llrs, snr, start)
     }
 
+    /// Measures the block's delay profile from its pilots (known symbols, so
+    /// available whether or not the last block decoded) and sets the fingers
+    /// and the reference from it. A start that is a few chips off, because the
+    /// previous stage's estimate was wrong or a fade moved the strongest path,
+    /// is found here instead of costing the block.
+    fn ds_prepass(&mut self, buf: &Buf, scr: &[Iq]) {
+        use super::preamble::DelayProfile;
+        let l = usize::from(self.header.mode.spread);
+        let t = self.track;
+        let dphi = t.dphase();
+        let per = PILOT_INTERVAL as usize;
+        let pilots = self.layout.symbols() / per + 1;
+        let mut power = vec![0.0f32; DelayProfile::LAGS];
+        for (i, pw) in power.iter_mut().enumerate() {
+            let lag = DelayProfile::lag(i);
+            for g in 0..pilots {
+                let n = g * per;
+                let p = pilot_symbol(g).conj();
+                let mut acc = Iq::new(0.0, 0.0);
+                for k in 0..l {
+                    let kk = n * l + k;
+                    let (s, c) = (t.phase + kk as f64 * dphi).sin_cos();
+                    let x = buf.at(t.pos + (kk as f64 + lag) * t.step);
+                    acc += x * Iq::new(c as f32, -(s as f32)) * scr[kk].conj() * p;
+                }
+                *pw += (acc / l as f32).norm_sqr();
+            }
+        }
+        let (fingers, shift) = super::refine::fingers_from_profile(&DelayProfile { power });
+        self.fingers = fingers;
+        self.track.pos += shift * self.track.step;
+    }
+
     fn block_ds(&mut self, buf: &Buf) -> BlockResult {
-        let start = self.track;
         let l = usize::from(self.header.mode.spread);
         let s_count = self.layout.symbols();
         let scr = self.scr.chips(self.chip0, s_count * l);
+        self.ds_prepass(buf, &scr);
+        let start = self.track;
         let nf = self.fingers.len();
         let main = self.main_finger();
         let mut t = self.track;
@@ -426,6 +469,7 @@ impl PayloadRx {
         let t_pilot = PILOT_INTERVAL as f64 * t_sym;
         let freq_every = ((FREQ_UPDATE_S / t_pilot).ceil() as usize).max(3);
         let mut freq_acc = Iq::new(0.0, 0.0);
+        let mut freq_norm = 0.0f32;
         let mut pilot_no = 0;
         for s in 0..s_count {
             let sc = &scr[s * l..(s + 1) * l];
@@ -449,11 +493,16 @@ impl PayloadRx {
                 }
                 if pilot_no > 0 {
                     freq_acc += g[main][pilot_no] * g[main][pilot_no - 1].conj();
+                    freq_norm += g[main][pilot_no].norm() * g[main][pilot_no - 1].norm();
                 }
                 pilot_no += 1;
                 if pilot_no % freq_every == 0 {
-                    t.freq += 0.5 * f64::from(freq_acc.arg()) / (TAU * t_pilot);
+                    t.freq += freq_correction(freq_acc, freq_norm, t_pilot);
+                    t.freq = t
+                        .freq
+                        .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
                     freq_acc = Iq::new(0.0, 0.0);
+                    freq_norm = 0.0;
                 }
             }
             t.advance(l);
@@ -631,6 +680,80 @@ mod tests {
                 line += &format!("  {ebn0:.0}dB:{:.2}", bad as f64 / total as f64);
             }
             println!("{line}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_500_vs_truth() {
+        for profile in [Profile::N500] {
+            for (off, ppm, seed) in [(0.0, 0.0, 1u64)] {
+                let seg = segment(profile, "ds4-1/2", 2, 2);
+                let mut ch = channel(profile, 5.0);
+                ch.offset_hz = off;
+                ch.clock_ppm = ppm;
+                ch.seed = seed;
+                let audio = through(&seg, &ch);
+                let Ok(run) = to_header(&audio, profile) else {
+                    println!("{profile} off {off} ppm {ppm} seed {seed}: no header");
+                    continue;
+                };
+                let (g, _) = genie(&seg, &ch, &audio);
+                println!(
+                    "{profile} off {off} ppm {ppm} seed {seed}: lock step {:.5} (truth {:.5}) freq {:.2} | decoded pos err {:+.2} step {:.5} freq {:.3}",
+                    run.lock.step,
+                    g.track.step,
+                    run.lock.freq_hz,
+                    run.header.track.pos - g.track.pos,
+                    run.header.track.step,
+                    run.header.track.freq,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_good_fading() {
+        let profile = Profile::W2400;
+        for seed in 0..10u64 {
+            let mut ch = channel(profile, 8.0);
+            ch.fading = Some(Watterson::GOOD);
+            ch.seed = 700 + seed;
+            ch.offset_hz = 5.0;
+            let (ok, total, note) = recover(profile, "ds8-1/2", 4, 2, &ch);
+            println!("seed {seed}: {ok}/{total} {note:?}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_good_seeds() {
+        let profile = Profile::W2400;
+        for seed in [0u64, 1, 7, 2] {
+            let seg = segment(profile, "ds8-1/2", 4, 2);
+            let mut ch = channel(profile, 8.0);
+            ch.fading = Some(Watterson::GOOD);
+            ch.seed = 700 + seed;
+            ch.offset_hz = 5.0;
+            let audio = through(&seg, &ch);
+            let Ok(run) = to_header(&audio, profile) else {
+                println!("seed {seed}: no header");
+                continue;
+            };
+            let (g, _) = genie(&seg, &ch, &audio);
+            let chip = run.header.track.step;
+            println!(
+                "seed {seed}: decoded pos - true path0 = {:+.2} chips (true path1 at +0.96), step err {:+.1} ppm, freq err {:+.3} Hz, fingers {:?}",
+                (run.header.track.pos - g.track.pos) / chip,
+                (run.header.track.step / g.track.step - 1.0) * 1e6,
+                run.header.track.freq - g.track.freq,
+                run.header.fingers
+            );
+            println!(
+                "   preamble profile fingers {:?}",
+                crate::rx::header::pick_fingers(&run.lock.profile, 3)
+            );
         }
     }
 

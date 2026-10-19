@@ -148,6 +148,15 @@ impl Acquirer {
         self.next = from;
     }
 
+    /// Starts the accumulation afresh but carries on from the current
+    /// position (after a detection has been handed on).
+    pub fn restart(&mut self) {
+        self.ring.clear();
+        self.starts.clear();
+        self.sum.clear();
+        self.crossed = None;
+    }
+
     /// Absolute index of the next window; everything before the oldest
     /// window in use can be released.
     pub fn oldest_needed(&self) -> i64 {
@@ -163,7 +172,18 @@ impl Acquirer {
         while self.next + self.n as i64 <= buf.end() {
             let start = self.next;
             self.next += self.n as i64;
-            let surf = self.window_power(buf.slice(start, start + self.n as i64));
+            let mut surf = self.window_power(buf.slice(start, start + self.n as i64));
+            // Each window is scaled to a unit noise mean (the median of an
+            // exponential is ln 2 times its mean). A fading signal changes the
+            // level from window to window, which would fatten the tail of the
+            // sum well beyond the gamma law the threshold assumes.
+            let mut tmp = surf.clone();
+            let mid = tmp.len() / 2;
+            let (_, med, _) = tmp.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            let scale = 1.0 / (f64::from(*med) / std::f64::consts::LN_2).max(1e-30);
+            for v in &mut surf {
+                *v = (f64::from(*v) * scale) as f32;
+            }
             if self.sum.is_empty() {
                 self.sum = vec![0.0; surf.len()];
             }
@@ -433,6 +453,54 @@ mod tests {
         // 50 ppm over a few seconds moves the period by under a sample.
         assert!(off < 3.0, "timing off by {off}");
         assert!((d.freq_hz + 55.0).abs() < 2.0, "freq {}", d.freq_hz);
+    }
+
+    /// False detections per minute on payload-only audio (a strong signal that
+    /// is not the preamble), by channel.
+    #[test]
+    #[ignore]
+    fn false_alarms_on_payload() {
+        use crate::rx::testrig::{FS, LEVEL, channel, segment};
+        use crate::tx::segment_chips;
+        use decdsss_chan::Watterson;
+        let profile = Profile::W2400;
+        let seg = segment(profile, "ds8-1/2", 4, 6);
+        let chips = segment_chips(&seg).unwrap();
+        // Payload only: drop the preamble and header.
+        let lead = crate::tx::lead_chips(profile);
+        let audio = chips_to_audio(&chips[lead..], profile, FS, LEVEL, 0.0, 0.0);
+        println!("payload-only audio: {:.0} s", audio.len() as f64 / FS);
+        for (name, fading, snr) in [
+            ("awgn", None, 8.0),
+            ("awgn", None, 30.0),
+            ("good", Some(Watterson::GOOD), 8.0),
+            ("moderate", Some(Watterson::MODERATE), 8.0),
+            ("poor", Some(Watterson::POOR), 8.0),
+        ] {
+            let mut ch = channel(profile, snr);
+            ch.fading = fading;
+            let a = ch.apply(&audio, FS);
+            let mut fe = Frontend::new(profile, FS);
+            let mut acq = Acquirer::new(profile, 100.0);
+            let mut buf = Buf::default();
+            let mut hits = 0;
+            let mut worst = f64::MIN;
+            for chunk in a.chunks(4800) {
+                let mut bb = Vec::new();
+                fe.push(chunk, &mut bb);
+                buf.push(&bb);
+                while let Some(d) = acq.run(&buf) {
+                    hits += 1;
+                    worst = worst.max(d.margin_db);
+                    acq.reset(buf.end());
+                }
+                buf.trim(acq.oldest_needed());
+            }
+            println!(
+                "{name:9} {snr:4.0} dB: {hits} false detections in {:.0} s (worst margin {worst:.1} dB)",
+                a.len() as f64 / FS
+            );
+        }
     }
 
     #[test]

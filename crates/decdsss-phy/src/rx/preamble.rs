@@ -19,6 +19,9 @@ use super::acq::{Detection, rot};
 
 /// A's periods the pattern test looks back over (before the B pair).
 const LOOKBACK_A: usize = 3;
+/// A period counts as signal when its correlation is at least this fraction
+/// of the strongest seen (−5 dB).
+const STRONG: f64 = 0.3;
 /// Pattern score needed to declare the end of the preamble.
 const SCORE_THRESHOLD: f64 = 0.7;
 
@@ -111,6 +114,9 @@ pub struct PreambleTracker {
     powers: Vec<(f32, f32)>,
     /// The loop's timing error estimate of each period, samples.
     errs: Vec<f64>,
+    /// Dominant correlation power of each period, and the largest so far.
+    dom: Vec<f64>,
+    pmax: f64,
     fresh: bool,
 }
 
@@ -138,6 +144,8 @@ impl PreambleTracker {
             prompt: Vec::new(),
             powers: Vec::new(),
             errs: Vec::new(),
+            dom: Vec::new(),
+            pmax: 0.0,
             fresh: true,
         }
     }
@@ -185,12 +193,24 @@ impl PreambleTracker {
             let (e, l) = (c[0].norm(), c[2].norm());
             let d = if e + l > 0.0 { (l - e) / (e + l) } else { 0.0 };
             let err = f64::from(d) * SPS as f64 / 1.33;
-            let (kp, ki) = if self.fresh { (0.8, 0.0) } else { (0.5, 0.15) };
-            self.fresh = false;
+            // Periods before the preamble began (the search window starts a
+            // little early) hold only noise: leave the loop alone for them.
+            let dom = f64::from(pa.max(pb));
+            self.pmax = self.pmax.max(dom);
+            let strong = dom >= STRONG * self.pmax;
+            let (kp, ki) = match (strong, self.fresh) {
+                (false, _) => (0.0, 0.0),
+                (true, true) => (0.8, 0.0),
+                (true, false) => (0.5, 0.15),
+            };
+            if strong {
+                self.fresh = false;
+            }
             self.bounds.push(self.pos);
             self.errs.push(err);
             self.prompt.push((c[1], a_dom));
             self.powers.push((pa, pb));
+            self.dom.push(dom);
             self.z
                 .push(f64::from(pb - pa) / f64::from(pb + pa).max(1e-30));
             // Advance: one period plus the loop's correction. The integrator
@@ -229,14 +249,22 @@ impl PreambleTracker {
         // The period length and phase from a line through every period's
         // measured boundary (tracked boundary plus the loop's error estimate):
         // steadier than the loop's own running estimate.
-        let pts: Vec<(f64, f64)> = (0..=k)
-            .map(|m| (m as f64, self.bounds[m] + self.errs[m]))
+        let pmax = self.dom[..=k].iter().copied().fold(0.0, f64::max);
+        let used: Vec<usize> = (0..=k).filter(|&m| self.dom[m] >= STRONG * pmax).collect();
+        let pts: Vec<(f64, f64, f64)> = used
+            .iter()
+            .map(|&m| (m as f64, self.bounds[m] + self.errs[m], self.dom[m]))
             .collect();
-        let mbar = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
-        let bbar = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
-        let sxx: f64 = pts.iter().map(|p| (p.0 - mbar).powi(2)).sum();
-        let sxy: f64 = pts.iter().map(|p| (p.0 - mbar) * (p.1 - bbar)).sum();
-        let period = if sxx > 0.0 { sxy / sxx } else { self.period };
+        let wsum: f64 = pts.iter().map(|p| p.2).sum();
+        let mbar = pts.iter().map(|p| p.2 * p.0).sum::<f64>() / wsum;
+        let bbar = pts.iter().map(|p| p.2 * p.1).sum::<f64>() / wsum;
+        let sxx: f64 = pts.iter().map(|p| p.2 * (p.0 - mbar).powi(2)).sum();
+        let sxy: f64 = pts.iter().map(|p| p.2 * (p.0 - mbar) * (p.1 - bbar)).sum();
+        let period = if pts.len() >= 4 && sxx > 0.0 {
+            sxy / sxx
+        } else {
+            self.period
+        };
         // Believe the fit only if it is within 300 ppm of the nominal clock.
         let period = if (period / self.n - 1.0).abs() < 3e-4 {
             period
@@ -258,6 +286,21 @@ impl PreambleTracker {
         let f_res = f64::from(s.arg()) / (std::f64::consts::TAU * tp);
         if std::env::var("DSSS_DEBUG").is_ok() {
             eprintln!(
+                "bounds diffs {:?}",
+                self.bounds
+                    .windows(2)
+                    .map(|w| ((w[1] - w[0]) * 100.0).round() / 100.0)
+                    .collect::<Vec<_>>()
+            );
+            eprintln!(
+                "errs {:?}",
+                self.errs
+                    .iter()
+                    .map(|e| (e * 100.0).round() / 100.0)
+                    .collect::<Vec<_>>()
+            );
+            eprintln!("fit period {period:.3} (nominal {}) k {k}", self.n);
+            eprintln!(
                 "preamble: f_ref {:.2} f_res {:.2} periods {} k {k} z {:?}",
                 self.f_ref,
                 f_res,
@@ -272,7 +315,7 @@ impl PreambleTracker {
         let a = preamble_a(self.profile);
         let mut power = vec![0.0f32; DelayProfile::LAGS];
         let first_b = k + 1 - PRE_B_PERIODS;
-        for m in 0..first_b {
+        for m in (0..first_b).filter(|&m| self.dom[m] >= STRONG * pmax) {
             for (i, pw) in power.iter_mut().enumerate() {
                 let lag = DelayProfile::lag(i) * chip;
                 *pw += self
