@@ -93,6 +93,10 @@ pub enum Play {
     Nothing,
     /// The PTT was released with speech recorded: send it.
     Send,
+    /// Live mode: the PTT went down, start streaming.
+    LiveStart,
+    /// Live mode: the PTT was let go, finish the stream.
+    LiveStop,
     /// Play the clip as it is.
     Clip,
     /// Play the clip as Codec2 will send it (compressed and expanded again).
@@ -172,6 +176,22 @@ impl VoicePanel {
         }
     }
 
+    /// Chooses the input whose name contains `hint` (the default if none does).
+    pub fn select_mic(&mut self, devices_in: &[String], hint: &str) {
+        self.mic = devices_in
+            .iter()
+            .position(|d| d.to_lowercase().contains(&hint.to_lowercase()))
+            .map_or(0, |i| i + 1);
+    }
+
+    /// The microphone chosen for recording (None: the default).
+    pub fn mic_name(&self, devices_in: &[String]) -> Option<String> {
+        self.mic
+            .checked_sub(1)
+            .and_then(|i| devices_in.get(i))
+            .cloned()
+    }
+
     pub fn recording(&self) -> bool {
         self.rec.is_some()
     }
@@ -215,12 +235,14 @@ impl VoicePanel {
     }
 
     /// The controls: choose a WAV or record, and hear the clip. Returns what to play.
-    pub fn ui(&mut self, ui: &mut Ui, devices_in: &[String]) -> Play {
+    pub fn ui(&mut self, ui: &mut Ui, devices_in: &[String], live: bool, on_air: bool) -> Play {
         let mut play = Play::Nothing;
         // Push to talk: hold the button (or the space bar) and speak; let go and it
         // is sent as one over, like keying a microphone.
-        let talking = self.recording();
-        let label = if talking {
+        let talking = self.recording() || (live && on_air);
+        let label = if talking && live {
+            "● ON AIR: let go to stop"
+        } else if talking {
             "● TALKING: let go to send"
         } else {
             "🎙  Hold to talk (PTT)  ·  or hold Space"
@@ -236,14 +258,25 @@ impl VoicePanel {
         let space = ui.ctx().input(|i| i.key_down(egui::Key::Space))
             && !ui.ctx().egui_wants_keyboard_input();
         let held = ptt.is_pointer_button_down_on() || space;
-        if held && !self.ptt_down && !talking {
+        if live {
+            // Live: the stream is the whole transmission; no recording here.
+            if held && !self.ptt_down && !on_air {
+                self.ptt_down = true;
+                play = Play::LiveStart;
+            } else if !held && self.ptt_down {
+                self.ptt_down = false;
+                play = Play::LiveStop;
+            }
+        } else if held && !self.ptt_down && !talking {
             self.ptt_down = true;
             self.start(devices_in);
         } else if !held && self.ptt_down {
             play = self.release();
         }
-        ui.checkbox(&mut self.send_on_release, "send when I let go")
-            .on_hover_text("Off: the speech is kept, and sent with Play to the sound card");
+        if !live {
+            ui.checkbox(&mut self.send_on_release, "send when I let go")
+                .on_hover_text("Off: the speech is kept, and sent with Play to the sound card");
+        }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!self.recording(), egui::Button::new("Choose WAV…"))
@@ -368,13 +401,21 @@ pub fn voice_card(ui: &mut Ui, v: &VoiceView) -> bool {
                     play = true;
                 }
                 ui.label(
-                    RichText::new(format!(
-                        "{:.1} s  ·  {}/{} frames{}",
-                        v.seconds,
-                        v.have,
-                        v.total,
-                        if v.complete { "  ·  complete" } else { "" }
-                    ))
+                    RichText::new(if v.live {
+                        format!(
+                            "{:.1} s  ·  {}",
+                            v.seconds,
+                            if v.complete { "complete" } else { "● LIVE" }
+                        )
+                    } else {
+                        format!(
+                            "{:.1} s  ·  {}/{} frames{}",
+                            v.seconds,
+                            v.have,
+                            v.total,
+                            if v.complete { "  ·  complete" } else { "" }
+                        )
+                    })
                     .size(11.0),
                 );
             });

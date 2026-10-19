@@ -1,13 +1,14 @@
 // made by CasualArclamp
-//! The header demodulator: 64 CSK256 symbols on the call code, rake-combined
-//! noncoherently, de-interleaved and LDPC-decoded.
+//! The header demodulator: CSK symbols on the call code (one of the alphabets of
+//! `tx::HEADER_ALPHABETS`), rake-combined noncoherently, de-interleaved and
+//! LDPC-decoded.
 
 use super::despread::{Track, csk_bit_llrs, despread, ln_i0, walsh_correlate, walsh_one};
 use super::frontend::Buf;
 use super::preamble::PreambleLock;
 use crate::codes::{CALL_CODE, Scrambler};
 use crate::framing::{HEADER_INFO_BITS, Header};
-use crate::tx::{HEADER_CSK, HEADER_SYMBOLS};
+use crate::tx::{header_bits, header_chips_l, header_len, header_symbols};
 use decdsss_dsp::Iq;
 use decdsss_fec::interleave::Interleaver;
 use decdsss_fec::ldpc::{Code, Decoder};
@@ -71,11 +72,21 @@ pub struct HeaderResult {
     pub snr_db: f64,
 }
 
-/// Demodulates the header that starts at `lock.header_start`.
-pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome {
+/// Chips of samples the demodulator needs past the header's own, and its
+/// length in samples at the lock's chip length: where the buffer must reach.
+pub fn header_need(lock: &PreambleLock, alphabet: usize) -> f64 {
     let fingers = pick_fingers(&lock.profile, 3);
     let max_lag = fingers.iter().map(|f| f.lag).fold(0.0f64, f64::max);
-    let total_chips = HEADER_SYMBOLS * HEADER_CSK;
+    lock.header_start + (header_len(alphabet) as f64 + max_lag + 6.0) * lock.step + 16.0
+}
+
+/// Demodulates the header, in CSK alphabet `alphabet`, that starts at
+/// `lock.header_start`.
+pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64, alphabet: usize) -> HeaderOutcome {
+    let (hl, nsym, bits) = (alphabet, header_symbols(alphabet), header_bits(alphabet));
+    let fingers = pick_fingers(&lock.profile, 3);
+    let max_lag = fingers.iter().map(|f| f.lag).fold(0.0f64, f64::max);
+    let total_chips = header_len(alphabet);
     let need = lock.header_start + (total_chips as f64 + max_lag + 6.0) * lock.step + 16.0;
     if need > buf.end() as f64 {
         return HeaderOutcome::NeedMore(need.ceil() as i64);
@@ -95,22 +106,22 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome 
         phase: 0.0,
         rate,
     };
-    let mut u = vec![Iq::new(0.0, 0.0); HEADER_CSK];
-    // W[symbol][finger] = the 256 correlations.
-    let mut w: Vec<Vec<Vec<Iq>>> = Vec::with_capacity(HEADER_SYMBOLS);
-    let mut decisions = Vec::with_capacity(HEADER_SYMBOLS);
+    let mut u = vec![Iq::new(0.0, 0.0); hl];
+    // W[symbol][finger] = the `hl` correlations.
+    let mut w: Vec<Vec<Vec<Iq>>> = Vec::with_capacity(nsym);
+    let mut decisions = Vec::with_capacity(nsym);
     let mut peak_prev: Option<Iq> = None;
     let mut freq_acc = Iq::new(0.0, 0.0);
     let (mut err_int, kp, ki) = (0.0f64, 0.15, 0.01);
-    for s in 0..HEADER_SYMBOLS {
-        let sc = &scr[s * HEADER_CSK..(s + 1) * HEADER_CSK];
+    for s in 0..nsym {
+        let sc = &scr[s * hl..(s + 1) * hl];
         let mut per_finger = Vec::with_capacity(fingers.len());
         for f in &fingers {
             despread(buf, &t, sc, f.lag, &mut u);
             per_finger.push(walsh_correlate(&u));
         }
         // The decision: the code with the most weighted power.
-        let mut power = vec![0.0f32; HEADER_CSK];
+        let mut power = vec![0.0f32; hl];
         for (f, wf) in fingers.iter().zip(&per_finger) {
             for (p, z) in power.iter_mut().zip(wf) {
                 *p += f.power * z.norm_sqr();
@@ -125,8 +136,8 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome 
         decisions.push(m);
         // Early/late on the main finger, with the decided code.
         let lag = fingers[main].lag;
-        let mut ue = vec![Iq::new(0.0, 0.0); HEADER_CSK];
-        let mut ul = vec![Iq::new(0.0, 0.0); HEADER_CSK];
+        let mut ue = vec![Iq::new(0.0, 0.0); hl];
+        let mut ul = vec![Iq::new(0.0, 0.0); hl];
         despread(buf, &t, sc, lag - 0.25, &mut ue);
         despread(buf, &t, sc, lag + 0.25, &mut ul);
         let (e, l) = (walsh_one(&ue, m).norm(), walsh_one(&ul, m).norm());
@@ -141,9 +152,9 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome 
         }
         peak_prev = Some(peak);
         w.push(per_finger);
-        t.advance(HEADER_CSK);
+        t.advance(hl);
     }
-    let t_sym = HEADER_CSK as f64 * t.step / rate;
+    let t_sym = hl as f64 * t.step / rate;
     let f_res = f64::from(freq_acc.arg()) / (std::f64::consts::TAU * t_sym);
     t.freq += 0.5 * f_res;
 
@@ -156,28 +167,30 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome 
             let wf = &w[s][f];
             let total: f64 = wf.iter().map(|z| f64::from(z.norm_sqr())).sum();
             let pk = f64::from(wf[m].norm_sqr());
-            sigma2[f] += (total - pk) / (HEADER_CSK as f64 - 1.0);
+            sigma2[f] += (total - pk) / (hl as f64 - 1.0);
             amp2[f] += pk;
         }
     }
     for f in 0..nf {
-        sigma2[f] /= HEADER_SYMBOLS as f64;
-        amp2[f] = (amp2[f] / HEADER_SYMBOLS as f64 - sigma2[f]).max(0.01 * sigma2[f]);
+        sigma2[f] /= nsym as f64;
+        amp2[f] = (amp2[f] / nsym as f64 - sigma2[f]).max(0.01 * sigma2[f]);
     }
     let kappa: Vec<f64> = (0..nf)
         .map(|f| 2.0 * amp2[f].sqrt() / sigma2[f].max(1e-30))
         .collect();
 
-    let mut llrs = Vec::with_capacity(HEADER_SYMBOLS * 8);
-    let mut metric = vec![0.0f64; HEADER_CSK];
+    let mut llrs = Vec::with_capacity(nsym * bits);
+    let mut metric = vec![0.0f64; hl];
     for sym in &w {
         for (m, v) in metric.iter_mut().enumerate() {
             *v = (0..nf)
                 .map(|f| ln_i0(kappa[f] * f64::from(sym[f][m].norm())))
                 .sum();
         }
-        csk_bit_llrs(&metric, 8, &mut llrs);
+        csk_bit_llrs(&metric, bits, &mut llrs);
     }
+    // The last symbol may carry padding bits past the codeword.
+    llrs.truncate(Code::header().n());
     let llrs = Interleaver::new(llrs.len()).invert(&llrs);
     let code = Code::header();
     let mut dec = Decoder::new(code);
@@ -192,7 +205,7 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome 
     // exact chips, from where the preamble put the start, and re-derive the
     // rake fingers from them, on the refined reference.
     let mut fingers = fingers;
-    if let Some(known) = crate::tx::header_chips(&header) {
+    if let Some(known) = header_chips_l(&header, hl) {
         let t0 = Track {
             pos: lock.header_start,
             step: lock.step,
@@ -302,6 +315,47 @@ mod tests {
                     }
                 }
                 println!("{name:9} {snr:6.1} dB: header ok {ok}/{trials} {why:?}");
+            }
+        }
+    }
+
+    /// Header success against SNR for each alphabet, on AWGN and the moderate
+    /// channel; run with
+    /// `cargo test -p decdsss-phy --release -- --ignored --nocapture header_alphabet_curve`.
+    #[test]
+    #[ignore]
+    fn header_alphabet_curve() {
+        use crate::tx::{HEADER_ALPHABETS, chips_to_audio, header_chips_l, preamble_chips};
+        let profile = Profile::W2400;
+        let seg = segment(profile, "ds8-1/2", 1, 1);
+        let chans: [(&str, Option<Watterson>); 2] =
+            [("awgn", None), ("moderate", Some(Watterson::MODERATE))];
+        for (name, fading) in chans {
+            for &l in &HEADER_ALPHABETS {
+                let mut chips = preamble_chips(profile);
+                chips.extend(header_chips_l(&seg.header, l).unwrap());
+                chips.extend(std::iter::repeat_n(decdsss_dsp::Iq::new(0.0, 0.0), 4000));
+                let audio = chips_to_audio(&chips, profile, 48_000.0, 0.2, 1.0, 1.0);
+                let mut row = format!("{name:9} L={l:3}:");
+                for snr in [-16.0, -13.0, -10.0, -7.0, -4.0, -1.0, 2.0, 5.0, 8.0] {
+                    let trials = 10;
+                    let mut ok = 0;
+                    for seed in 0..trials {
+                        let mut ch = channel(profile, snr);
+                        ch.seed = 700 + seed;
+                        ch.fading = fading;
+                        ch.offset_hz = -15.0 + seed as f64 * 3.0;
+                        ch.clock_ppm = -30.0 + seed as f64 * 6.0;
+                        let heard = ch.apply(&audio, 48_000.0);
+                        if let Ok(r) = to_header(&heard, profile)
+                            && r.header.header == seg.header
+                        {
+                            ok += 1;
+                        }
+                    }
+                    row += &format!(" {snr:+.0}:{ok:2}");
+                }
+                println!("{row}");
             }
         }
     }

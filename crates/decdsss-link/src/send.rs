@@ -16,7 +16,7 @@
 use crate::erasure::{self, MAX_BLOCKS};
 use decdsss_core::{Mode, Profile};
 use decdsss_phy::framing::{Header, Layout, PayloadType};
-use decdsss_phy::tx::{Segment, lead_chips};
+use decdsss_phy::tx::{Segment, lead_chips_for};
 
 /// Bytes of frame data ahead of the shard: the ident and the shard count.
 pub const FRAME_META: usize = 4;
@@ -122,7 +122,7 @@ pub(crate) fn air_time(p: &Frames, total_frames: usize) -> f64 {
     let blocks = total_frames.div_ceil(p.depth);
     let per_segment = ((p.resync_s / layout.seconds()).floor() as usize).clamp(1, 4095);
     let segments = blocks.div_ceil(per_segment);
-    let lead = lead_chips(p.profile) as f64 / f64::from(p.profile.chip_rate());
+    let lead = lead_chips_for(p.profile, p.mode) as f64 / f64::from(p.profile.chip_rate());
     blocks as f64 * layout.seconds() + segments as f64 * lead
 }
 

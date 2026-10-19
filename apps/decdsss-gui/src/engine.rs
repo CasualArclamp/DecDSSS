@@ -6,6 +6,7 @@
 
 use crate::demo;
 use crate::monitor::Monitor;
+use crate::player::Player;
 use crate::spectrum::Spectrum;
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
 use decdsss_codec2::Mode as Codec;
@@ -49,6 +50,16 @@ pub enum Cmd {
     Stop,
     /// Stops the transmission (or playback) in progress at once.
     StopTransmit,
+    /// The output live speech is played on (speakers or headphones).
+    Listen {
+        device: Option<String>,
+    },
+    /// Speech (8 kHz) for the speech output, as if it had just been decoded from a
+    /// live transmission (`last`: the end of it); for checking the output.
+    Speech {
+        pcm: Vec<i16>,
+        last: bool,
+    },
     /// The RF monitor: play what the receiver hears on an output device.
     Monitor {
         on: bool,
@@ -106,6 +117,8 @@ pub struct VoiceView {
     pub wave: Vec<(f32, f32)>,
     pub seconds: f64,
     pub complete: bool,
+    /// A live transmission: the speech so far, still coming unless `complete`.
+    pub live: bool,
 }
 
 /// How far a transmission has got, for the progress bars.
@@ -230,6 +243,8 @@ struct Run {
     picture_version: u64,
     /// The same for speech: with the frames it was last drawn from.
     voices: Vec<((String, u8), usize, Arc<VoiceView>)>,
+    /// The codec of each live transmission heard (from its header's type).
+    live_codec: BTreeMap<(String, u8), Codec>,
 }
 
 /// Speech cards kept on the display.
@@ -270,11 +285,57 @@ fn update_voice(r: &mut Run, call: &str, session: u8) {
         speech: Arc::new(speech),
         wave,
         complete: p.have == p.total,
+        live: false,
     });
     match at {
         Some(i) => r.voices[i] = (key, p.have, view),
         None => {
             r.voices.push((key, p.have, view));
+            if r.voices.len() > VOICES_MAX {
+                r.voices.remove(0);
+            }
+        }
+    }
+}
+
+/// Redraws a live transmission's card from the speech so far.
+fn update_live_view(r: &mut Run, call: &str, session: u8) {
+    let Some((speech, done)) = r.asm.live_speech(call, session) else {
+        return;
+    };
+    let speech = speech.to_vec();
+    let per_col = speech.len().div_ceil(WAVE_COLS).max(1);
+    let wave: Vec<(f32, f32)> = speech
+        .chunks(per_col)
+        .map(|c| {
+            let lo = c.iter().copied().min().unwrap_or(0);
+            let hi = c.iter().copied().max().unwrap_or(0);
+            (f32::from(lo) / 32768.0, f32::from(hi) / 32768.0)
+        })
+        .collect();
+    let key = (call.to_string(), session);
+    let at = r.voices.iter().position(|(k, ..)| *k == key);
+    let view = Arc::new(VoiceView {
+        call: call.to_string(),
+        session,
+        codec: if let Some(h) = r.live_codec.get(&key) {
+            *h
+        } else {
+            Codec::C450
+        },
+        have: 0,
+        total: 0,
+        map: Vec::new(),
+        seconds: speech.len() as f64 / 8000.0,
+        speech: Arc::new(speech),
+        wave,
+        complete: done,
+        live: true,
+    });
+    match at {
+        Some(i) => r.voices[i] = (key, 0, view),
+        None => {
+            r.voices.push((key, 0, view));
             if r.voices.len() > VOICES_MAX {
                 r.voices.remove(0);
             }
@@ -373,6 +434,7 @@ fn log(shared: &Arc<Mutex<Shared>>, line: String) {
 fn worker(shared: Arc<Mutex<Shared>>, rx: Receiver<Cmd>) {
     let mut run: Option<Run> = None;
     let mut monitor = Monitor::default();
+    let mut player = Player::default();
     let tx_stop = Arc::new(AtomicBool::new(false));
     loop {
         // Commands: block briefly when idle, poll when running.
@@ -413,6 +475,12 @@ fn worker(shared: Arc<Mutex<Shared>>, rx: Receiver<Cmd>) {
                 shared.lock().unwrap().monitor_error = None;
             }
             Some(Cmd::StopTransmit) => tx_stop.store(true, Ordering::Relaxed),
+            Some(Cmd::Listen { device }) => player.configure(device),
+            Some(Cmd::Speech { pcm, last }) => {
+                if let Some(e) = player.push(&pcm, last) {
+                    log(&shared, e);
+                }
+            }
             Some(Cmd::Transmit {
                 audio,
                 rate,
@@ -420,8 +488,10 @@ fn worker(shared: Arc<Mutex<Shared>>, rx: Receiver<Cmd>) {
             }) => transmit(&shared, audio, rate, device, tx_stop.clone()),
             None => {}
         }
+        // The speech output is fed whether or not a receiver is running.
+        player.tick();
         let Some(r) = run.as_mut() else { continue };
-        if !step(&shared, r, &mut monitor) {
+        if !step(&shared, r, &mut monitor, &mut player) {
             run = None;
             let mut g = shared.lock().unwrap();
             g.running = false;
@@ -509,12 +579,18 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
         pictures: Vec::new(),
         picture_version: 0,
         voices: Vec::new(),
+        live_codec: BTreeMap::new(),
     })
 }
 
 /// Reads what is available, processes it, publishes. False when a finite
 /// source has run out.
-fn step(shared: &Arc<Mutex<Shared>>, r: &mut Run, monitor: &mut Monitor) -> bool {
+fn step(
+    shared: &Arc<Mutex<Shared>>,
+    r: &mut Run,
+    monitor: &mut Monitor,
+    player: &mut Player,
+) -> bool {
     let chunk: Vec<f32> = match &mut r.reader {
         Reader::Device(input) => {
             if input.is_dead() {
@@ -574,7 +650,7 @@ fn step(shared: &Arc<Mutex<Shared>>, r: &mut Run, monitor: &mut Monitor) -> bool
         }
         let t = r.samples as f64 / r.rate;
         for tagged in r.mr.push(&chunk) {
-            handle_event(shared, r, t, tagged.profile, tagged.event);
+            handle_event(shared, r, player, t, tagged.profile, tagged.event);
         }
         shared.lock().unwrap().level = peak;
     }
@@ -582,7 +658,14 @@ fn step(shared: &Arc<Mutex<Shared>>, r: &mut Run, monitor: &mut Monitor) -> bool
     true
 }
 
-fn handle_event(shared: &Arc<Mutex<Shared>>, r: &mut Run, t: f64, profile: Profile, event: Event) {
+fn handle_event(
+    shared: &Arc<Mutex<Shared>>,
+    r: &mut Run,
+    player: &mut Player,
+    t: f64,
+    profile: Profile,
+    event: Event,
+) {
     let p = profile.label();
     match event {
         Event::Acquired(d) if r.details => log(
@@ -643,8 +726,20 @@ fn handle_event(shared: &Arc<Mutex<Shared>>, r: &mut Run, t: f64, profile: Profi
                 );
             }
             let finished = r.asm.push(&header, &result);
-            if decdsss_link::voice::codec_of(header.ptype).is_some() {
-                update_voice(r, &header.call, header.session);
+            if let Some(codec) = decdsss_link::voice::codec_of(header.ptype) {
+                if header.total_frames == 0 {
+                    // Live speech: played as it comes, and drawn.
+                    r.live_codec
+                        .insert((header.call.clone(), header.session), codec);
+                    for c in r.asm.take_live() {
+                        if let Some(e) = player.push(&c.pcm, c.ended) {
+                            log(shared, format!("[{t:6.1}s] {e}"));
+                        }
+                    }
+                    update_live_view(r, &header.call, header.session);
+                } else {
+                    update_voice(r, &header.call, header.session);
+                }
                 for v in r.asm.take_voice() {
                     save_voice(shared, r, t, v);
                 }

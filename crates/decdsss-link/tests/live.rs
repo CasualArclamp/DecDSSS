@@ -194,7 +194,8 @@ fn live_speech_streams_and_plays_without_running_dry() {
 }
 
 fn tx_lead(_audio: &[f32]) -> f64 {
-    12.3
+    // 14 preamble periods and a 64-code header at 1920 chip/s.
+    (7154.0 + 5504.0) / 1920.0
 }
 
 fn tx_block() -> f64 {

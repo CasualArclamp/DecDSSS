@@ -73,9 +73,15 @@ pub struct Automation {
     /// stop it this many seconds in (for checking the Stop button).
     pub tx_play: Option<String>,
     pub tx_stop: Option<f64>,
+    /// Listen on the output whose name contains this, and (with `listen_test`) send
+    /// a tone to it one second in, through the live speech player.
+    pub listen: Option<String>,
+    pub listen_test: bool,
     /// Hold the PTT this long from the input `mic` (half a second in), then let go:
     /// what was said is sent on the output named by `tx_play`.
     pub ptt_for: Option<f64>,
+    /// Like `ptt_for`, but live: stream from the microphone for this long.
+    pub live_for: Option<f64>,
     pub requested_at: Option<Instant>,
 }
 
@@ -111,6 +117,8 @@ pub struct App {
     played: std::collections::BTreeSet<(String, u8)>,
     /// Smoothed frames a second, for the top bar.
     fps: f32,
+    /// Frames a second from the time between frames (updated in `logic`).
+    measured_fps: f32,
     /// When the last frame began, for the 60 fps limit.
     last_frame: Instant,
     /// Frame counting for `DECDSSS_FPS`.
@@ -122,6 +130,11 @@ pub struct App {
     tx_play_started: bool,
     /// `--ptt-for` has let go.
     ptt_released: bool,
+    /// `--listen-test` has sent its tone.
+    listen_tested: bool,
+    /// `--live-for` has keyed up, and let go.
+    live_started: bool,
+    live_stopped: bool,
     /// The last view of each station, kept after its segment ends so the card
     /// does not flicker away between segments: (profile, call, session).
     stations: std::collections::BTreeMap<(usize, String, u8), (ChannelView, Instant)>,
@@ -172,6 +185,7 @@ impl App {
             || auto.tx_file.is_some()
             || auto.record_for.is_some()
             || auto.ptt_for.is_some()
+            || auto.live_for.is_some()
         {
             view = View::Tx;
         }
@@ -221,15 +235,29 @@ impl App {
             auto_play_rx: true,
             played: Default::default(),
             fps: 0.0,
+            measured_fps: 0.0,
             last_frame: Instant::now(),
             frames: 0,
             fps_since: Instant::now(),
             recording_started: false,
             tx_play_started: false,
             ptt_released: false,
+            listen_tested: false,
+            live_started: false,
+            live_stopped: false,
             stations: Default::default(),
             pictures: Default::default(),
         };
+        if let Some(hint) = app.auto.listen.clone() {
+            app.monitor_device = app
+                .devices_out
+                .iter()
+                .position(|d| d.0.to_lowercase().contains(&hint.to_lowercase()))
+                .map_or(0, |i| i + 1);
+            app.engine.send(Cmd::Listen {
+                device: app.listen().0,
+            });
+        }
         if let Some(hint) = app.auto.monitor.clone() {
             app.monitor_on = true;
             app.monitor_device = app
@@ -385,11 +413,10 @@ impl App {
             );
             ui.label(format!("{:.0} s", sh.seconds));
             // The measured frame rate of the window (the waterfall scrolls a row a frame).
-            let dt = ui.ctx().input(|i| i.stable_dt).max(1e-3);
-            self.fps += 0.1 * (1.0 / dt - self.fps);
+            self.fps += 0.1 * (self.measured_fps - self.fps);
             ui.label(RichText::new(format!("{:.0} fps", self.fps)).weak());
             // Whatever tab is showing, a transmission in progress can be stopped.
-            if sh.tx.active
+            if (sh.tx.active || self.tx.live_active())
                 && ui
                     .add(egui::Button::new(RichText::new("■ STOP").strong()).fill(col::BAD))
                     .on_hover_text(
@@ -397,6 +424,7 @@ impl App {
                     )
                     .clicked()
             {
+                self.tx.abort_live();
                 self.engine.send(Cmd::StopTransmit);
             }
             ui.separator();
@@ -473,6 +501,9 @@ impl App {
                     })
                     .flatten(),
                 volume: self.monitor_volume,
+            });
+            self.engine.send(Cmd::Listen {
+                device: self.listen().0,
             });
             if self.auto.screenshot.is_none() {
                 self.prefs
@@ -875,6 +906,35 @@ impl App {
             }
         }
         let t = now.duration_since(self.started).as_secs_f64();
+        if self.auto.listen_test && t >= 1.0 && !self.listen_tested {
+            self.listen_tested = true;
+            // Three seconds of a 440 Hz tone, in chunks of a second.
+            let tone: Vec<i16> = (0..24_000)
+                .map(|i| {
+                    (6000.0 * (std::f64::consts::TAU * 440.0 * f64::from(i) / 8000.0).sin()) as i16
+                })
+                .collect();
+            for (k, c) in tone.chunks(8000).enumerate() {
+                self.engine.send(Cmd::Speech {
+                    pcm: c.to_vec(),
+                    last: k == 2,
+                });
+            }
+        }
+        if let Some(hold) = self.auto.live_for {
+            let (devices_out, devices_in) = (self.devices_out.clone(), self.devices_in.clone());
+            if t >= 0.5 && !self.live_started {
+                self.live_started = true;
+                let mic = self.auto.mic.clone().unwrap_or_default();
+                let out = self.auto.tx_play.clone().unwrap_or_default();
+                self.tx
+                    .auto_live_start(&devices_out, &devices_in, &mic, &out);
+            }
+            if t >= 0.5 + hold && !self.live_stopped {
+                self.live_stopped = true;
+                self.tx.auto_live_stop();
+            }
+        }
         if let Some(hold) = self.auto.ptt_for {
             if t >= 0.5 && !self.recording_started {
                 self.recording_started = true;
@@ -997,6 +1057,22 @@ fn attempt_card(ui: &mut Ui, a: &AttemptView, w: f32) {
     if !a.periods.is_empty() {
         scope::preamble_bars(ui, &a.periods, vec2(w, 54.0));
     }
+    if a.header_stage && a.header_needs_s > 0.0 {
+        // The header is a stretch of its own, from a second to eight and a half:
+        // how far into it the receiver is, and which header it is waiting for (the
+        // shortest is tried first, and a longer one if that does not decode).
+        let frac = (a.header_since_s / a.header_needs_s).clamp(0.0, 1.0) as f32;
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .desired_width(w - 24.0)
+                .text(format!(
+                    "header: {:.1} of {:.1} s  ·  trying the {}-code header",
+                    a.header_since_s.min(a.header_needs_s),
+                    a.header_needs_s,
+                    a.header_alphabet
+                )),
+        );
+    }
 }
 
 fn channel_card(ui: &mut Ui, c: &ChannelView, tr: Option<&Transfer>, w: f32, is_live: bool) {
@@ -1103,6 +1179,9 @@ impl eframe::App for App {
         if since < frame {
             std::thread::sleep(frame - since);
         }
+        // The frame rate as it is, from the time between frames.
+        let dt = self.last_frame.elapsed().as_secs_f32().max(1e-3);
+        self.measured_fps += 0.1 * (1.0 / dt - self.measured_fps);
         self.last_frame = Instant::now();
         self.tx.background(ctx);
         self.automate(ctx);
@@ -1191,7 +1270,7 @@ impl eframe::App for App {
         let listen = self.listen();
         // Received speech plays when it is whole, once (not in unattended runs).
         if self.auto_play_rx && self.auto.screenshot.is_none() && !sh.tx.active {
-            for v in sh.voices.iter().filter(|v| v.complete) {
+            for v in sh.voices.iter().filter(|v| v.complete && !v.live) {
                 if self.played.insert((v.call.clone(), v.session)) {
                     self.play_speech(&v.speech);
                 }

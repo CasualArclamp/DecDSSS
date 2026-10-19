@@ -20,9 +20,53 @@ use decdsss_dsp::shaper::Shaper;
 use decdsss_fec::interleave::Interleaver;
 use decdsss_fec::ldpc::Code;
 
-/// The header's CSK alphabet and symbol count: 256 chips a symbol, 8 bits each.
+/// The long header's CSK alphabet and symbol count: 256 chips a symbol, 8 bits each.
 pub const HEADER_CSK: usize = 256;
 pub const HEADER_SYMBOLS: usize = 512 / 8;
+
+/// The CSK alphabets a header may use (chips and codes to a symbol), shortest
+/// first. A small alphabet is a short header (16: 128 symbols of 16 chips, 2048
+/// chips, about a second) that needs a stronger signal; 256 is the long one
+/// (16384 chips, 8.5 s) for the weakest modes. The receiver tries them in this
+/// order, as soon as each could be in, so it starts as early as the transmitter
+/// allows.
+pub const HEADER_ALPHABETS: [usize; 5] = [16, 32, 64, 128, 256];
+
+/// Bits in a header symbol of alphabet `l`.
+pub fn header_bits(l: usize) -> usize {
+    l.trailing_zeros() as usize
+}
+
+/// Symbols in a header of alphabet `l` (the 512 coded bits, the last symbol
+/// padded with zeros).
+pub fn header_symbols(l: usize) -> usize {
+    512usize.div_ceil(header_bits(l))
+}
+
+/// Chips in a header of alphabet `l`.
+pub fn header_len(l: usize) -> usize {
+    header_symbols(l) * l
+}
+
+/// The alphabet a transmission in `mode` sends its header in: the shortest that
+/// still decodes some way below the payload's own threshold and leaves the payload
+/// as well started as the long header does. Measured at 2.4 kHz (`header_alphabet_curve`,
+/// ten trials a point; in-band SNR from which the header decoded on the moderate
+/// fading channel, AWGN 3-9 dB lower): 16 about +8 dB, 32 -1 dB, 64 about -4 dB
+/// (8 of 10, 10 of 10 from +5), 128 -7 dB, 256 -4 dB (and 8 of 10 at -13). The
+/// payload, over 256 transmissions a point: DS4 2/3 at 24 dB Eb/N0 lost 1.3 % of its
+/// frames with the long header, 0.9 % with 64, 1.2 % with 128 and 2.8 % with 32 (a
+/// short header gives the timing loop less to start from); DS8 1/2 at 10 dB 2.3 %,
+/// 3.2 %, 3.2 % for 256, 128, 64. So the fast modes use 64 (DS4) and 128 (SF 8, 16);
+/// the slow ones keep the 256 they need.
+pub fn header_alphabet_for(mode: decdsss_core::Mode) -> usize {
+    use decdsss_core::Family;
+    match (mode.family, mode.spread) {
+        (Family::DsPsk, 0..=4) => 64,
+        (Family::DsPsk, 5..=16) => 128,
+        _ => HEADER_CSK,
+    }
+}
 
 /// The known value of the k-th pilot of a block: QPSK from an m-sequence.
 pub fn pilot_symbol(k: usize) -> Iq {
@@ -57,18 +101,27 @@ pub fn preamble_chips(profile: Profile) -> Vec<Iq> {
     v
 }
 
-/// Chips of the header: 128 information bits to the 512-bit header
+/// Chips of the long header: 128 information bits to the 512-bit header
 /// codeword (rate 1/4), interleaved, 64 CSK256 symbols on the call code.
 pub fn header_chips(h: &Header) -> Option<Vec<Iq>> {
+    header_chips_l(h, HEADER_CSK)
+}
+
+/// Chips of the header in CSK alphabet `l` (one of [`HEADER_ALPHABETS`]): the
+/// same codeword, `log2 l` bits to a symbol.
+pub fn header_chips_l(h: &Header, l: usize) -> Option<Vec<Iq>> {
     let info = h.pack()?;
     let cw = Code::header().encode(&info);
     let sent = Interleaver::new(cw.len()).apply(&cw);
     let scr = Scrambler::new(CALL_CODE);
-    let mut chips = Vec::with_capacity(HEADER_SYMBOLS * HEADER_CSK);
-    for (s, bits) in sent.chunks(8).enumerate() {
-        let m = bits.iter().fold(0usize, |a, &b| (a << 1) | usize::from(b));
-        for i in 0..HEADER_CSK {
-            chips.push(scr.chip(s * HEADER_CSK + i) * walsh_chip(m, i));
+    let mut chips = Vec::with_capacity(header_len(l));
+    for (s, bits) in sent.chunks(header_bits(l)).enumerate() {
+        // The last symbol may have fewer bits: pad with zeros.
+        let m = (0..header_bits(l)).fold(0usize, |a, i| {
+            (a << 1) | usize::from(bits.get(i).copied().unwrap_or(0))
+        });
+        for i in 0..l {
+            chips.push(scr.chip(s * l + i) * walsh_chip(m, i));
         }
     }
     Some(chips)
@@ -159,7 +212,7 @@ pub fn segment_chips(seg: &Segment) -> Option<Vec<Iq>> {
     let h = &seg.header;
     let layout = Layout::new(h.profile, h.mode, h.depth);
     let mut chips = preamble_chips(h.profile);
-    chips.extend(header_chips(h)?);
+    chips.extend(header_chips_l(h, header_alphabet_for(h.mode))?);
     let scr = Scrambler::new(own_code(&h.call)?);
     let mut chip0 = 0;
     for b in 0..usize::from(h.nblocks) {
@@ -226,7 +279,10 @@ impl LiveTx {
     /// The audio of the preamble and the header, to be sent first.
     pub fn lead(&mut self) -> Vec<f32> {
         let mut chips = preamble_chips(self.header.profile);
-        chips.extend(header_chips(&self.header).expect("the header packed in new()"));
+        chips.extend(
+            header_chips_l(&self.header, header_alphabet_for(self.header.mode))
+                .expect("the header packed in new()"),
+        );
         let mut audio = Vec::new();
         self.shaper.push(&chips, &mut audio);
         audio
@@ -260,14 +316,24 @@ impl LiveTx {
 
     /// Seconds of signal before the first block (preamble and header).
     pub fn lead_seconds(&self) -> f64 {
-        lead_chips(self.header.profile) as f64 / f64::from(self.header.profile.chip_rate())
+        lead_chips_for(self.header.profile, self.header.mode) as f64
+            / f64::from(self.header.profile.chip_rate())
     }
 }
 
-/// Chips up to the first payload block: preamble plus header.
+/// Chips up to the first payload block with the long header: preamble plus header.
 pub fn lead_chips(profile: Profile) -> usize {
-    (PRE_A_PERIODS + PRE_B_PERIODS) * crate::codes::preamble_len(profile)
-        + HEADER_SYMBOLS * HEADER_CSK
+    lead_chips_with(profile, HEADER_CSK)
+}
+
+/// Chips up to the first payload block of a transmission in `mode`.
+pub fn lead_chips_for(profile: Profile, mode: decdsss_core::Mode) -> usize {
+    lead_chips_with(profile, header_alphabet_for(mode))
+}
+
+/// Chips up to the first payload block with a header of alphabet `l`.
+pub fn lead_chips_with(profile: Profile, l: usize) -> usize {
+    (PRE_A_PERIODS + PRE_B_PERIODS) * crate::codes::preamble_len(profile) + header_len(l)
 }
 
 /// Chips to audio at `sample_rate`: RRC-shaped, on the profile's audio
@@ -349,7 +415,8 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(worst < 1e-6, "{worst}");
-        assert!((live.lead_seconds() - 12.27).abs() < 0.02);
+        // 14 preamble periods of 511 chips and a 64-code header (86 symbols).
+        assert!((live.lead_seconds() - (7154.0 + 5504.0) / 1920.0).abs() < 0.02);
         assert!(
             (live.block_seconds() - 2.75).abs() < 0.05,
             "{}",
@@ -365,7 +432,7 @@ mod tests {
             let chips = segment_chips(&s).unwrap();
             assert_eq!(
                 chips.len(),
-                lead_chips(Profile::W2400) + 3 * layout.chips(),
+                lead_chips_for(Profile::W2400, s.header.mode) + 3 * layout.chips(),
                 "{mode}"
             );
         }

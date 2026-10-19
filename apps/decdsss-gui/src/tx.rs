@@ -3,6 +3,7 @@
 //! DecDSSS never keys a transmitter; it plays audio and you do the rest.
 
 use crate::engine::{Cmd, Engine, TxState};
+use crate::live::{LiveConfig, LiveTxSession, Phase};
 use crate::prefs::Prefs;
 use crate::voice::{Play, VoicePanel};
 use decdsss_audio::wav;
@@ -140,6 +141,10 @@ pub struct TxPanel {
     vox: bool,
     /// What the speech summary was worked out for, and the summary.
     voice_summary: Option<(String, Result<String, String>)>,
+    /// Live voice (streamed while the PTT is held) rather than overs.
+    live_mode: bool,
+    /// The live transmission in progress.
+    live: Option<LiveTxSession>,
 }
 
 impl Default for TxPanel {
@@ -169,6 +174,8 @@ impl Default for TxPanel {
             codec: None,
             vox: false,
             voice_summary: None,
+            live_mode: false,
+            live: None,
         }
     }
 }
@@ -248,6 +255,40 @@ impl TxPanel {
         }
     }
 
+    /// Starts a live transmission as if the PTT had gone down: the microphone is the
+    /// input whose name contains `mic_hint`, the output the one with `out_hint` (for
+    /// `--live-for`).
+    pub fn auto_live_start(
+        &mut self,
+        devices_out: &[(String, u32)],
+        devices_in: &[String],
+        mic_hint: &str,
+        out_hint: &str,
+    ) {
+        if self.call.is_empty() {
+            self.call = "VK2ABC".into();
+        }
+        self.voice = true;
+        self.live_mode = true;
+        if let Some(vm) = Mode::voice(self.profile) {
+            self.mode = vm.name();
+        }
+        self.depth = 2;
+        self.vp.select_mic(devices_in, mic_hint);
+        self.device = devices_out
+            .iter()
+            .position(|d| d.0.to_lowercase().contains(&out_hint.to_lowercase()))
+            .map_or(0, |i| i + 1);
+        self.start_live(devices_out, devices_in);
+    }
+
+    /// Lets go of the PTT of [`TxPanel::auto_live_start`].
+    pub fn auto_live_stop(&mut self) {
+        if let Some(s) = &self.live {
+            s.stop();
+        }
+    }
+
     /// Stops a recording started by [`TxPanel::auto_record`].
     pub fn auto_stop(&mut self) {
         self.vp.finish();
@@ -298,7 +339,7 @@ impl TxPanel {
     fn play_voice(&mut self, which: Play, engine: &Engine, listen: &(Option<String>, u32)) {
         let Some(clip) = &self.vp.clip else { return };
         let pcm: Vec<i16> = match which {
-            Play::Nothing | Play::Send => return,
+            Play::Nothing | Play::Send | Play::LiveStart | Play::LiveStop => return,
             Play::Clip => clip.pcm.clone(),
             Play::AsSent => {
                 let Some(spec) = self.voice_spec() else {
@@ -353,6 +394,59 @@ impl TxPanel {
         }
     }
 
+    /// Keys up and starts streaming the microphone.
+    fn start_live(&mut self, devices_out: &[(String, u32)], devices_in: &[String]) {
+        if self.live.is_some() {
+            return;
+        }
+        let Some(call) = normalise_call(&self.call) else {
+            self.note = "enter your callsign (letters, digits and /, up to 9)".into();
+            return;
+        };
+        let Some(spec) = self.voice_spec() else {
+            self.note = "this bandwidth is too narrow for voice".into();
+            return;
+        };
+        let (out_device, out_rate) = self.output(devices_out);
+        let mic_device = self.vp.mic_name(devices_in);
+        let session = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            % 64) as u8;
+        let cfg = LiveConfig {
+            profile: spec.profile,
+            mode: spec.mode,
+            depth: spec.depth,
+            call,
+            session,
+            codec: spec.codec,
+            level: self.level,
+            vox: self.vox,
+            out_device,
+            out_rate,
+            mic_device,
+        };
+        match LiveTxSession::start(&cfg) {
+            Ok(s) => {
+                self.note.clear();
+                self.live = Some(s);
+            }
+            Err(e) => self.note = e,
+        }
+    }
+
+    /// Whether a live transmission is going out.
+    pub fn live_active(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Cuts a live transmission at once.
+    pub fn abort_live(&mut self) {
+        if let Some(s) = self.live.take() {
+            s.abort();
+        }
+    }
+
     /// The speech controls and what sending the clip comes to.
     fn voice_section(
         &mut self,
@@ -362,11 +456,55 @@ impl TxPanel {
         devices_out: &[(String, u32)],
         listen: &(Option<String>, u32),
     ) {
-        let play = self.vp.ui(ui, devices_in);
-        if play == Play::Send {
-            self.send_transmission(engine, devices_out);
-        } else {
-            self.play_voice(play, engine, listen);
+        ui.horizontal(|ui| {
+            ui.label("Voice");
+            ui.selectable_value(&mut self.live_mode, false, "overs")
+                .on_hover_text("Hold to talk, let go and it is sent as one over");
+            ui.selectable_value(&mut self.live_mode, true, "live")
+                .on_hover_text(
+                    "Streamed while you hold the PTT, and played as it arrives at the other end",
+                );
+        });
+        let on_air = self.live.is_some();
+        let play = self.vp.ui(ui, devices_in, self.live_mode, on_air);
+        match play {
+            Play::Send => self.send_transmission(engine, devices_out),
+            Play::LiveStart => self.start_live(devices_out, devices_in),
+            Play::LiveStop => {
+                if let Some(s) = &self.live {
+                    s.stop();
+                }
+            }
+            _ => self.play_voice(play, engine, listen),
+        }
+        if let Some(s) = &self.live {
+            let st = s.status();
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    crate::scope::col::BAD,
+                    match st.phase {
+                        Phase::Starting => format!(
+                            "● ON AIR: keying up, speech goes out in {:.0} s",
+                            (st.lead_s - st.elapsed).max(0.0)
+                        ),
+                        Phase::OnAir => format!("● ON AIR  {:.0} s", st.elapsed - st.lead_s),
+                        Phase::Ending => "sending the end".into(),
+                        Phase::Done => String::new(),
+                    },
+                );
+                ui.add(
+                    egui::ProgressBar::new(st.mic_peak.clamp(0.0, 1.0))
+                        .desired_width(90.0)
+                        .fill(crate::scope::col::LOCK),
+                );
+            });
+            ui.label(
+                RichText::new(format!(
+                    "{:.1} s of speech waiting to go out  ·  {} blocks sent, {} fillers",
+                    st.backlog_s, st.blocks, st.fillers
+                ))
+                .size(11.0),
+            );
         }
         ui.horizontal(|ui| {
             ui.label("Codec2");
@@ -678,6 +816,17 @@ impl TxPanel {
     pub fn background(&mut self, ctx: &Context) {
         self.drive_picture(ctx);
         self.vp.tick(ctx);
+        if let Some(s) = &self.live {
+            let st = s.status();
+            if st.phase == Phase::Done {
+                if let Some(e) = st.error {
+                    self.note = e;
+                }
+                self.live = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
     }
 
     /// The transmit controls, drawn into `ui`.

@@ -72,6 +72,7 @@ pub fn to_header(audio: &[f32], profile: Profile) -> Result<Run, String> {
     let mut buf = Buf::default();
     let mut tracker: Option<PreambleTracker> = None;
     let mut lock: Option<PreambleLock> = None;
+    let mut alphabet = 0;
     let rate = fe.out_rate();
     for chunk in audio.chunks(2400) {
         let mut bb = Vec::new();
@@ -92,17 +93,23 @@ pub fn to_header(audio: &[f32], profile: Profile) -> Result<Run, String> {
             }
         }
         if let Some(l) = &lock {
-            match demod_header(&buf, l, rate) {
-                HeaderOutcome::NeedMore(_) => {}
-                HeaderOutcome::Bad(why) => return Err(format!("header: {why}")),
-                HeaderOutcome::Decoded(h) => {
-                    return Ok(Run {
-                        fe,
-                        buf,
-                        lock: l.clone(),
-                        header: *h,
-                    });
+            // The alphabets in turn, as the receiver tries them.
+            while alphabet < crate::tx::HEADER_ALPHABETS.len() {
+                match demod_header(&buf, l, rate, crate::tx::HEADER_ALPHABETS[alphabet]) {
+                    HeaderOutcome::NeedMore(_) => break,
+                    HeaderOutcome::Bad(_) => alphabet += 1,
+                    HeaderOutcome::Decoded(h) => {
+                        return Ok(Run {
+                            fe,
+                            buf,
+                            lock: l.clone(),
+                            header: *h,
+                        });
+                    }
                 }
+            }
+            if alphabet == crate::tx::HEADER_ALPHABETS.len() {
+                return Err("header: it did not decode in any alphabet".into());
             }
         }
     }
@@ -127,7 +134,8 @@ pub fn genie(seg: &Segment, ch: &Channel, audio: &[f32]) -> (super::payload::Pay
     let lead = 1.0;
     // Position of the first payload chip.
     let first_chip = ((lead + 10.0 / cr) * rate + fe.delay()) / r;
-    let pos = first_chip + crate::tx::lead_chips(profile) as f64 * super::frontend::SPS as f64 / r;
+    let lead = crate::tx::lead_chips_for(profile, seg.header.mode);
+    let pos = first_chip + lead as f64 * super::frontend::SPS as f64 / r;
     let mut fingers = vec![Finger {
         lag: 0.0,
         power: 1.0,

@@ -128,10 +128,18 @@ A transmission is one or more *segments*; a segment is:
 2. **Header** — 128 bits (version, profile, mode, depth, payload type,
    callsign, session, first frame number, blocks in this segment, frames in the
    whole transmission, CRC-16) in a rate-¼ n = 512 LDPC codeword, interleaved,
-   as 64 CSK256 symbols on the call code. Always CSK256 whatever the payload,
-   so it is decodable wherever any payload mode is. 8.5 s on `2k4`, 6.8 s on
-   `3k`, 41 s on `500`. (A rate-½ n = 256 header was built first; it needed
-   about 3.4 dB more signal, which made it the limit of the whole system.)
+   as CSK symbols on the call code, in one of five alphabets (`HEADER_ALPHABETS`:
+   16, 32, 64, 128 or 256 codes of as many chips, 4 to 8 bits a symbol, the same
+   codeword). The weak payload modes (DS16 3/4 down to DS64 and every CSK mode)
+   keep CSK256, decodable wherever any payload mode is: 8.5 s on `2k4`, 6.8 s on
+   `3k`, 41 s on `500`. The fast modes send a shorter one so decoding starts
+   sooner: DS4 uses CSK64 (86 symbols, 2.9 s on `2k4`) and DS8 and DS16 CSK128
+   (74 symbols, 4.9 s), where the header still decodes below the payload's own
+   threshold. The receiver tries the alphabets shortest first, each as soon as its
+   chips are in, so it starts as early as the transmitter allows. The start-up
+   (preamble and header) of a DS4 transmission is 6.6 s instead of 12.3 s. (A rate-½
+   n = 256 header was built first; it needed about 3.4 dB more signal, which made
+   it the limit of the whole system.)
 3. **Payload blocks** — `nblocks` blocks on the station's own code, each
    `depth` LDPC codewords interleaved together. DS-PSK blocks carry a known
    pilot every eighth symbol and a closing pilot, so each block decodes alone.
@@ -168,7 +176,7 @@ filter, normalised so a chip comes out at its own amplitude.
    ignored (the search window starts early), the pattern A…A B B is found from a
    per-period score that needs no noise estimate, and a line through the period
    boundaries gives the clock and the header start.
-3. **Header** — 64 CSK256 symbols on the call code, the rake fingers from the
+3. **Header** — CSK symbols on the call code (alphabets above), the rake fingers from the
    preamble's delay profile, a log-Bessel noncoherent metric, de-interleave, LDPC.
    Once decoded, its chips are known exactly, and they are used to refine timing,
    clock and carrier (a quarter second at a time over a fine lag grid, following
@@ -300,10 +308,11 @@ CRC-16 (headers) and CRC-32 (payload frames).
   - *Rate.* A modem frame carries 720 bits of speech in 1.37 s of signal at DS4 ⅔
     on 2.4 kHz, 1.17 times the codec's 450 bit/s (1.05 at 700C on 3 kHz, 29 × 28
     bits per 1.10 s block of DS4 ¾). The payload therefore keeps up with the
-    speech, but only just, and a 12 s preamble and header come first: a live
+    speech, but only just, and a 6.6 s preamble and header come first (12.3 s before the
+    short headers): a live
     stream would need a listener's buffer of about a minute to ride out one
     resync. So this is store-and-forward: a 10 s recording is 23 s of signal
-    (12 s of preamble and header, then the payload).
+    (6.6 s of preamble and header, then the payload).
   - *Receive.* `Assembler` gathers voice by (call, session) like files; the speech
     so far can be rendered at any time (`voice_speech`: silence where frames are
     missing) and the whole is handed over when every frame is in (`take_voice`).
@@ -312,7 +321,26 @@ CRC-16 (headers) and CRC-32 (payload frames).
   - *Keying.* `--vox` (CLI) and the VOX box (GUI) put 0.4 s of 1 kHz and a 0.3 s
     pause ahead of the signal so a radio on VOX is transmitting before the
     preamble; otherwise you key the radio, as for any transmission.
-  - *Not yet:* live (streamed) voice and CAT keying (voicemodem's rig crate).
+  - *Live.* `Voice: live` in the Transmit panel streams while the PTT is held
+    (`link::live`, `phy::tx::LiveTx`, GUI `live.rs`): one very long segment (4095
+    blocks, frame total 0) sent without a gap, each modem frame behind a number
+    byte (speech 0..253, END, FILLER); a block takes whatever speech frames are
+    ready and a filler for the rest, so the signal never stops; the receiver puts
+    silence where numbers are missing, ignores fillers, plays what arrives through
+    a jitter buffer (a second of speech before it starts, and again after running
+    dry) and closes the channel after the end frame or six blocks with nothing
+    decoded. The microphone is levelled (peak follower, at most +30 dB), brought
+    to 8 kHz and encoded as it is spoken; the transmitter starts the preamble and
+    header at once, so the speech said during the start-up (6.6 s at DS4) is sent
+    afterwards, catching up at 1.17 times the codec's rate until it has caught up,
+    then fillers. Simulated end to end (`tests/live.rs`: 12 dB AWGN, offset, clock
+    error, 25 s talked): every speech frame arrives, the end is seen, the playout
+    never runs dry, first speech heard 16 s after keying with the long header
+    (about 10 s with CSK64). Through VB-Audio cables the GUI streamed from a cable
+    "microphone" for 12 s, the CLI received header and five blocks and saved
+    12.8 s of speech at the end frame; the speech player was checked by playing a
+    tone through it into one cable and recording it from the other.
+  - *Not yet:* CAT keying (voicemodem's rig crate), a short preamble.
 - **ARQ** (M5): a connected mode for files on both stations' own codes, with
   selective repeat and ACK bitmaps sent at a robust mode.
 
@@ -336,7 +364,7 @@ speech and send it with *Play to the sound card*. Received speech plays by
 itself when a transmission is whole (*auto-play speech*). Everything you listen
 to (the RF monitor, received speech, the speech previews) plays on the speakers
 chosen in the bar, never on the output that feeds the radio. This is
-store-and-forward, not live: a 12 s preamble and header come before the speech
+store-and-forward, not live: a 6.6 s preamble and header come before the speech
 (see Payloads, Voice); a live, streamed mode needs a shorter start-up first.
 Checked through VB-Audio cables (`--ptt-for 6 --mic "CABLE-B Output" --tx-play
 "CABLE-A Input"`: six seconds recorded from one cable, sent into the other,
@@ -481,10 +509,21 @@ modem is about 2 dB above its code.
 | 500 Hz | DS8 ½ | 4.0 dB | −6.6 dB |
 | | CSK64 ½ | 6.0 dB (one frame of 14 lost at 4–5 dB) | −8.3 dB |
 
-The header, a rate-¼ CSK256 codeword, decodes 12 of 12 times from −15 dB to
+The long header, a rate-¼ CSK256 codeword, decodes 12 of 12 times from −15 dB to
 +5 dB in-band on AWGN and 9 of 12 at −17 dB (the preamble search finds the
 preamble at −17 dB with a 50 ppm clock error and 55 Hz offset, and makes no false
 detection in a minute of noise or of strong payload).
+
+**Header alphabets** (`cargo test --release -p decdsss-phy header_alphabet_curve --
+--ignored --nocapture`; 2.4 kHz, ten trials a point, with offsets and clock errors).
+In-band SNR from which the header decoded: AWGN, 16 about −7 dB, 32 −7 dB (5 of 10
+at −10), 64 −10 dB, 128 −13 dB, 256 −16 dB; moderate fading, 16 about +8 dB, 32 −1 dB,
+64 about +5 dB (8 to 9 of 10 between −4 and +2), 128 −7 dB, 256 −4 dB (8 of 10 at
+−13). The alphabets are not all as good for the payload as a long header: over 256
+transmissions a point on the moderate channel, DS4 2/3 at 24 dB Eb/N0 lost 1.3 % of
+its frames with CSK256, 0.9 % with 64, 1.2 % with 128 and 2.8 % with 32; DS8 1/2 at
+10 dB 2.3 %, 3.2 %, 3.2 % with 256, 128, 64 (a short header gives the timing loop
+less to start from). Hence 64 for DS4 and 128 for DS8 and DS16.
 
 ### Watterson fading (2.4 kHz, ½ rate, depth 4, two blocks, 24 transmissions a point)
 

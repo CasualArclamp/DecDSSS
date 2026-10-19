@@ -72,6 +72,12 @@ pub struct AttemptView {
     pub freq_hz: f64,
     /// True once the preamble has ended and the header is being decoded.
     pub header_stage: bool,
+    /// While the header is being decoded: the CSK alphabet being tried, the
+    /// seconds since the preamble ended, and the seconds from then that this
+    /// alphabet's header needs.
+    pub header_alphabet: usize,
+    pub header_since_s: f64,
+    pub header_needs_s: f64,
     /// Per-period correlation power of A and of B (once the preamble ended).
     pub periods: Vec<(f32, f32)>,
 }
@@ -99,7 +105,10 @@ pub struct Tagged {
 /// that start together are followed together.
 enum Step {
     Preamble(Box<PreambleTracker>),
-    Header(Box<PreambleLock>),
+    /// The preamble has ended: the header is tried in each alphabet in turn
+    /// (the index into `tx::HEADER_ALPHABETS`), the shortest first, as soon as
+    /// its chips are in.
+    Header(Box<PreambleLock>, usize),
 }
 
 struct Attempt {
@@ -187,9 +196,27 @@ impl Receiver {
                 .iter()
                 .map(|a| AttemptView {
                     freq_hz: a.freq_hz,
-                    header_stage: matches!(a.step, Step::Header(_)),
+                    header_stage: matches!(a.step, Step::Header(..)),
+                    header_alphabet: match &a.step {
+                        Step::Header(_, i) => crate::tx::HEADER_ALPHABETS[*i],
+                        Step::Preamble(_) => 0,
+                    },
+                    header_since_s: match &a.step {
+                        Step::Header(l, _) => {
+                            ((self.buf.end() as f64 - l.header_start) / self.rate).max(0.0)
+                        }
+                        Step::Preamble(_) => 0.0,
+                    },
+                    header_needs_s: match &a.step {
+                        Step::Header(l, i) => {
+                            (header::header_need(l, crate::tx::HEADER_ALPHABETS[*i])
+                                - l.header_start)
+                                / self.rate
+                        }
+                        Step::Preamble(_) => 0.0,
+                    },
                     periods: match &a.step {
-                        Step::Header(l) => l.periods.clone(),
+                        Step::Header(l, _) => l.periods.clone(),
                         Step::Preamble(_) => Vec::new(),
                     },
                 })
@@ -281,14 +308,33 @@ impl Receiver {
                     }
                     State::Locked(lock) => Next::Lock(Box::new(lock)),
                 },
-                Step::Header(lock) => match demod_header(&self.buf, lock, self.rate) {
-                    HeaderOutcome::NeedMore(_) => Next::Stay,
-                    HeaderOutcome::Bad(why) => {
-                        self.pending.push_back(Event::Lost(why.into()));
-                        Next::Drop
+                Step::Header(lock, alpha) => {
+                    // The shortest alphabet first; one that does not decode gives way
+                    // to the next, and only the last one's failure ends the attempt.
+                    let mut out = Next::Stay;
+                    while *alpha < crate::tx::HEADER_ALPHABETS.len() {
+                        match demod_header(
+                            &self.buf,
+                            lock,
+                            self.rate,
+                            crate::tx::HEADER_ALPHABETS[*alpha],
+                        ) {
+                            HeaderOutcome::NeedMore(_) => break,
+                            HeaderOutcome::Bad(why) => {
+                                *alpha += 1;
+                                if *alpha == crate::tx::HEADER_ALPHABETS.len() {
+                                    self.pending.push_back(Event::Lost(why.into()));
+                                    out = Next::Drop;
+                                }
+                            }
+                            HeaderOutcome::Decoded(h) => {
+                                out = Next::Open(h);
+                                break;
+                            }
+                        }
                     }
-                    HeaderOutcome::Decoded(h) => Next::Open(h),
-                },
+                    out
+                }
             };
             match next {
                 Next::Stay => k += 1,
@@ -298,7 +344,7 @@ impl Receiver {
                 Next::Lock(lock) => {
                     self.pending
                         .push_back(Event::PreambleLocked(Box::new((*lock).clone())));
-                    self.attempts[k].step = Step::Header(lock);
+                    self.attempts[k].step = Step::Header(lock, 0);
                     // Look at it again straight away: the header may be in.
                 }
                 Next::Open(h) => {
@@ -313,7 +359,7 @@ impl Receiver {
         for a in &self.attempts {
             keep = keep.min(match &a.step {
                 Step::Preamble(t) => t.oldest_needed(),
-                Step::Header(l) => (l.header_start - 12.0 * l.step) as i64,
+                Step::Header(l, _) => (l.header_start - 12.0 * l.step) as i64,
             });
         }
         for ch in &self.channels {

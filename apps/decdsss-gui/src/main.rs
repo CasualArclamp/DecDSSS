@@ -9,7 +9,9 @@
 mod app;
 mod demo;
 mod engine;
+mod live;
 mod monitor;
+mod player;
 mod prefs;
 mod scope;
 mod spectrum;
@@ -123,7 +125,10 @@ fn main() -> eframe::Result {
             "--view" => auto.view = Some(value("--view")),
             "--monitor" => auto.monitor = Some(value("--monitor")),
             "--tx-play" => auto.tx_play = Some(value("--tx-play")),
+            "--listen" => auto.listen = Some(value("--listen")),
+            "--listen-test" => auto.listen_test = true,
             "--ptt-for" => auto.ptt_for = value("--ptt-for").parse().ok(),
+            "--live-for" => auto.live_for = value("--live-for").parse().ok(),
             "--tx-stop" => auto.tx_stop = value("--tx-stop").parse().ok(),
             "--window-size" => {
                 let v = value("--window-size");
