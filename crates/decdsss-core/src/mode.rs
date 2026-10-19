@@ -18,8 +18,8 @@ pub const CSK_SIZES: [u16; 4] = [32, 64, 128, 256];
 pub enum Family {
     /// Direct sequence: a QPSK symbol held for SF chips, coherent, pilot-aided.
     DsPsk,
-    /// Cyclic code-shift keying: one of L cyclic shifts of an L-chip base
-    /// sequence, log2(L) bits a symbol, noncoherent.
+    /// Code-shift keying: one of L orthogonal Walsh codes of L chips, log2(L)
+    /// bits a symbol, noncoherent.
     Csk,
 }
 

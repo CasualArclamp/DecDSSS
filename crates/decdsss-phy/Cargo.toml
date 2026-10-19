@@ -1,0 +1,15 @@
+# made by CasualArclamp
+[package]
+name = "decdsss-phy"
+description = "DecDSSS physical layer: codes, framing, DS-PSK/CSK modulator and receiver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdsss-core = { path = "../decdsss-core" }
+decdsss-dsp = { path = "../decdsss-dsp" }
+num-complex.workspace = true
+rustfft.workspace = true

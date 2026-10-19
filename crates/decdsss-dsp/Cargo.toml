@@ -1,0 +1,12 @@
+# made by CasualArclamp
+[package]
+name = "decdsss-dsp"
+description = "DecDSSS DSP building blocks: RRC, pulse shaper, resampler, FIR, interpolation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+num-complex.workspace = true

@@ -65,17 +65,24 @@ Over the scrambler, the two families modulate differently:
   64}. Coherent detection with time-multiplexed pilots: one known symbol in
   every 8 (`PILOT_INTERVAL`). The rake estimates each path's gain from the pilots
   and combines them by maximal ratio.
-- **CSK** — cyclic code-shift keying, as in JTIDS: an L-chip base sequence with
-  near-ideal periodic autocorrelation, cyclically shifted by the symbol value,
-  so a symbol carries log₂L bits. L is in {32, 64, 128, 256}. Detection is
-  noncoherent: one FFT circular correlation per symbol, with the argmax shift as
-  the symbol. Bit LLRs come by max-log from the correlation powers, and the
-  rake adds the powers at each path's delay. No pilots are needed, and the phase
-  only has to hold for one symbol, which suits HF fading at the robust end.
+- **CSK** — M-ary orthogonal code keying, as on the IS-95 uplink: a symbol
+  sends one of the L Walsh–Hadamard codes of length L, so it carries log₂L
+  bits. L is in {32, 64, 128, 256}. Detection is noncoherent: one fast Walsh
+  transform of the descrambled chips gives all L correlations, the symbol is
+  the largest, bit LLRs come by max-log from the correlation powers, and the
+  rake adds the powers across paths, each descrambled at its own delay. No
+  pilots are needed, and the phase only has to hold for one symbol, which suits
+  HF fading at the robust end.
 
-Base sequences are binary (an m-sequence extended by one chip), not
-Zadoff–Chu: ZC's delay–Doppler ridge turns a residual frequency error into a
-code-phase shift, which for CSK means a wrong symbol.
+Walsh codes are exactly orthogonal, binary, and cost only adds to detect. Two
+other choices were rejected:
+- Cyclic shifts of one base sequence (JTIDS-style CCSK) were tried first. An
+  m-sequence extended to 2^k chips measured a peak periodic sidelobe of 8/32
+  (−12 dB) at L = 32.
+- Zadoff–Chu has perfect cyclic autocorrelation, but its delay–Doppler ridge
+  turns a frequency error into a wrong symbol.
+
+The scrambler on top keeps the spectrum white whatever code is sent.
 
 ### Rates
 
@@ -166,6 +173,11 @@ convolutional block interleaver spans HF fades. Frame CRCs are CRC-16/32.
   arrives.
 - **Voice** (M4): Codec2 (450 on `2k4`, 700C on `3k`), streamed in PTT overs with
   a short interleaver. Codecs run off the real-time loop (voicemodem's lesson).
+  **Open:** the pure-Rust `codec2` crate voicemodem uses (0.3.1) has no 700C or
+  450 modes; its slowest is 1200 bit/s. The options are to build the C
+  libcodec2 (LGPL-2.1, CMake, as a submodule like DecSAT's libopus), to port
+  700C/450 to Rust, or to run Codec2 1200 at SF 2 (≈3 dB processing gain).
+  Rory's call before M4.
 - **ARQ** (M5): a connected mode for files on both stations' own codes, with
   selective repeat and ACK bitmaps sent at a robust mode.
 
