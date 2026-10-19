@@ -49,6 +49,21 @@ pub fn through(seg: &Segment, ch: &Channel) -> Vec<f32> {
     ch.apply(&audio, FS)
 }
 
+/// Segments back to back through a channel, with the postamble after the last
+/// if `eot`, one second of silence ahead and three behind (the receiver needs the
+/// second after a segment to decide about the postamble).
+pub fn through_all(segs: &[Segment], ch: &Channel, eot: bool) -> Vec<f32> {
+    let chips = if eot {
+        crate::tx::transmission_chips(segs).unwrap()
+    } else {
+        segs.iter()
+            .flat_map(|s| segment_chips(s).unwrap())
+            .collect()
+    };
+    let audio = chips_to_audio(&chips, segs[0].header.profile, FS, LEVEL, 1.0, 3.0);
+    ch.apply(&audio, FS)
+}
+
 pub fn channel(profile: Profile, snr_db: f64) -> Channel {
     Channel {
         snr_db: Some(snr_db),

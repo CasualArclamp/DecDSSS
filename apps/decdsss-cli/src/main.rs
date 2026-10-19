@@ -12,7 +12,7 @@ use decdsss_link::{Assembler, SendSpec, VoiceSpec, container, max_stream_bytes, 
 use decdsss_phy::codes::{normalise_call, own_code};
 use decdsss_phy::framing::{Layout, PayloadType};
 use decdsss_phy::rx::{Event, MultiReceiver};
-use decdsss_phy::tx::{Segment, chips_to_audio, segment_chips};
+use decdsss_phy::tx::{Segment, chips_to_audio, transmission_chips};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -473,10 +473,7 @@ fn tx(
         );
         (plan.segments, summary)
     };
-    let mut chips = Vec::new();
-    for s in &segs {
-        chips.extend(segment_chips(s).context("cannot build the header")?);
-    }
+    let chips = transmission_chips(&segs).context("cannot build the header")?;
     let mut audio = chips_to_audio(&chips, profile, f64::from(rate), level, lead, tail);
     if vox {
         let mut v = decdsss_phy::tx::vox_lead(f64::from(rate), level, 0.4, 0.3);
@@ -748,6 +745,12 @@ impl RxRun {
                     }
                 }
                 Event::SegmentEnd { .. } => {}
+                Event::EndOfTransmission { header, ratio, .. } => {
+                    println!(
+                        "[{t:7.1}s] {p}: {} has finished (postamble {ratio:.0}x its noise floor)",
+                        header.call
+                    );
+                }
             }
         }
     }

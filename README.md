@@ -50,7 +50,9 @@ side by side. Two ways of spreading, as a ladder of modes (`decdsss modes`):
 LDPC (rate ½, ⅔ or ¾, 1152-bit codewords, designed in this repository) and a
 time interleaver sit under both. A file is sent as frames in segments, each a
 preamble, a rate-¼ header (callsign, mode, frame numbers) and blocks; a long
-transmission repeats the preamble so a late listener can join. Frames are
+transmission repeats the preamble so a late listener can join, and the last
+block is followed by a one-second end-of-transmission postamble that a receiver
+following the station recognises, so it knows the station has finished. Frames are
 erasure-coded: any as many frames as the file has data frames rebuild it, however
 they were lost, and each repeat pass sends new coded frames.
 

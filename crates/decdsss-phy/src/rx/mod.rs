@@ -54,6 +54,15 @@ pub enum Event {
     },
     /// The segment's last block is done; the channel is closed.
     SegmentEnd { channel: usize },
+    /// The end-of-transmission postamble followed: the station has finished, so a
+    /// live stream is over and no more segments are coming. `ratio` is the peak
+    /// of its delay profile over the median ([`crate::eot`]). A transmission
+    /// whose postamble is missed or too weak never gets this event.
+    EndOfTransmission {
+        channel: usize,
+        header: Box<Header>,
+        ratio: f32,
+    },
 }
 
 /// What one open payload channel shows.
@@ -138,14 +147,19 @@ struct Channel {
 impl Channel {
     /// A live voice stream: speech with no frame total.
     fn is_live(&self) -> bool {
-        let h = &self.rx.header;
-        h.total_frames == 0
-            && matches!(
-                h.ptype,
-                crate::framing::PayloadType::Voice | crate::framing::PayloadType::Voice450
-            )
+        self.rx.is_live()
     }
 }
+
+/// A station whose segment has just ended, still listened to for the second in
+/// which its postamble would come. Whatever the answer, it is dropped then.
+struct Tail {
+    id: usize,
+    rx: PayloadRx,
+}
+
+/// Tails kept at most (a stream of short segments, none of them the last).
+const MAX_TAILS: usize = 8;
 
 pub struct Receiver {
     pub profile: Profile,
@@ -154,6 +168,7 @@ pub struct Receiver {
     acq: Acquirer,
     attempts: Vec<Attempt>,
     channels: Vec<Channel>,
+    tails: Vec<Tail>,
     next_channel: usize,
     rate: f64,
     /// Total input samples seen, for the caller's clock.
@@ -173,6 +188,7 @@ impl Receiver {
             attempts: Vec::new(),
             acq,
             channels: Vec::new(),
+            tails: Vec::new(),
             next_channel: 0,
             rate,
             samples_in: 0,
@@ -262,11 +278,51 @@ impl Receiver {
                     result: Box::new(result),
                 });
             }
-            if ch.rx.done() || (ch.is_live() && ch.lost_run >= LIVE_LOST_BLOCKS) {
+            let heard_eot = ch.rx.eot();
+            if ch.rx.done()
+                || heard_eot.is_some()
+                || (ch.is_live() && ch.lost_run >= LIVE_LOST_BLOCKS)
+            {
                 self.pending.push_back(Event::SegmentEnd { channel: ch.id });
-                self.channels.remove(i);
+                let ch = self.channels.remove(i);
+                match heard_eot {
+                    // A live stream saw it between blocks.
+                    Some(ratio) => self.pending.push_back(Event::EndOfTransmission {
+                        channel: ch.id,
+                        header: Box::new(ch.rx.header.clone()),
+                        ratio,
+                    }),
+                    // A finished segment: the postamble, if any, is the next second.
+                    None if ch.rx.done() => {
+                        if self.tails.len() >= MAX_TAILS {
+                            self.tails.remove(0);
+                        }
+                        self.tails.push(Tail {
+                            id: ch.id,
+                            rx: ch.rx,
+                        });
+                    }
+                    None => {}
+                }
             } else {
                 i += 1;
+            }
+        }
+
+        // Stations that have just finished a segment: is the postamble next?
+        let mut t = 0;
+        while t < self.tails.len() {
+            let Some(ratio) = self.tails[t].rx.probe_eot(&self.buf) else {
+                t += 1;
+                continue;
+            };
+            let tail = self.tails.remove(t);
+            if ratio >= crate::eot::EOT_PEAK_OVER_MEDIAN {
+                self.pending.push_back(Event::EndOfTransmission {
+                    channel: tail.id,
+                    header: Box::new(tail.rx.header.clone()),
+                    ratio,
+                });
             }
         }
 
@@ -364,6 +420,9 @@ impl Receiver {
         }
         for ch in &self.channels {
             keep = keep.min(ch.rx.oldest_needed());
+        }
+        for tail in &self.tails {
+            keep = keep.min(tail.rx.oldest_needed());
         }
         self.buf.trim(keep);
     }
@@ -574,6 +633,167 @@ mod tests {
         assert_eq!(got.len(), 10, "frames: {}", got.len());
         for (i, f) in got {
             assert_eq!(f.as_ref(), Some(&segs[i / 2].frames[i % 2]), "frame {i}");
+        }
+    }
+
+    /// The display must follow the signal through a block, not wait for the
+    /// pre-pass's first seconds and then catch up: fed in tenths of a second, the
+    /// symbol counter of the channel never stands still for long while the payload
+    /// is arriving (it stood still for about four seconds in every block when a
+    /// block waited for its pre-pass; the longest wait it now allows is the
+    /// start-up of the first block).
+    #[test]
+    fn the_channel_keeps_up_with_the_signal_between_blocks() {
+        let profile = Profile::W2400;
+        let seg = segment(profile, "ds4-3/4", 2, 4);
+        let audio = through_all(std::slice::from_ref(&seg), &channel(profile, 12.0), true);
+        let mut rx = Receiver::new(profile, FS);
+        let chunk = (FS / 10.0) as usize;
+        let (mut last_p, mut last_change, mut worst, mut seen) = (0usize, 0.0f64, 0.0f64, false);
+        for (i, c) in audio.chunks(chunk).enumerate() {
+            rx.push(c);
+            let t = i as f64 / 10.0;
+            let Some(ch) = rx.snapshot(0).channels.first().cloned() else {
+                if seen {
+                    break;
+                }
+                continue;
+            };
+            let p = ch.blocks_done * ch.live.symbols_in_block.max(1) + ch.live.symbol;
+            if !seen {
+                seen = true;
+                last_p = p;
+                last_change = t;
+            }
+            if p != last_p {
+                last_p = p;
+                last_change = t;
+            }
+            worst = worst.max(t - last_change);
+        }
+        assert!(seen, "the channel opened");
+        assert!(worst < 1.0, "the display stood still for {worst:.1} s");
+    }
+
+    fn eots(events: &[Event]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::EndOfTransmission { .. }))
+            .count()
+    }
+
+    /// The postamble after the last segment is heard once, after that segment
+    /// ended; a transmission without one never reports an end; a postamble after
+    /// each of three back-to-back segments does not appear (only the last carries
+    /// one) and does not disturb the segments after it.
+    #[test]
+    fn the_postamble_ends_the_transmission_once() {
+        for (profile, mode) in [
+            (Profile::W2400, "ds8-1/2"),
+            (Profile::W3000, "csk64-2/3"),
+            (Profile::N500, "ds4-1/2"),
+        ] {
+            let seg = segment(profile, mode, 1, 2);
+            let with = through_all(std::slice::from_ref(&seg), &channel(profile, 6.0), true);
+            let events = run(&mut Receiver::new(profile, FS), &with);
+            let end = events
+                .iter()
+                .position(|e| matches!(e, Event::SegmentEnd { .. }))
+                .expect("segment end");
+            let eot = events
+                .iter()
+                .position(|e| matches!(e, Event::EndOfTransmission { .. }))
+                .unwrap_or_else(|| panic!("{profile} {mode}: no end of transmission"));
+            assert!(
+                eot > end,
+                "{profile}: the postamble comes after the segment"
+            );
+            assert_eq!(eots(&events), 1, "{profile}");
+            assert_eq!(frames_of(&events).len(), seg.frames.len(), "{profile}");
+
+            let without = through_all(std::slice::from_ref(&seg), &channel(profile, 6.0), false);
+            let events = run(&mut Receiver::new(profile, FS), &without);
+            assert_eq!(eots(&events), 0, "{profile}: none was sent");
+        }
+
+        let profile = Profile::W2400;
+        let segs: Vec<Segment> = (0..3usize)
+            .map(|i| {
+                let mut s = segment(profile, "csk32-1/2", 1, 2);
+                s.header.frame0 = (i * 2) as u16;
+                s.header.total_frames = 6;
+                s
+            })
+            .collect();
+        let audio = through_all(&segs, &channel(profile, 3.0), true);
+        let events = run(&mut Receiver::new(profile, FS), &audio);
+        assert_eq!(frames_of(&events).len(), 6);
+        assert_eq!(eots(&events), 1);
+        let last_block = events
+            .iter()
+            .rposition(|e| matches!(e, Event::Block { .. }))
+            .unwrap();
+        let eot = events
+            .iter()
+            .position(|e| matches!(e, Event::EndOfTransmission { .. }))
+            .unwrap();
+        assert!(eot > last_block);
+    }
+
+    /// How often the postamble is heard against signal-to-noise ratio, and how
+    /// often something that is not one is taken for it. Run with
+    /// `cargo test --release -p decdsss-phy eot_curve -- --ignored --nocapture`.
+    /// "data" is the place of the next block in the middle of a stream (what a live
+    /// receiver tests after every block), "quiet" the noise after a transmission
+    /// that sent no postamble.
+    #[test]
+    #[ignore = "measurement"]
+    fn eot_curve() {
+        use decdsss_chan::Watterson;
+        let profile = Profile::W2400;
+        let trials = 24;
+        // The postamble does not depend on the mode; the modes only differ in what
+        // the "data" case sees. Short blocks keep the signals short.
+        for (mode, fading) in [
+            ("ds4-3/4", None),
+            ("ds4-3/4", Some(Watterson::MODERATE)),
+            ("ds8-1/2", None),
+        ] {
+            println!("{mode} fading {}", fading.is_some());
+            for snr in [-27.0, -24.0, -21.0, -18.0, -15.0, -12.0, -6.0, 6.0] {
+                let (mut hit, mut data_false, mut quiet_false) = (0, 0, 0);
+                let (mut worst_data, mut worst_quiet, mut worst_hit) = (0.0f32, 0.0f32, f32::MAX);
+                for seed in 0..trials {
+                    let seg = segment(profile, mode, 1, 2);
+                    let mut ch = channel(profile, snr);
+                    ch.fading = fading;
+                    ch.seed = 100 + seed;
+                    ch.offset_hz = 4.0;
+                    let audio = through_all(std::slice::from_ref(&seg), &ch, true);
+                    let (mut rx, buf) = genie(&seg, &ch, &audio);
+                    // The data case: after block 0, with block 1 coming.
+                    rx.skip_blocks(1);
+                    if let Some(r) = rx.probe_eot(&buf) {
+                        worst_data = worst_data.max(r);
+                        data_false += usize::from(r >= crate::eot::EOT_PEAK_OVER_MEDIAN);
+                    }
+                    rx.skip_blocks(1);
+                    if let Some(r) = rx.probe_eot(&buf) {
+                        worst_hit = worst_hit.min(r);
+                        hit += usize::from(r >= crate::eot::EOT_PEAK_OVER_MEDIAN);
+                    }
+                    let quiet = through_all(std::slice::from_ref(&seg), &ch, false);
+                    let (mut rx, buf) = genie(&seg, &ch, &quiet);
+                    rx.skip_blocks(2);
+                    if let Some(r) = rx.probe_eot(&buf) {
+                        worst_quiet = worst_quiet.max(r);
+                        quiet_false += usize::from(r >= crate::eot::EOT_PEAK_OVER_MEDIAN);
+                    }
+                }
+                println!(
+                    "  {snr:5.1} dB: heard {hit}/{trials} (weakest ratio {worst_hit:.1}); false on data {data_false} (highest {worst_data:.1}), on quiet {quiet_false} (highest {worst_quiet:.1})"
+                );
+            }
         }
     }
 
