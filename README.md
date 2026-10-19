@@ -90,6 +90,10 @@ cargo run --release -p decdsss-cli -- sweep --mode csk64-1/2 --ebn0 2 6 1 --fadi
 
 # The window; the demo needs no radio
 cargo run --release -p decdsss-gui -- --demo
+# The same demo signal as a WAV (three stations on one channel), for --wav or the cli's rx
+cargo run --release -p decdsss-gui -- --write-demo demo.wav
+
+# Single-file Windows executables (static C runtime, nothing to install) into exepowershell -ExecutionPolicy Bypass -File scriptsuild-portable.ps1
 cargo run --release -p decdsss-gui -- --device "CABLE-A Output"
 ```
 

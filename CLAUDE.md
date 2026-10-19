@@ -15,6 +15,7 @@ cargo run -p decdsss-cli -- modes       # the mode ladder and its rates
 cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --picture --air 120 -o pic.wav   # a picture sized to the air time
 cargo run --release -p decdsss-cli -- tx speech.wav --call VK2ABC --voice -o voice.wav   # Codec2 speech
 cargo run --release -p decdsss-cli -- sweep --mode ds8-1/2 --ebn0 2 6 1   # frame loss vs Eb/N0, whole receiver
+powershell -ExecutionPolicy Bypass -File scriptsuild-portable.ps1   # portable exes into exe\ (git-ignored)
 cargo run --release -p decdsss-gui -- --demo   # the window; --screenshot OUT.png --after 20 for pictures
 ```
 

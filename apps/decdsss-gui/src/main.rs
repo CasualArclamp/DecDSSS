@@ -15,7 +15,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: decdsss-gui [--demo | --wav FILE] [--speed X] [--profile 500,2k4,3k] \
-[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--record-for SECS [--mic NAME]]";
+[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--record-for SECS [--mic NAME]] | --write-demo OUT.wav";
 
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
@@ -40,6 +40,27 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             "--demo" => source = SourceKind::Demo,
+            "--write-demo" => {
+                // The demo signal as a WAV (open it with --wav, or in the cli's rx):
+                // no window.
+                let path = PathBuf::from(value("--write-demo"));
+                let d = demo::make();
+                match decdsss_audio::wav::write(&path, &d.audio, demo::RATE) {
+                    Ok(_) => println!(
+                        "{} s of {} Hz audio → {}
+{}",
+                        d.audio.len() as u32 / demo::RATE,
+                        demo::RATE,
+                        path.display(),
+                        d.what
+                    ),
+                    Err(e) => {
+                        eprintln!("decdsss-gui: cannot write {}: {e}", path.display());
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
             "--device" => {
                 source = SourceKind::Device;
                 device = Some(value("--device"));
