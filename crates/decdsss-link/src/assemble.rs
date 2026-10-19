@@ -97,6 +97,7 @@ pub struct LiveChunk {
 /// A live transmission being received.
 struct LiveTransfer {
     decoder: LiveDecoder,
+    codec: Codec,
     /// All the speech so far (for the saved file and the display).
     speech: Vec<i16>,
     lost: usize,
@@ -197,6 +198,7 @@ impl Assembler {
             .entry(key.clone())
             .or_insert_with(|| LiveTransfer {
                 decoder,
+                codec,
                 speech: Vec::new(),
                 lost: 0,
                 done: false,
@@ -236,6 +238,36 @@ impl Assembler {
     /// Speech of live transmissions that has come since the last call, in order.
     pub fn take_live(&mut self) -> Vec<LiveChunk> {
         std::mem::take(&mut self.live_chunks)
+    }
+
+    /// The receiver heard the postamble of a live transmission whose end frame was
+    /// lost (or never decoded): close it as the end frame would have. Does nothing
+    /// if it has ended already or was never heard.
+    pub fn end_live(&mut self, call: &str, session: u8) {
+        let key = (call.to_string(), session);
+        let Some(live) = self.lives.get_mut(&key) else {
+            return;
+        };
+        if live.done {
+            return;
+        }
+        live.done = true;
+        let codec = live.codec;
+        self.live_chunks.push(LiveChunk {
+            call: key.0.clone(),
+            session: key.1,
+            codec,
+            pcm: Vec::new(),
+            lost: 0,
+            ended: true,
+        });
+        self.finished_voice.push(ReceivedVoice {
+            call: key.0,
+            session: key.1,
+            codec,
+            speech: live.speech.clone(),
+            lost: live.lost,
+        });
     }
 
     /// All the speech of a live transmission so far, and whether it has ended.

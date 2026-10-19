@@ -394,6 +394,11 @@ fn modulate(
         alive = play(&tx.block(&frames));
     }
     if alive {
+        // The talker let go (not a STOP: that cuts the signal off): the postamble
+        // tells the other end the stream is over.
+        alive = play(&tx.eot());
+    }
+    if alive {
         alive = play(&tx.finish());
     }
     if alive {

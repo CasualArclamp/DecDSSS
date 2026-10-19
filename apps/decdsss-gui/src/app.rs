@@ -1214,7 +1214,11 @@ fn channel_card(
                 live.symbols_in_block,
             ));
             if !is_live {
-                ui.label(RichText::new("between segments").italics());
+                if tr.is_some_and(|t| t.ended) {
+                    ui.label(RichText::new("■ end of transmission").strong());
+                } else {
+                    ui.label(RichText::new("between segments").italics());
+                }
             }
         });
 
@@ -1235,6 +1239,7 @@ fn channel_card(
                 need_db: need as f32,
                 measured,
                 between: !is_live,
+                ended: tr.is_some_and(|t| t.ended),
             },
             inner,
         );

@@ -3,6 +3,7 @@
 //! the receiver (acquisition, tracking, rake, demodulation).
 
 pub mod codes;
+pub mod eot;
 pub mod framing;
 pub mod rx;
 pub mod sim;

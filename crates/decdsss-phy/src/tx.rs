@@ -227,6 +227,32 @@ pub fn segment_chips(seg: &Segment) -> Option<Vec<Iq>> {
     Some(chips)
 }
 
+/// The end-of-transmission postamble for the station that sent `seg` as its last
+/// segment: its scrambler on from the last block, times the B sequence (see
+/// [`crate::eot`]). `None` if the callsign has no code.
+pub fn eot_chips(seg: &Segment) -> Option<Vec<Iq>> {
+    let h = &seg.header;
+    let layout = Layout::new(h.profile, h.mode, h.depth);
+    let scr = Scrambler::new(own_code(&h.call)?);
+    Some(crate::eot::chips(
+        h.profile,
+        &scr,
+        usize::from(h.nblocks) * layout.chips(),
+    ))
+}
+
+/// All the chips of a transmission: every segment back to back, then the
+/// postamble that tells a receiver it is over. `None` if a header cannot be packed
+/// or there are no segments.
+pub fn transmission_chips(segs: &[Segment]) -> Option<Vec<Iq>> {
+    let mut chips = Vec::new();
+    for s in segs {
+        chips.extend(segment_chips(s)?);
+    }
+    chips.extend(eot_chips(segs.last()?)?);
+    Some(chips)
+}
+
 /// A lead for a radio that keys on VOX: a 1 kHz tone of `tone_s` seconds at RMS
 /// `level`, then `gap_s` of silence, for the audio to follow.
 pub fn vox_lead(rate: f64, level: f32, tone_s: f64, gap_s: f64) -> Vec<f32> {
@@ -294,6 +320,17 @@ impl LiveTx {
     /// padded with zero frames).
     pub fn block(&mut self, frames: &[Vec<u8>]) -> Vec<f32> {
         let chips = block_chips(&self.layout, frames, &self.scr, self.chip0);
+        self.chip0 += chips.len();
+        let mut audio = Vec::new();
+        self.shaper.push(&chips, &mut audio);
+        audio
+    }
+
+    /// The postamble, to be sent after the last block when the talker lets go
+    /// (not when a transmission is cut short): it tells the receiver the stream is
+    /// over without it having to wait for blocks that do not come.
+    pub fn eot(&mut self) -> Vec<f32> {
+        let chips = crate::eot::chips(self.header.profile, &self.scr, self.chip0);
         self.chip0 += chips.len();
         let mut audio = Vec::new();
         self.shaper.push(&chips, &mut audio);

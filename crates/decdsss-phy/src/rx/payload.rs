@@ -23,6 +23,7 @@ use super::frontend::Buf;
 use super::header::{Finger, HeaderResult};
 use super::preamble::DelayProfile;
 use crate::codes::{Scrambler, own_code};
+use crate::eot;
 use crate::framing::{Header, Layout, check_frame};
 use crate::tx::{block_chips, pilot_symbol};
 use decdsss_core::Family;
@@ -325,6 +326,16 @@ pub struct PayloadRx {
     strip_count: usize,
     strip_signal: f64,
     strip_noise: f64,
+    /// Set when the end-of-transmission postamble was heard: the peak-over-median
+    /// ratio of its delay profile.
+    eot: Option<f32>,
+    /// The postamble was looked for at the start of the block in progress.
+    eot_probed: bool,
+    /// The fingers and the reference were measured from known chips just before:
+    /// from the header at the start, and after every block that decoded whole
+    /// (the known-chip refinement). Then the block starts at once; otherwise it
+    /// waits for the seconds of pilots its own pre-pass measures from.
+    fresh: bool,
     /// The last block's interleaved LLRs (kept for the tests).
     #[cfg(test)]
     pub last_llrs: Vec<f32>,
@@ -355,6 +366,9 @@ impl PayloadRx {
             strip_count: 0,
             strip_signal: 0.0,
             strip_noise: 0.0,
+            eot: None,
+            eot_probed: false,
+            fresh: true,
             #[cfg(test)]
             last_llrs: Vec::new(),
         })
@@ -366,6 +380,61 @@ impl PayloadRx {
 
     pub fn done(&self) -> bool {
         self.next_block >= usize::from(self.header.nblocks)
+    }
+
+    /// A live voice stream: speech with no frame total, so no block count that
+    /// says where it ends.
+    pub fn is_live(&self) -> bool {
+        self.header.total_frames == 0
+            && matches!(
+                self.header.ptype,
+                crate::framing::PayloadType::Voice | crate::framing::PayloadType::Voice450
+            )
+    }
+
+    /// Moves past `n` blocks without decoding them (tests that measure the
+    /// postamble from a genie start, whose track is exact).
+    #[cfg(test)]
+    pub fn skip_blocks(&mut self, n: usize) {
+        self.track.advance(n * self.layout.chips());
+        self.chip0 += n * self.layout.chips();
+        self.next_block += n;
+    }
+
+    /// Whether the end-of-transmission postamble was heard (its delay profile's
+    /// peak over its median).
+    pub fn eot(&self) -> Option<f32> {
+        self.eot
+    }
+
+    /// Looks for the postamble at the next block's place: `Some(ratio)` once the
+    /// samples for it are in (the ratio is the delay profile's peak over its
+    /// median; [`eot::EOT_PEAK_OVER_MEDIAN`] or more is a yes), `None` while they
+    /// are not or while a block is in progress. The chips are the station's
+    /// scrambler on from the last block times the B sequence, so data after the
+    /// last block, which is the scrambler times symbols, does not correlate.
+    pub fn probe_eot(&self, buf: &Buf) -> Option<f32> {
+        if self.work.is_some() {
+            return None;
+        }
+        self.probe_eot_at(buf, &self.track)
+    }
+
+    /// The postamble's place is where the block that starts at `at` would be (its
+    /// scrambler position is `chip0`, the chips sent before that block).
+    fn probe_eot_at(&self, buf: &Buf, at: &Track) -> Option<f32> {
+        let profile = self.header.profile;
+        let n = eot::len(profile);
+        let reach = DelayProfile::lag(DelayProfile::LAGS) + n as f64;
+        if at.pos + reach * at.step + 16.0 > buf.end() as f64 {
+            return None;
+        }
+        let refs = eot::chips(profile, &self.scr, self.chip0);
+        let p = super::refine::profile_known(buf, at, &refs, eot::segment_chips(profile));
+        let mut sorted = p.power.clone();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[sorted.len() / 2].max(1e-30);
+        Some(sorted[sorted.len() - 1] / median)
     }
 
     pub fn blocks_done(&self) -> usize {
@@ -392,21 +461,45 @@ impl PayloadRx {
     /// Works on the block in progress with the samples there are; returns it
     /// when it is complete.
     pub fn step(&mut self, buf: &Buf) -> Option<BlockResult> {
-        if self.done() {
+        if self.done() || self.eot.is_some() {
             return None;
         }
         if self.work.is_none() {
-            // Start a block once the pre-pass has its first seconds.
+            // A block starts at once when the fingers are fresh (the display then
+            // follows the signal all the way through, with no wait between
+            // blocks); otherwise once its pre-pass has its first seconds.
+            let prepass = !self.fresh;
             let l = f64::from(self.header.mode.spread);
             let cr = f64::from(self.header.profile.chip_rate());
-            let span = (PREPASS_S + 1.0)
-                .max(PREPASS_MIN as f64 * 8.0 * l / cr)
-                .min(self.layout.seconds());
+            let span = if prepass {
+                (PREPASS_S + 1.0)
+                    .max(PREPASS_MIN as f64 * 8.0 * l / cr)
+                    .min(self.layout.seconds())
+            } else {
+                0.0
+            };
             let need = self.track.pos + (span * cr + AHEAD_CHIPS) * self.track.step + 16.0;
             if need > buf.end() as f64 {
                 return None;
             }
-            self.begin_block(buf);
+            self.begin_block(buf, prepass);
+        }
+        // A live stream has no block count: a second into each block, ask whether
+        // what came was the postamble (the block just begun is then not a block).
+        if self.is_live() && self.next_block > 0 && !self.eot_probed {
+            let start = match &self.work {
+                Some(Work::Csk(w)) => w.start,
+                Some(Work::Ds(w)) => w.start,
+                None => return None,
+            };
+            if let Some(r) = self.probe_eot_at(buf, &start) {
+                self.eot_probed = true;
+                if r >= eot::EOT_PEAK_OVER_MEDIAN {
+                    self.eot = Some(r);
+                    self.work = None;
+                    return None;
+                }
+            }
         }
         let work = self.work.take()?;
         match work {
@@ -438,7 +531,8 @@ impl PayloadRx {
         self.next_block += 1;
     }
 
-    fn begin_block(&mut self, buf: &Buf) {
+    fn begin_block(&mut self, buf: &Buf, prepass: bool) {
+        self.eot_probed = false;
         let cr = f64::from(self.header.profile.chip_rate());
         self.dll.set_wide((self.chip0 as f64) / cr < DLL_WIDE_S);
         let l = usize::from(self.header.mode.spread);
@@ -450,7 +544,9 @@ impl PayloadRx {
         let blank = || vec![Iq::new(0.0, 0.0); l];
         match self.layout.mode.family {
             Family::Csk => {
-                self.csk_prepass(buf, &scr);
+                if prepass {
+                    self.csk_prepass(buf, &scr);
+                }
                 let start = self.track;
                 self.work = Some(Work::Csk(Box::new(CskWork {
                     scr,
@@ -473,7 +569,9 @@ impl PayloadRx {
                 })));
             }
             Family::DsPsk => {
-                self.ds_prepass(buf, &scr);
+                if prepass {
+                    self.ds_prepass(buf, &scr);
+                }
                 let start = self.track;
                 let pilots = s_count / PILOT_INTERVAL as usize + 1;
                 self.work = Some(Work::Ds(Box::new(DsWork {
@@ -534,8 +632,10 @@ impl PayloadRx {
         self.live.soft = coded[coded.len() - n..].to_vec();
         let (frames, iterations) = self.decode(llrs);
         let first_frame = usize::from(self.header.frame0) + self.next_block * self.layout.depth;
+        self.fresh = false;
         if frames.iter().all(Option::is_some) && !debug_frozen("refresh") {
             self.refresh_fingers(buf, &frames, block_start);
+            self.fresh = true;
         }
         self.live.fingers = self.fingers.clone();
         BlockResult {

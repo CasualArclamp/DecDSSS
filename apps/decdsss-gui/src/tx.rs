@@ -16,7 +16,7 @@ use decdsss_link::{
 };
 use decdsss_phy::codes::normalise_call;
 use decdsss_phy::framing::{DEPTHS, Layout, PayloadType};
-use decdsss_phy::tx::{chips_to_audio, segment_chips, vox_lead};
+use decdsss_phy::tx::{chips_to_audio, transmission_chips, vox_lead};
 use eframe::egui::{self, ColorImage, Context, RichText, TextureHandle, TextureOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -754,10 +754,7 @@ impl TxPanel {
             spec.call = call;
             spec.session = session;
             let plan = plan_voice(&spec, &clip.pcm)?;
-            let mut chips = Vec::new();
-            for s in &plan.segments {
-                chips.extend(segment_chips(s).ok_or("cannot build the header")?);
-            }
+            let chips = transmission_chips(&plan.segments).ok_or("cannot build the header")?;
             let audio = chips_to_audio(&chips, self.profile, f64::from(rate), self.level, 1.0, 1.0);
             let audio = self.with_vox(rate, audio);
             return Ok(Plan {
@@ -797,10 +794,7 @@ impl TxPanel {
             passes: self.repeat.max(1),
         };
         let segs = segments(&spec, &container::pack(&name, &data))?;
-        let mut chips = Vec::new();
-        for s in &segs {
-            chips.extend(segment_chips(s).ok_or("cannot build the header")?);
-        }
+        let chips = transmission_chips(&segs).ok_or("cannot build the header")?;
         let audio = chips_to_audio(&chips, self.profile, f64::from(rate), self.level, 1.0, 1.0);
         let audio = self.with_vox(rate, audio);
         Ok(Plan {

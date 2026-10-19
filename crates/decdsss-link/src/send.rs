@@ -115,15 +115,15 @@ fn shape(spec: &SendSpec, stream_len: usize) -> Result<Shape, String> {
     })
 }
 
-/// Seconds of signal `total_frames` frames take: every block, and the preamble
-/// and header of every segment.
+/// Seconds of signal `total_frames` frames take: every block, the preamble and
+/// header of every segment, and the postamble after the last.
 pub(crate) fn air_time(p: &Frames, total_frames: usize) -> f64 {
     let layout = Layout::new(p.profile, p.mode, p.depth);
     let blocks = total_frames.div_ceil(p.depth);
     let per_segment = ((p.resync_s / layout.seconds()).floor() as usize).clamp(1, 4095);
     let segments = blocks.div_ceil(per_segment);
     let lead = lead_chips_for(p.profile, p.mode) as f64 / f64::from(p.profile.chip_rate());
-    blocks as f64 * layout.seconds() + segments as f64 * lead
+    blocks as f64 * layout.seconds() + segments as f64 * lead + decdsss_phy::eot::seconds(p.profile)
 }
 
 /// Seconds of signal a `stream_len`-byte stream takes to send under `spec`.
@@ -340,11 +340,9 @@ mod tests {
         let stream = vec![5u8; 4000];
         let p = plan(&sp, &stream).unwrap();
         // The chips of the real segments: the same seconds.
-        let chips: usize = p
-            .segments
-            .iter()
-            .map(|s| decdsss_phy::tx::segment_chips(s).unwrap().len())
-            .sum();
+        let chips = decdsss_phy::tx::transmission_chips(&p.segments)
+            .unwrap()
+            .len();
         let secs = chips as f64 / f64::from(sp.profile.chip_rate());
         let est = air_seconds(&sp, stream.len()).unwrap();
         assert!((secs - est).abs() < 1e-6, "{secs} vs {est}");

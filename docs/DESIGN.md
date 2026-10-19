@@ -153,6 +153,31 @@ A transmission is one or more *segments*; a segment is:
    and header with its first frame number, so late joiners can start and a
    receiver that lost the signal can find its place. How often is the sender's
    choice (≈ 60 s keeps the overhead near 15 %).
+5. **Postamble** — after the last block of the last segment, and of a live stream
+   when the talker lets go, one second (four coherent quarter-seconds: 1920 chips on
+   `2k4`, 2400 on `3k`, 400 on `500`) of the station's own scrambler run on from the
+   last block, times the preamble's B sequence. Real chips at full power, no data.
+   A receiver already following the station has its timing, carrier and rake
+   fingers; it correlates the chips that come next with this known sequence at the
+   delay profile's lags (−6 to +20 chips), sums the four segments' powers, and calls
+   the transmission over when the profile's peak is 7 times its median (a live stream
+   is asked after every block; a finished segment for the second after it, and only
+   a yes is reported). A miss changes nothing: a live stream still closes on its end
+   frame or after six empty blocks. The B sequence on top of the scrambler is what
+   keeps data from answering: data is the scrambler times a symbol held for SF
+   chips, which the bare scrambler would sum up coherently into a peak at the main
+   path, while B changes every chip and data sums like noise against it. The
+   station's own scrambler keeps one station's postamble from ending another's
+   channel. It costs one second of air time per transmission (counted in the
+   picture budget). The threshold is derived from the tail of a sum of four
+   exponentials: P(X > 7 × 3.67) = 1.5·10⁻⁶ a lag, about 26 independent lags in the
+   window, so about 4·10⁻⁵ a test. *Measured* (`rx::tests::eot_curve`, ignored; 2.4
+   kHz, genie timing, 24 trials a point, in-band SNR): heard in 23 of 24 trials at
+   −18 dB and all from −15 dB without fading (DS4 3/4 and DS8 1/2 alike; the
+   weakest payload mode, DS64 1/2, needs −15.6 dB); on moderate fading 9 of 24 at
+   −18, 19 of 24 at −15, 23 of 24 at −12 and all from −6 dB. Mistaken for one: 0 in
+   576 tests on data (the place of the next block mid-stream) and 0 in 576 on noise
+   after a transmission without one, the highest ratio seen 5.5.
 
 Several stations may transmit at once: their preambles overlap only by
 coincidence, their payloads sit on different codes, and the receiver opens one
@@ -192,6 +217,19 @@ filter, normalised so a chip comes out at its own amplitude.
    the first pilots (DS-PSK) or from the Walsh peaks of the first symbols
    (CSK), fingers placed on its peaks by deconvolution (CLEAN, with the
    raised-cosine pulse response), reference moved onto the strongest path.
+   That wait (four seconds of pilots) is only taken when the fingers are stale: a
+   block that follows one that decoded whole starts at once, with the fingers and
+   reference its known-chip refinement left (below), and so does the first block,
+   with the header's. Otherwise the instruments stand still for the first four
+   seconds of every block and then catch up, which for a DS4 block of 4.4 s is most
+   of it (`rx::tests::the_channel_keeps_up_with_the_signal_between_blocks`: the
+   counter stood still 2.7 s, now under a second). Frame loss through the whole
+   receiver, 32 to 48 transmissions a point, waiting against starting at once:
+   DS4 2/3 depth 2 on moderate fading (14, 18, 22 dB) and on AWGN (2, 4, 6 dB),
+   DS8 1/2 on moderate fading (6, 9, 12 dB): identical, to the frame. CSK64 1/2 on
+   moderate fading at 6 dB 65.1 % to 60.9 % lost, at 9 dB 9.4 % to 8.3 %; DS16 3/4
+   on good fading with 20 ppm at 9 dB 23.4 % to 21.1 %, the rest equal. The
+   pre-pass was not doing work the refinement had not done.
    Then symbol by symbol as samples arrive: rake despreading; an early/late
    timing loop on the sum over all fingers; a carrier loop from pilot gains or
    successive CSK peaks, updated only when the phase steps agree and limited in
@@ -333,14 +371,14 @@ CRC-16 (headers) and CRC-32 (payload frames).
     ready and a filler for the rest, so the signal never stops; the receiver puts
     silence where numbers are missing, ignores fillers, plays what arrives through
     a jitter buffer (a second of speech before it starts, and again after running
-    dry) and closes the channel after the end frame or six blocks with nothing
-    decoded. The microphone is levelled (peak follower, at most +30 dB), brought
+    dry) and closes the channel after the end frame, the postamble (Over structure, 5) or six
+    blocks with nothing decoded. The microphone is levelled (peak follower, at most +30 dB), brought
     to 8 kHz and encoded as it is spoken; the transmitter starts the preamble and
     header at once, so the speech said during the start-up (6.6 s at DS4) is sent
     afterwards, catching up at 1.17 times the codec's rate until it has caught up,
     then fillers. Simulated end to end (`tests/live.rs`: 12 dB AWGN, offset, clock
-    error, 25 s talked): every speech frame arrives, the end is seen, the playout
-    never runs dry, first speech heard 16 s after keying with the long header
+    error, 25 s talked): every speech frame arrives, the end is seen (the postamble
+    within 3 s of the signal's end), the playout never runs dry, first speech heard 16 s after keying with the long header
     (about 10 s with CSK64). Through VB-Audio cables the GUI streamed from a cable
     "microphone" for 12 s, the CLI received header and five blocks and saved
     12.8 s of speech at the end frame; the speech player was checked by playing a

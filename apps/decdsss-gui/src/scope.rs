@@ -135,6 +135,8 @@ pub struct Margin {
     pub measured: bool,
     /// The station's segment has ended (no reading until the next).
     pub between: bool,
+    /// Its postamble was heard: there is no next.
+    pub ended: bool,
 }
 
 /// Eb/N0 bar scale, dB: fixed, so the bar does not jump as the reading moves.
@@ -215,6 +217,7 @@ pub fn margin_bar(ui: &mut Ui, m: &Margin, width: f32) {
         ui.set_width(width);
         let left = match (m.ebn0_db, m.snr_db) {
             (Some(e), Some(s)) => format!("Eb/N0 {e:.1} dB · in-band SNR {s:+.1} dB"),
+            _ if m.ended => "no reading: the transmission has ended".into(),
             _ if m.between => "no reading between segments".into(),
             _ => "Eb/N0 not measured yet".into(),
         };

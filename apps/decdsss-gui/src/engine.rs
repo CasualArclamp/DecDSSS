@@ -129,6 +129,8 @@ pub struct Transfer {
     pub have: usize,
     pub total: usize,
     pub done: bool,
+    /// The station's postamble was heard: it has finished transmitting.
+    pub ended: bool,
     /// Which frames are in.
     pub map: Vec<bool>,
 }
@@ -708,6 +710,7 @@ fn handle_event(
                     have: 0,
                     total: 0,
                     done: false,
+                    ended: false,
                     map: Vec::new(),
                 });
         }
@@ -764,6 +767,35 @@ fn handle_event(
             }
         }
         Event::SegmentEnd { .. } => {}
+        Event::EndOfTransmission { header, ratio, .. } => {
+            log(
+                shared,
+                format!(
+                    "[{t:6.1}s] {p}: {} has finished (postamble {ratio:.0}x its noise floor)",
+                    header.call
+                ),
+            );
+            if let Some(tr) = r.transfers.get_mut(&(header.call.clone(), header.session)) {
+                tr.ended = true;
+            }
+            // A live stream whose end frame was lost ends here instead.
+            if let Some(codec) = decdsss_link::voice::codec_of(header.ptype)
+                && header.total_frames == 0
+            {
+                r.asm.end_live(&header.call, header.session);
+                r.live_codec
+                    .insert((header.call.clone(), header.session), codec);
+                for c in r.asm.take_live() {
+                    if let Some(e) = player.push(&c.pcm, c.ended) {
+                        log(shared, format!("[{t:6.1}s] {e}"));
+                    }
+                }
+                update_live_view(r, &header.call, header.session);
+                for v in r.asm.take_voice() {
+                    save_voice(shared, r, t, v);
+                }
+            }
+        }
     }
 }
 

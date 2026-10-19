@@ -105,7 +105,10 @@ fn live_speech_streams_and_plays_without_running_dry() {
         audio.extend(tx.block(&frames));
         at += tx.block_seconds();
     }
+    // The talker lets go: the postamble, then the filter's tail.
+    audio.extend(tx.eot());
     audio.extend(tx.finish());
+    let signal_end_s = audio.len() as f64 / RATE;
     assert!(next == ready.len(), "every frame went out");
 
     let channel = Channel {
@@ -126,6 +129,7 @@ fn live_speech_streams_and_plays_without_running_dry() {
     let mut arrivals: Vec<(f64, f64)> = Vec::new();
     let mut ended = false;
     let mut segment_closed = false;
+    let mut eot_at = None;
     let mut fed = 0usize;
     for chunk in heard.chunks(4800) {
         fed += chunk.len();
@@ -140,11 +144,20 @@ fn live_speech_streams_and_plays_without_running_dry() {
                     }
                 }
                 Event::SegmentEnd { .. } => segment_closed = true,
+                Event::EndOfTransmission { .. } => eot_at = Some(fed as f64 / RATE),
                 _ => {}
             }
         }
     }
     assert!(ended, "the end frame arrived");
+    // The postamble closes the stream within moments of the signal's end, not after
+    // the six blocks (18 s) with nothing in them that the receiver otherwise waits.
+    let eot_at = eot_at.expect("the postamble was heard");
+    assert!(
+        eot_at - signal_end_s < 3.0,
+        "heard {:.1} s after the signal ended",
+        eot_at - signal_end_s
+    );
     assert!(
         segment_closed,
         "the receiver closed the channel after the end"

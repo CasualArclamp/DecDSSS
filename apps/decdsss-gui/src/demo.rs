@@ -10,7 +10,7 @@ use decdsss_codec2::Mode as Codec;
 use decdsss_core::{Mode, Profile};
 use decdsss_link::{SendSpec, VoiceSpec, container, plan_voice, segments};
 use decdsss_phy::framing::PayloadType;
-use decdsss_phy::tx::{chips_to_audio, segment_chips};
+use decdsss_phy::tx::{chips_to_audio, transmission_chips};
 
 pub const RATE: u32 = 48_000;
 
@@ -90,10 +90,7 @@ fn station(
         passes: 1,
     };
     let segs = segments(&spec, &container::pack(name, data)).expect("demo segments");
-    let mut chips = Vec::new();
-    for s in &segs {
-        chips.extend(segment_chips(s).expect("demo header"));
-    }
+    let chips = transmission_chips(&segs).expect("demo header");
     chips_to_audio(&chips, Profile::W2400, f64::from(RATE), 0.2, lead, 2.0)
 }
 
@@ -156,10 +153,7 @@ fn voice_station(call: &str, session: u8, pcm: &[i16], lead: f64) -> Vec<f32> {
         resync_s: 40.0,
     };
     let plan = plan_voice(&spec, pcm).expect("demo speech");
-    let mut chips = Vec::new();
-    for s in &plan.segments {
-        chips.extend(segment_chips(s).expect("demo header"));
-    }
+    let chips = transmission_chips(&plan.segments).expect("demo header");
     chips_to_audio(&chips, Profile::W2400, f64::from(RATE), 0.2, lead, 2.0)
 }
 
