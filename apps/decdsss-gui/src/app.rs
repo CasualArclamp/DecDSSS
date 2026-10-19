@@ -359,129 +359,255 @@ impl App {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut Ui, sh: &Shared) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("DecDSSS").strong().size(16.0));
-            ui.label(RichText::new(format!("v{VERSION}")).weak().size(12.0))
-                .on_hover_text(format!("decdsss-gui {VERSION}"));
-            // Tabs: the receiver, the transmitter, or both on one page.
-            let before = self.view;
-            for (v, label) in [(View::Rx, "RX"), (View::Tx, "TX"), (View::Both, "RX + TX")] {
+    /// The top bar: a run row (view, Start / Stop), the status line, then
+    /// labelled cards for the source, bands, level, radio and listening.
+    /// "DecDSSS v0.0.1".
+    fn brand(&self, ui: &mut Ui) {
+        ui.label(RichText::new("DecDSSS").strong().size(16.0));
+        ui.label(RichText::new(format!("v{VERSION}")).weak().size(12.0))
+            .on_hover_text(format!("decdsss-gui {VERSION}"));
+    }
+
+    /// RX / TX / RX + TX. `big` makes them tall, flat buttons.
+    fn view_tabs(&mut self, ui: &mut Ui, big: bool) {
+        let before = self.view;
+        for (v, label) in [(View::Rx, "RX"), (View::Tx, "TX"), (View::Both, "RX + TX")] {
+            if big {
+                let text = RichText::new(label).strong().size(14.0);
+                let b = egui::Button::selectable(self.view == v, text).min_size(vec2(56.0, 28.0));
+                if ui.add(b).clicked() {
+                    self.view = v;
+                }
+            } else {
                 ui.selectable_value(&mut self.view, v, label);
             }
-            if self.view != before && self.auto.screenshot.is_none() {
-                self.prefs.set("view", self.view.name());
-                self.prefs.save();
-            }
-            ui.separator();
-            ui.add_enabled_ui(!sh.running, |ui| {
-                egui::ComboBox::from_id_salt("source")
-                    .selected_text(match self.source {
-                        SourceKind::Device => "Sound card",
-                        SourceKind::Wav => "WAV file",
-                        SourceKind::Demo => "Demo signal",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.source, SourceKind::Device, "Sound card");
-                        ui.selectable_value(&mut self.source, SourceKind::Wav, "WAV file");
-                        ui.selectable_value(&mut self.source, SourceKind::Demo, "Demo signal");
-                    });
-                match self.source {
-                    SourceKind::Device => {
-                        let name = if self.device_in == 0 {
-                            "System default".to_string()
-                        } else {
-                            self.devices_in
-                                .get(self.device_in - 1)
-                                .cloned()
-                                .unwrap_or_default()
-                        };
-                        egui::ComboBox::from_id_salt("device")
-                            .width(220.0)
-                            .selected_text(name)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.device_in, 0, "System default");
-                                for (i, d) in self.devices_in.iter().enumerate() {
-                                    ui.selectable_value(&mut self.device_in, i + 1, d);
-                                }
-                            });
-                    }
-                    SourceKind::Wav => {
-                        if ui.button("Open WAV…").clicked()
-                            && let Some(p) = rfd::FileDialog::new()
-                                .add_filter("WAV audio", &["wav"])
-                                .pick_file()
-                        {
-                            self.wav = Some(p);
-                        }
-                        if let Some(p) = &self.wav {
-                            ui.label(
-                                p.file_name()
-                                    .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
-                            );
-                        }
-                        ui.add(
-                            egui::Slider::new(&mut self.speed, 1.0..=32.0)
-                                .logarithmic(true)
-                                .text("× speed"),
-                        );
-                    }
-                    SourceKind::Demo => {
-                        ui.add(
-                            egui::Slider::new(&mut self.speed, 1.0..=32.0)
-                                .logarithmic(true)
-                                .text("× speed"),
-                        );
-                    }
+        }
+        if self.view != before && self.auto.screenshot.is_none() {
+            self.prefs.set("view", self.view.name());
+            self.prefs.save();
+        }
+    }
+
+    /// Where the audio comes from: sound card, WAV file or the demo signal.
+    fn source_controls(&mut self, ui: &mut Ui, sh: &Shared) {
+        ui.add_enabled_ui(!sh.running, |ui| {
+            egui::ComboBox::from_id_salt("source")
+                .selected_text(match self.source {
+                    SourceKind::Device => "Sound card",
+                    SourceKind::Wav => "WAV file",
+                    SourceKind::Demo => "Demo signal",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.source, SourceKind::Device, "Sound card");
+                    ui.selectable_value(&mut self.source, SourceKind::Wav, "WAV file");
+                    ui.selectable_value(&mut self.source, SourceKind::Demo, "Demo signal");
+                });
+            match self.source {
+                SourceKind::Device => {
+                    let name = if self.device_in == 0 {
+                        "System default".to_string()
+                    } else {
+                        self.devices_in
+                            .get(self.device_in - 1)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    egui::ComboBox::from_id_salt("device")
+                        .width(220.0)
+                        .selected_text(name)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.device_in, 0, "System default");
+                            for (i, d) in self.devices_in.iter().enumerate() {
+                                ui.selectable_value(&mut self.device_in, i + 1, d);
+                            }
+                        });
                 }
-            });
-            ui.separator();
-            ui.add_enabled_ui(!sh.running, |ui| {
-                for (i, b) in Band::ALL.iter().enumerate() {
+                SourceKind::Wav => {
+                    if ui.button("Open WAV…").clicked()
+                        && let Some(p) = rfd::FileDialog::new()
+                            .add_filter("WAV audio", &["wav"])
+                            .pick_file()
+                    {
+                        self.wav = Some(p);
+                    }
+                    if let Some(p) = &self.wav {
+                        ui.label(
+                            p.file_name()
+                                .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
+                        );
+                    }
+                    ui.add(
+                        egui::Slider::new(&mut self.speed, 1.0..=32.0)
+                            .logarithmic(true)
+                            .text("× speed"),
+                    );
+                }
+                SourceKind::Demo => {
+                    ui.add(
+                        egui::Slider::new(&mut self.speed, 1.0..=32.0)
+                            .logarithmic(true)
+                            .text("× speed"),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Which bands to listen on. `chips` draws them as toggle buttons.
+    fn band_checks(&mut self, ui: &mut Ui, sh: &Shared, chips: bool) {
+        ui.add_enabled_ui(!sh.running, |ui| {
+            for (i, b) in Band::ALL.iter().enumerate() {
+                if chips {
+                    ui.toggle_value(&mut self.bands[i], b.label());
+                } else {
                     ui.checkbox(&mut self.bands[i], b.label());
                 }
-            });
-            ui.separator();
+            }
+        });
+    }
+
+    /// Start (green) or Stop (red). `big` makes it a wide, tall button.
+    fn run_button(&mut self, ui: &mut Ui, sh: &Shared, big: bool) {
+        let size = if big { vec2(110.0, 32.0) } else { vec2(0.0, 0.0) };
+        let (label, fill) = if sh.running {
+            ("■  Stop", col::BAD)
+        } else {
+            ("▶  Start", col::LOCK)
+        };
+        let text = RichText::new(label)
+            .strong()
+            .size(if big { 15.0 } else { 13.0 })
+            .color(if sh.running { Color32::WHITE } else { Color32::BLACK });
+        if ui
+            .add(egui::Button::new(text).fill(fill).min_size(size))
+            .clicked()
+        {
             if sh.running {
-                if ui.button("■ Stop").clicked() {
-                    self.engine.send(Cmd::Stop);
-                }
-            } else if ui.button("▶ Start").clicked() {
+                self.engine.send(Cmd::Stop);
+            } else {
                 self.start();
             }
-            // Input level.
-            let (rect, _) = ui.allocate_exact_size(vec2(90.0, 12.0), Sense::hover());
-            let p = ui.painter_at(rect);
-            p.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-            let w = (sh.level.clamp(0.0, 1.0)).sqrt() * rect.width();
+        }
+    }
+
+    /// The input level: a plain bar, or `segmented` LED blocks (green, amber, red).
+    fn level_meter(&self, ui: &mut Ui, sh: &Shared, width: f32, height: f32, segmented: bool) {
+        let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+        let lvl = sh.level.clamp(0.0, 1.0).sqrt();
+        if segmented {
+            const N: usize = 24;
+            let gap = 2.0;
+            let w = (rect.width() - gap * (N as f32 - 1.0)) / N as f32;
+            for i in 0..N {
+                let f = i as f32 / N as f32;
+                let on = lvl > f;
+                let c = if f > 0.85 {
+                    col::BAD
+                } else if f > 0.65 {
+                    col::MARK
+                } else {
+                    col::LOCK
+                };
+                let c = if on { c } else { c.gamma_multiply(0.18) };
+                let x = rect.left() + i as f32 * (w + gap);
+                let r = egui::Rect::from_min_size(pos2(x, rect.top()), vec2(w, rect.height()));
+                p.rect_filled(r, 1.0, c);
+            }
+        } else {
+            let w = lvl * rect.width();
             p.rect_filled(
                 egui::Rect::from_min_size(rect.min, vec2(w, rect.height())),
                 2.0,
                 if sh.level > 0.95 { col::BAD } else { col::LOCK },
             );
-            ui.label(format!("{:.0} s", sh.seconds));
-            // The measured frame rate of the window (the waterfall scrolls a row a frame).
-            self.fps += 0.1 * (self.measured_fps - self.fps);
-            ui.label(RichText::new(format!("{:.0} fps", self.fps)).weak());
-            // Whatever tab is showing, a transmission in progress can be stopped.
-            if (sh.tx.active || self.tx.live_active())
-                && ui
-                    .add(egui::Button::new(RichText::new("■ STOP").strong()).fill(col::BAD))
-                    .on_hover_text(
-                        "Stop the transmission (or the playback) now; if you key the radio by hand, release it too",
-                    )
-                    .clicked()
-            {
-                self.tx.abort_live();
-                self.engine.send(Cmd::StopTransmit);
-            }
+        }
+    }
+
+    /// Whatever tab is showing, a transmission in progress can be stopped.
+    fn tx_stop(&mut self, ui: &mut Ui, sh: &Shared, big: bool) {
+        if !(sh.tx.active || self.tx.live_active()) {
+            return;
+        }
+        let size = if big { vec2(100.0, 32.0) } else { vec2(0.0, 0.0) };
+        if ui
+            .add(
+                egui::Button::new(RichText::new("■ STOP TX").strong().color(Color32::WHITE))
+                    .fill(col::BAD)
+                    .min_size(size),
+            )
+            .on_hover_text(
+                "Stop the transmission (or the playback) now; if you key the radio by hand, release it too",
+            )
+            .clicked()
+        {
+            self.tx.abort_live();
+            self.engine.send(Cmd::StopTransmit);
+        }
+    }
+
+    /// Seconds run, and the measured frame rate of the window (the waterfall
+    /// scrolls a row a frame).
+    fn clock_and_fps(&mut self, ui: &mut Ui, sh: &Shared) {
+        ui.label(format!("{:.0} s", sh.seconds));
+        self.fps += 0.1 * (self.measured_fps - self.fps);
+        ui.label(RichText::new(format!("{:.0} fps", self.fps)).weak());
+    }
+
+    /// A small caps caption over a group of controls.
+    fn caption(ui: &mut Ui, text: &str) {
+        ui.label(RichText::new(text).weak().size(10.0).strong());
+    }
+
+    fn top_bar(&mut self, ui: &mut Ui, sh: &Shared) {
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            self.brand(ui);
             ui.separator();
-            self.cat_button(ui);
+            self.view_tabs(ui, true);
             ui.separator();
-            self.monitor_controls(ui, sh);
-            ui.separator();
-            ui.label(RichText::new(&sh.status).weak());
+            self.run_button(ui, sh, true);
+            self.tx_stop(ui, sh, true);
         });
+        ui.label(RichText::new(&sh.status).weak().size(11.0));
+        ui.horizontal_wrapped(|ui| {
+            let frame = |ui: &Ui| egui::Frame::group(ui.style()).inner_margin(6.0);
+            frame(ui).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    Self::caption(ui, "SOURCE");
+                    ui.horizontal(|ui| self.source_controls(ui, sh));
+                });
+            });
+            frame(ui).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    Self::caption(ui, "BANDS");
+                    ui.horizontal(|ui| self.band_checks(ui, sh, true));
+                });
+            });
+            frame(ui).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    Self::caption(ui, "LEVEL");
+                    ui.horizontal(|ui| {
+                        self.level_meter(ui, sh, 110.0, 14.0, false);
+                        self.clock_and_fps(ui, sh);
+                    });
+                });
+            });
+            frame(ui).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    Self::caption(ui, "RADIO");
+                    ui.horizontal(|ui| self.cat_button(ui));
+                });
+            });
+            frame(ui).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    Self::caption(ui, "LISTEN");
+                    ui.horizontal_wrapped(|ui| self.monitor_controls(ui, sh));
+                });
+            });
+        });
+        ui.add_space(2.0);
     }
 
     /// The CAT and PTT button, with a lamp: grey when the program keys nothing,
