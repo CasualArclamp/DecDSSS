@@ -18,12 +18,19 @@
 //! profile is measured again from what is known (the pilots, or the symbols
 //! just decided), the reference moves onto the strongest path and the fingers
 //! are placed on the peaks by deconvolution.
+//!
+//! A watch on the energy the fingers collect catches the signal lost (a slip
+//! of the audio, or a fade); a wide search on the samples kept tells a slip from
+//! a fade, and after a slip the tracking state goes back to a snapshot from
+//! before it and the symbols are despread again from there on the moved track
+//! ([`rewind`]).
 
 use super::despread::{Track, csk_bit_llrs, despread, ln_i0, sum, walsh_correlate, walsh_one};
 use super::frontend::Buf;
 use super::grake;
 use super::header::{Finger, HeaderResult};
 use super::preamble::DelayProfile;
+use super::rewind::{self, Judged, Watch};
 use crate::codes::{Scrambler, own_code};
 use crate::eot;
 use crate::framing::{Header, Layout, check_frame};
@@ -110,6 +117,45 @@ fn rake_only() -> bool {
     *RAKE_ONLY.get_or_init(|| std::env::var_os("DECDSSS_RAKE_ONLY").is_some())
 }
 
+/// Where a block's known-chip refinement starts: after a slip the block's
+/// timing is one line only from the slip on, so there, on the track that symbol
+/// was taken on (moved onto the end's finger lags); otherwise the block's start.
+fn refine_from(
+    ts: &[(Track, f64)],
+    shifted: f64,
+    slipped_at: Option<usize>,
+    start: Track,
+) -> (Track, usize) {
+    match slipped_at {
+        Some(k) => {
+            let (mut t, moved) = ts[k];
+            t.pos += (shifted - moved) * t.step;
+            (t, k)
+        }
+        None => (start, 0),
+    }
+}
+
+/// What a slip search measures of one symbol at one lag: (buffer, the track
+/// the symbol was taken on, its scrambler chips, lag in chips, a scratch
+/// buffer) → power. A trait object (`dyn Fn`), so one search serves DS-PSK
+/// and CSK.
+type EnergyAt = dyn Fn(&Buf, &Track, &[Iq], f64, &mut [Iq]) -> f64;
+
+/// Harmonic number H_n: the mean of the largest of n exponential variables of
+/// unit mean (the largest of a CSK symbol's n code powers when only noise is
+/// there).
+fn harmonic(n: usize) -> f64 {
+    (1..=n).map(|k| 1.0 / k as f64).sum()
+}
+
+/// Measurement switch (environment `DECDSSS_NO_REWIND`, any value): no watch,
+/// no rewind, as before them. Read once.
+fn no_rewind() -> bool {
+    static NO_REWIND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_REWIND.get_or_init(|| std::env::var_os("DECDSSS_NO_REWIND").is_some())
+}
+
 /// The carrier correction from `acc`, a sum of successive-measurement
 /// products (`norm` the sum of their magnitudes) taken `interval_s` apart;
 /// zero when the products do not agree (a fade).
@@ -142,6 +188,8 @@ pub struct BlockResult {
 /// The data behind the instrument panels, updated as the demodulator works.
 #[derive(Clone, Debug, Default)]
 pub struct Live {
+    /// Slips of the signal the rewind found and followed.
+    pub slips: usize,
     /// DS-PSK: recent data symbols after rake combining, scaled to unit
     /// amplitude (the constellation).
     pub symbols: Vec<Iq>,
@@ -190,6 +238,7 @@ fn loop_gains(bn_hz: f64, update_s: f64) -> (f64, f64) {
 /// (each finger's own bias towards a neighbouring path points the other way
 /// for the neighbour, so the sum is far better behaved than one finger's),
 /// are averaged over a group of symbols, then one update.
+#[derive(Clone)]
 struct Dll {
     kp: f64,
     ki: f64,
@@ -282,6 +331,32 @@ struct CskWork {
     u: Vec<Iq>,
     ue: Vec<Iq>,
     ul: Vec<Iq>,
+    /// As in [`DsWork`]: the track each symbol was taken on and the fingers'
+    /// moves, snapshots, the search, the replay and the slip.
+    ts: Vec<(Track, f64)>,
+    shifted: f64,
+    snaps: Vec<CskSnap>,
+    search: bool,
+    replay_until: usize,
+    slip: Option<(usize, f64)>,
+    slipped_at: Option<usize>,
+}
+
+/// What a CSK block's tracking was at a symbol.
+#[derive(Clone)]
+struct CskSnap {
+    s: usize,
+    t: Track,
+    w_len: usize,
+    peak_prev: Option<Iq>,
+    freq_acc: Iq,
+    freq_norm: f32,
+    tc: Track,
+    s_lo: usize,
+    shifted: f64,
+    dll: Dll,
+    fingers: Vec<Finger>,
+    finger_age: Vec<u8>,
 }
 
 /// A DS-PSK block in progress.
@@ -316,6 +391,39 @@ struct DsWork {
     /// Running mean of the squared distance of a displayed symbol from its
     /// nearest QPSK point: 1/this is the symbol-rate SNR.
     err2: f32,
+    /// Snapshots of the tracking state at the watch's windows, the block's
+    /// start first.
+    snaps: Vec<DsSnap>,
+    /// The watch asked for a search before the next symbol.
+    search: bool,
+    /// After a rewind, the symbols up to here come again and the watch does
+    /// not judge them a second time.
+    replay_until: usize,
+    /// A slip the search found: from this symbol the signal is this many chips
+    /// away.
+    slip: Option<(usize, f64)>,
+    /// The symbol of the last slip followed: the block's timing is one line
+    /// only from there, so the known-chip refinement starts there.
+    slipped_at: Option<usize>,
+}
+
+/// What a DS-PSK block's tracking was at a symbol: enough to go on from there
+/// as though the symbols after it had not come yet.
+#[derive(Clone)]
+struct DsSnap {
+    s: usize,
+    t: Track,
+    pilot_no: usize,
+    freq_acc: Iq,
+    freq_norm: f32,
+    tc: Track,
+    s_lo: usize,
+    shifted: f64,
+    prev_z: Option<Iq>,
+    err2: f32,
+    dll: Dll,
+    fingers: Vec<Finger>,
+    finger_age: Vec<u8>,
 }
 
 enum Work {
@@ -355,6 +463,9 @@ pub struct PayloadRx {
     /// (the known-chip refinement). Then the block starts at once; otherwise it
     /// waits for the seconds of pilots its own pre-pass measures from.
     fresh: bool,
+    /// The watch on the energy the fingers collect (see [`rewind`]); it runs on
+    /// from block to block.
+    watch: Watch,
     /// The last block's interleaved LLRs (kept for the tests).
     #[cfg(test)]
     pub last_llrs: Vec<f32>,
@@ -388,6 +499,7 @@ impl PayloadRx {
             eot: None,
             eot_probed: false,
             fresh: true,
+            watch: Watch::default(),
             #[cfg(test)]
             last_llrs: Vec::new(),
         })
@@ -474,7 +586,8 @@ impl PayloadRx {
             Some(Work::Ds(w)) => w.start,
             None => self.track,
         };
-        (from.pos + (min_lag - 10.0) * from.step) as i64
+        let reach = rewind::SLIP_REACH_S * f64::from(self.header.profile.chip_rate());
+        (from.pos + (min_lag - reach - 10.0) * from.step) as i64
     }
 
     /// Works on the block in progress with the samples there are; returns it
@@ -552,6 +665,12 @@ impl PayloadRx {
 
     fn begin_block(&mut self, buf: &Buf, prepass: bool) {
         self.eot_probed = false;
+        // A loss carried over from the last block: its symbols are gone, so
+        // there is nothing to rewind to before this block's start.
+        self.watch.restart_window();
+        if let Some(l) = self.watch.lost.as_mut() {
+            l.since = 0;
+        }
         let cr = f64::from(self.header.profile.chip_rate());
         self.dll.set_wide((self.chip0 as f64) / cr < DLL_WIDE_S);
         let l = usize::from(self.header.mode.spread);
@@ -585,7 +704,19 @@ impl PayloadRx {
                     u: blank(),
                     ue: blank(),
                     ul: blank(),
+                    ts: Vec::with_capacity(s_count),
+                    shifted: 0.0,
+                    snaps: Vec::new(),
+                    search: false,
+                    replay_until: 0,
+                    slip: None,
+                    slipped_at: None,
                 })));
+                if let Some(Work::Csk(mut w)) = self.work.take() {
+                    let first = self.csk_snap(&w);
+                    w.snaps.push(first);
+                    self.work = Some(Work::Csk(w));
+                }
             }
             Family::DsPsk => {
                 if prepass {
@@ -614,7 +745,19 @@ impl PayloadRx {
                     shifted: 0.0,
                     prev_z: None,
                     err2: 0.5,
+                    snaps: Vec::new(),
+                    search: false,
+                    replay_until: 0,
+                    slip: None,
+                    slipped_at: None,
                 })));
+                // The block's start is the first snapshot. (`take` moves the
+                // work out of `self` so `ds_snap` can borrow `self` meanwhile.)
+                if let Some(Work::Ds(mut w)) = self.work.take() {
+                    let first = self.ds_snap(&w);
+                    w.snaps.push(first);
+                    self.work = Some(Work::Ds(w));
+                }
             }
         }
         self.live.fingers = self.fingers.clone();
@@ -650,6 +793,7 @@ impl PayloadRx {
         fallback: Option<&[f32]>,
         snr_db: f64,
         block_start: Track,
+        from_symbol: usize,
     ) -> BlockResult {
         #[cfg(test)]
         {
@@ -673,7 +817,7 @@ impl PayloadRx {
         let first_frame = usize::from(self.header.frame0) + self.next_block * self.layout.depth;
         self.fresh = false;
         if frames.iter().all(Option::is_some) && !debug_frozen("refresh") {
-            self.refresh_fingers(buf, &frames, block_start);
+            self.refresh_fingers(buf, &frames, block_start, from_symbol);
             self.fresh = true;
         }
         self.live.fingers = self.fingers.clone();
@@ -691,17 +835,28 @@ impl PayloadRx {
     /// With every codeword of the block decoded, the transmitted chips are
     /// known: refine timing, clock and carrier against them, then correlate at
     /// each lag for the block's delay profile and re-pick the fingers from it.
-    fn refresh_fingers(&mut self, buf: &Buf, frames: &[Option<Vec<u8>>], start: Track) {
+    ///
+    /// `start` is the track at symbol `from` (0 unless the block slipped: its
+    /// timing is one line only after the slip).
+    fn refresh_fingers(
+        &mut self,
+        buf: &Buf,
+        frames: &[Option<Vec<u8>>],
+        start: Track,
+        from: usize,
+    ) {
         let data: Vec<Vec<u8>> = frames.iter().map(|f| f.clone().unwrap()).collect();
         let chips = block_chips(&self.layout, &data, &self.scr, self.chip0);
+        let l = usize::from(self.header.mode.spread);
+        let chips = &chips[(from * l).min(chips.len())..];
         let main_lag = self.fingers.first().map_or(0.0, |f| f.lag);
         let cr = self.rate / super::frontend::SPS as f64;
         let seg = super::refine::segment_chips(cr);
-        let refined = super::refine::refine(buf, &start, &chips, main_lag, seg, 60e-6);
+        let refined = super::refine::refine(buf, &start, chips, main_lag, seg, 60e-6);
         let (fingers, shift) = match &refined {
-            Some(r) => super::refine::tail_fingers(buf, r, &start, &chips, seg),
+            Some(r) => super::refine::tail_fingers(buf, r, &start, chips, seg),
             None => {
-                let p = super::refine::profile_known(buf, &start, &chips, seg);
+                let p = super::refine::profile_known(buf, &start, chips, seg);
                 super::refine::fingers_from_profile(&p)
             }
         };
@@ -947,11 +1102,34 @@ impl PayloadRx {
         let t_sym = l as f64 * wk.t.step / wk.t.rate;
         let freq_every = ((FREQ_UPDATE_S / t_sym).ceil() as usize).max(4);
         let chunk = (((SEARCH_S / t_sym).ceil() as usize).max(SEARCH_MIN_SYMBOLS)).min(wk.s_count);
+        let win = ((rewind::WATCH_S / t_sym).ceil() as usize).max(rewind::WATCH_MIN_SYMBOLS);
+        let max_windows = ((rewind::LOST_MAX_S / (win as f64 * t_sym)).ceil() as usize).max(2);
+        let reach = rewind::SLIP_REACH_S * f64::from(self.header.profile.chip_rate());
+        let h_l = harmonic(l);
         while wk.s < wk.s_count {
             if wk.t.pos + (l as f64 + AHEAD_CHIPS) * wk.t.step + 16.0 > buf.end() as f64 {
                 return false;
             }
+            if wk.search {
+                let ahead = reach + self.fingers.iter().map(|f| f.lag).fold(0.0, f64::max);
+                if wk.t.pos + (l as f64 + ahead + AHEAD_CHIPS) * wk.t.step + 16.0 > buf.end() as f64
+                {
+                    return false;
+                }
+                wk.search = false;
+                if self.resync_csk(buf, wk, win) {
+                    continue;
+                }
+            }
+            if let Some((at, d)) = wk.slip
+                && at == wk.s
+            {
+                wk.t.pos += d * wk.t.step;
+                wk.slip = None;
+                wk.slipped_at = Some(wk.s);
+            }
             let s = wk.s;
+            wk.ts.push((wk.t, wk.shifted));
             let sc = &wk.scr[s * l..(s + 1) * l];
             let nf = self.fingers.len();
             let at = wk.w.len();
@@ -1041,13 +1219,120 @@ impl PayloadRx {
                 if let Some(shift) = self.adopt_track(&profile) {
                     let (step0, chips) = (wk.step0, ((s + 1 - wk.s_lo) * l) as f64);
                     self.apply_shift(&mut wk.t, shift, chips, step0);
+                    wk.shifted += shift;
                 }
                 wk.tc = wk.t;
                 wk.s_lo = s + 1;
             }
             wk.s += 1;
             self.live.symbol = wk.s;
+            if wk.s > wk.replay_until && !no_rewind() {
+                // The decided code's power at the fingers; the noise from the
+                // other codes, times H_L: when the signal is gone the decided
+                // code is the largest of L noise powers.
+                let (mut e, mut others) = (0.0f64, 0.0f64);
+                for f in 0..nf {
+                    let row = &wk.w[at + f * l..at + (f + 1) * l];
+                    let p = f64::from(row[m].norm_sqr());
+                    e += p;
+                    others += (row.iter().map(|z| f64::from(z.norm_sqr())).sum::<f64>() - p)
+                        / (l as f64 - 1.0);
+                }
+                match self.watch.push(e, h_l * others, win, wk.s, max_windows) {
+                    Some(Judged::Locked) => {
+                        let snap = self.csk_snap(wk);
+                        if wk.snaps.len() > rewind::SNAPS {
+                            wk.snaps.remove(1);
+                        }
+                        wk.snaps.push(snap);
+                    }
+                    Some(Judged::Lost | Judged::StillLost) => wk.search = true,
+                    Some(Judged::Recovered | Judged::GiveUp) | None => {}
+                }
+            }
         }
+        true
+    }
+
+    /// The tracking state of a CSK block as it stands, for a rewind.
+    fn csk_snap(&self, wk: &CskWork) -> CskSnap {
+        CskSnap {
+            s: wk.s,
+            t: wk.t,
+            w_len: wk.w.len(),
+            peak_prev: wk.peak_prev,
+            freq_acc: wk.freq_acc,
+            freq_norm: wk.freq_norm,
+            tc: wk.tc,
+            s_lo: wk.s_lo,
+            shifted: wk.shifted,
+            dll: self.dll.clone(),
+            fingers: self.fingers.clone(),
+            finger_age: self.finger_age.clone(),
+        }
+    }
+
+    /// Puts a CSK block back to the newest snapshot at or before symbol `at`.
+    fn csk_rewind(&mut self, wk: &mut CskWork, at: usize) {
+        let i = wk.snaps.iter().rposition(|n| n.s <= at).unwrap_or(0);
+        wk.snaps.truncate(i + 1);
+        let n = wk.snaps[i].clone();
+        wk.replay_until = wk.replay_until.max(wk.s);
+        wk.s = n.s;
+        wk.t = n.t;
+        wk.w.truncate(n.w_len);
+        wk.index.truncate(n.s);
+        wk.decisions.truncate(n.s);
+        wk.peak_prev = n.peak_prev;
+        wk.freq_acc = n.freq_acc;
+        wk.freq_norm = n.freq_norm;
+        wk.tc = n.tc;
+        wk.s_lo = n.s_lo;
+        wk.shifted = n.shifted;
+        wk.ts.truncate(n.s);
+        wk.slip = None;
+        if wk.slipped_at.is_some_and(|k| k >= n.s) {
+            wk.slipped_at = None;
+        }
+        self.dll = n.dll;
+        self.fingers = n.fingers;
+        self.finger_age = n.finger_age;
+        self.watch.restart_window();
+    }
+
+    /// The search for a CSK block (see [`PayloadRx::find_slip`]); the energy
+    /// at a lag is the largest Walsh correlation power. True when it rewound.
+    fn resync_csk(&mut self, buf: &Buf, wk: &mut CskWork, win: usize) -> bool {
+        let Some(lost) = self.watch.lost else {
+            return false;
+        };
+        if wk.s == 0 {
+            return false;
+        }
+        let csk = |buf: &Buf, t: &Track, sc: &[Iq], lag: f64, u: &mut [Iq]| {
+            despread(buf, t, sc, lag, u);
+            walsh_correlate(u)
+                .iter()
+                .map(|z| f64::from(z.norm_sqr()))
+                .fold(0.0, f64::max)
+        };
+        let span = (lost.since.min(wk.s - 1), wk.s);
+        let Some((k, d)) = self.find_slip(
+            buf,
+            &wk.ts,
+            wk.shifted,
+            &wk.scr,
+            wk.snaps[0].s,
+            span,
+            win,
+            &csk,
+        ) else {
+            return false;
+        };
+        self.csk_rewind(wk, k);
+        wk.slip = Some((k, d));
+        self.watch.lost = None;
+        self.live.slips += 1;
         true
     }
 
@@ -1088,7 +1373,8 @@ impl PayloadRx {
             csk_bit_llrs(&metric, bits, &mut llrs);
         }
         let snr = 10.0 * (amp2[0] / sigma2[0].max(1e-30)).log10();
-        self.finish(buf, &llrs, None, snr, wk.start)
+        let (start, from) = refine_from(&wk.ts, wk.shifted, wk.slipped_at, wk.start);
+        self.finish(buf, &llrs, None, snr, start, from)
     }
 
     /// Processes DS-PSK symbols while the buffer holds them; true when the
@@ -1101,9 +1387,34 @@ impl PayloadRx {
         let freq_every = ((FREQ_UPDATE_S / t_pilot).ceil() as usize).max(3);
         let chunk_pilots = ((SEARCH_S / t_pilot).ceil() as usize).max(SEARCH_MIN_PILOTS);
         let chunk = chunk_pilots * per;
+        let win = ((rewind::WATCH_S / t_sym).ceil() as usize).max(rewind::WATCH_MIN_SYMBOLS);
+        let max_windows = ((rewind::LOST_MAX_S / (win as f64 * t_sym)).ceil() as usize).max(2);
+        let reach = rewind::SLIP_REACH_S * f64::from(self.header.profile.chip_rate());
         while wk.s < wk.s_count {
             if wk.t.pos + (l as f64 + AHEAD_CHIPS) * wk.t.step + 16.0 > buf.end() as f64 {
                 return false;
+            }
+            if wk.search {
+                // The search reaches ahead of the newest symbol too.
+                let ahead = reach + self.fingers.iter().map(|f| f.lag).fold(0.0, f64::max);
+                if wk.t.pos + (l as f64 + ahead + AHEAD_CHIPS) * wk.t.step + 16.0 > buf.end() as f64
+                {
+                    return false;
+                }
+                wk.search = false;
+                if self.resync_ds(buf, wk, win) {
+                    // Rewound: on from the snapshot.
+                    continue;
+                }
+            }
+            if let Some((at, d)) = wk.slip
+                && at == wk.s
+            {
+                // The signal goes on `d` chips away from here (a slip of the
+                // audio): the track moves, the fingers with it.
+                wk.t.pos += d * wk.t.step;
+                wk.slip = None;
+                wk.slipped_at = Some(wk.s);
             }
             let s = wk.s;
             wk.ts.push((wk.t, wk.shifted));
@@ -1201,7 +1512,188 @@ impl PayloadRx {
             }
             wk.s += 1;
             self.live.symbol = wk.s;
+            if wk.s > wk.replay_until && !no_rewind() {
+                let e: f64 = wk.y[s].iter().map(|y| f64::from(y.norm_sqr())).sum();
+                // Noise: the same number of fingers where there is no path, eight
+                // chips past the last (beyond an HF delay spread at any profile).
+                let nf = self.fingers.len().min(SLOTS);
+                let off = self.fingers.iter().map(|f| f.lag).fold(0.0, f64::max) + 8.0;
+                let (t0, _) = wk.ts[s];
+                despread(buf, &t0, &wk.scr[s * l..(s + 1) * l], off, &mut wk.u);
+                let noise = nf as f64 * f64::from(sum(&wk.u).norm_sqr());
+                match self.watch.push(e, noise, win, wk.s, max_windows) {
+                    Some(Judged::Locked) => {
+                        let snap = self.ds_snap(wk);
+                        // The block's start stays; then the newest few.
+                        if wk.snaps.len() > rewind::SNAPS {
+                            wk.snaps.remove(1);
+                        }
+                        wk.snaps.push(snap);
+                    }
+                    Some(Judged::Lost | Judged::StillLost) => wk.search = true,
+                    Some(Judged::Recovered | Judged::GiveUp) | None => {}
+                }
+            }
         }
+        true
+    }
+
+    /// The tracking state of a DS-PSK block as it stands, for a rewind.
+    fn ds_snap(&self, wk: &DsWork) -> DsSnap {
+        DsSnap {
+            s: wk.s,
+            t: wk.t,
+            pilot_no: wk.pilot_no,
+            freq_acc: wk.freq_acc,
+            freq_norm: wk.freq_norm,
+            tc: wk.tc,
+            s_lo: wk.s_lo,
+            shifted: wk.shifted,
+            prev_z: wk.prev_z,
+            err2: wk.err2,
+            dll: self.dll.clone(),
+            fingers: self.fingers.clone(),
+            finger_age: self.finger_age.clone(),
+        }
+    }
+
+    /// Puts a DS-PSK block back to the newest snapshot at or before symbol
+    /// `at`; the symbols after it come again. Returns the symbol it went to.
+    fn ds_rewind(&mut self, wk: &mut DsWork, at: usize) -> usize {
+        let i = wk.snaps.iter().rposition(|n| n.s <= at).unwrap_or(0);
+        wk.snaps.truncate(i + 1);
+        let n = wk.snaps[i].clone();
+        wk.replay_until = wk.replay_until.max(wk.s);
+        wk.s = n.s;
+        wk.t = n.t;
+        wk.pilot_no = n.pilot_no;
+        wk.freq_acc = n.freq_acc;
+        wk.freq_norm = n.freq_norm;
+        wk.tc = n.tc;
+        wk.s_lo = n.s_lo;
+        wk.shifted = n.shifted;
+        wk.prev_z = n.prev_z;
+        wk.err2 = n.err2;
+        wk.ts.truncate(n.s);
+        wk.slip = None;
+        if wk.slipped_at.is_some_and(|k| k >= n.s) {
+            wk.slipped_at = None;
+        }
+        self.dll = n.dll;
+        self.fingers = n.fingers;
+        self.finger_age = n.finger_age;
+        self.watch.restart_window();
+        n.s
+    }
+
+    /// The watch's search (see [`rewind`]) on a block's symbols `from..to`:
+    /// what `energy_at` collects at every lag within the reach, summed. If the
+    /// fingers' pattern moved by some shift collects clearly more than where it
+    /// is, and the energy left the old lag and reached the new one in one clean
+    /// step, the signal slipped: returns the symbol it slipped at (looked for
+    /// from `lo` on) and the shift, chips. `ts` holds the track each symbol was
+    /// taken on and the chips the fingers had moved by then, `shifted` the
+    /// chips they have moved by now.
+    #[allow(clippy::too_many_arguments)]
+    fn find_slip(
+        &self,
+        buf: &Buf,
+        ts: &[(Track, f64)],
+        shifted: f64,
+        scr: &[Iq],
+        lo: usize,
+        (from, to): (usize, usize),
+        win: usize,
+        energy_at: &EnergyAt,
+    ) -> Option<(usize, f64)> {
+        let l = usize::from(self.header.mode.spread);
+        let nf = self.fingers.len().min(SLOTS);
+        if nf == 0 || from >= to {
+            return None;
+        }
+        let lags: Vec<f64> = self.fingers[..nf].iter().map(|f| f.lag).collect();
+        let reach = rewind::SLIP_REACH_S * f64::from(self.header.profile.chip_rate());
+        let step = DelayProfile::LAG_STEP;
+        let (lmin, lmax) = lags
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        let lag0 = lmin - reach;
+        let n = ((lmax + reach - lag0) / step).round() as usize + 1;
+        let mut u = vec![Iq::new(0.0, 0.0); l];
+        // Symbol `s` at `lag` on the fingers' present scale.
+        let mut at = |s: usize, lag: f64| {
+            let (t, moved) = ts[s];
+            energy_at(
+                buf,
+                &t,
+                &scr[s * l..(s + 1) * l],
+                lag + shifted - moved,
+                &mut u,
+            )
+        };
+        let mut energy = vec![0.0f64; n];
+        for s in from..to {
+            for (i, e) in energy.iter_mut().enumerate() {
+                *e += at(s, lag0 + i as f64 * step);
+            }
+        }
+        let symbols = (to - from) as f64;
+        let settled = self.watch.settled.unwrap_or(0.0);
+        let (d, got, here) = rewind::best_shift(&energy, lag0, step, &lags, reach)?;
+        if got < rewind::SLIP_RATIO * here
+            || got / symbols - self.watch.noise.unwrap_or(0.0) < rewind::SLIP_MIN * settled
+        {
+            return None;
+        }
+        // Where it slipped, from `lo` on.
+        let (mut old, mut new) = (Vec::new(), Vec::new());
+        for s in lo..to {
+            old.push(lags.iter().map(|&g| at(s, g)).sum::<f64>());
+            new.push(lags.iter().map(|&g| at(s, g + d)).sum::<f64>());
+        }
+        let split = rewind::slip_at(&old, &new);
+        // The noise a symbol collects at the fingers: most lags searched hold
+        // none of the signal, so the median is noise.
+        let mut sorted = energy.clone();
+        sorted.sort_by(f64::total_cmp);
+        let noise = nf as f64 * sorted[sorted.len() / 2] / symbols;
+        rewind::is_clean_slip(&old, &new, split, win, noise).then_some((lo + split, d))
+    }
+
+    /// The search for a DS-PSK block; on a slip, rewinds to before it and goes
+    /// on with the shift from there. True when it rewound. (In a fade the loops
+    /// ride it out as they always have. Holding them, as BinModem does for its
+    /// decision-directed loops, cost DS4 whole transmissions on moderate
+    /// fading: the early/late loop and the carrier were held at the start,
+    /// before they had settled.)
+    fn resync_ds(&mut self, buf: &Buf, wk: &mut DsWork, win: usize) -> bool {
+        let Some(lost) = self.watch.lost else {
+            return false;
+        };
+        if wk.s == 0 {
+            return false;
+        }
+        let ds = |buf: &Buf, t: &Track, sc: &[Iq], lag: f64, u: &mut [Iq]| {
+            despread(buf, t, sc, lag, u);
+            f64::from(sum(u).norm_sqr())
+        };
+        let span = (lost.since.min(wk.s - 1), wk.s);
+        let Some((k, d)) = self.find_slip(
+            buf,
+            &wk.ts,
+            wk.shifted,
+            &wk.scr,
+            wk.snaps[0].s,
+            span,
+            win,
+            &ds,
+        ) else {
+            return false;
+        };
+        self.ds_rewind(wk, k);
+        wk.slip = Some((k, d));
+        self.watch.lost = None;
+        self.live.slips += 1;
         true
     }
 
@@ -1277,15 +1769,20 @@ impl PayloadRx {
             llrs.push(4.0 * z.re);
             llrs.push(4.0 * z.im);
         }
-        let var_g0 = if n_cnt > 0 { n_acc / n_cnt as f64 } else { f64::NAN };
+        let var_g0 = if n_cnt > 0 {
+            n_acc / n_cnt as f64
+        } else {
+            f64::NAN
+        };
         let grake = if debug_frozen("grake") || rake_only() {
             None
         } else {
             self.grake_llrs(buf, &wk, &hs, var_g0)
         };
+        let (start, from) = refine_from(&wk.ts, wk.shifted, wk.slipped_at, wk.start);
         match grake {
-            Some(g) => self.finish(buf, &g, Some(&llrs), snr, wk.start),
-            None => self.finish(buf, &llrs, None, snr, wk.start),
+            Some(g) => self.finish(buf, &g, Some(&llrs), snr, start, from),
+            None => self.finish(buf, &llrs, None, snr, start, from),
         }
     }
 
@@ -1319,7 +1816,11 @@ impl PayloadRx {
         // carries the neighbours' chips and the noise, over L chips. What the
         // model says the neighbours are is taken off (not below a tenth, so an
         // over-estimate of the paths cannot leave no noise at all).
-        let isi = a.iter().map(|a| grake::isi_power(lags[0], &lags, a)).sum::<f64>() / a.len() as f64;
+        let isi = a
+            .iter()
+            .map(|a| grake::isi_power(lags[0], &lags, a))
+            .sum::<f64>()
+            / a.len() as f64;
         let total = l as f64 * var_g0;
         let sigma2 = (total - isi).max(0.1 * total);
         // `collect` into Option<Vec<_>>: None as soon as one pilot's model is
@@ -1588,12 +2089,17 @@ mod tests {
     /// the middle of block 2, as a sound card that drops or repeats a buffer
     /// does; which blocks decode after it, on a clean channel and on moderate
     /// fading. `cargo test --release -p decdsss-phy sync_slip_curve -- --ignored
-    /// --nocapture`
+    /// --nocapture`; `SLIP_ONLY=ds4`, `SLIP_TRIAL=0` and `SLIP_MS=-50` narrow it
+    /// to one mode, trial and cut. A number in brackets is the slips followed.
     #[test]
     #[ignore]
     fn sync_slip_curve() {
         let profile = Profile::W2400;
+        let only = std::env::var("SLIP_ONLY").ok();
         for mode in ["ds4-2/3", "ds8-1/2", "csk64-1/2"] {
+            if only.as_ref().is_some_and(|o| !mode.starts_with(o.as_str())) {
+                continue;
+            }
             let m = decdsss_core::Mode::from_name(mode).unwrap();
             let layout = Layout::new(profile, m, 2);
             let nblocks = 6u16;
@@ -1602,6 +2108,12 @@ mod tests {
                     let mut row = String::new();
                     let mut ok_all = 0;
                     for trial in 0..4u64 {
+                        if std::env::var("SLIP_TRIAL").is_ok_and(|v| v != trial.to_string())
+                            || std::env::var("SLIP_MS")
+                                .is_ok_and(|v| v.parse::<f64>().ok() != Some(ms))
+                        {
+                            continue;
+                        }
                         let seg = segment(profile, mode, 2, nblocks);
                         let ebn0 = if fading.is_some() { 20.0 } else { 10.0 };
                         let mut ch = channel(profile, ebn0 + m.snr_offset_db(profile));
@@ -1644,6 +2156,9 @@ mod tests {
                                 g if g == r.frames.len() => 'o',
                                 _ => '/',
                             });
+                        }
+                        if rx.live().slips > 0 {
+                            row += &format!("({})", rx.live().slips);
                         }
                     }
                     println!(

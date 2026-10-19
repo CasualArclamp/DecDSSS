@@ -16,6 +16,7 @@ pub mod header;
 pub mod payload;
 pub mod preamble;
 pub mod refine;
+pub mod rewind;
 #[cfg(test)]
 pub mod testrig;
 
@@ -26,8 +27,8 @@ use decdsss_dsp::decimate::Decimator;
 use frontend::{Buf, Frontend, MAX_OFFSET_HZ, SPS};
 use header::{HeaderOutcome, HeaderResult, HeaderView, HeaderWatch, demod_header};
 use payload::{BlockResult, PayloadRx};
-use rayon::prelude::*;
 use preamble::{PreambleLock, PreambleTracker, State};
+use rayon::prelude::*;
 use std::collections::VecDeque;
 
 /// Largest carrier offset the receiver searches, Hz.

@@ -318,6 +318,26 @@ Verification: nothing measurable yet. A block whose codewords all decode is re-m
    the refinement above runs on it, so the clock and carrier are re-learned
    every block.
 
+**Slips** (`rx/rewind.rs`, after BinModem's rewind). A sound card or a
+network stream that drops or repeats a buffer moves the signal by that much: the
+track is then chips off, which the early/late loop cannot pull and the block
+pre-pass (−6 to +20 chips, on a few pilots) often cannot see. A watch on each
+channel judges, every quarter second (at least 12 symbols), the signal the
+fingers collect: the energy less the noise measured the same way where there is
+no path (DS: eight chips past the last finger; CSK: the other codes' mean power
+times H_L, the mean of the largest of L noise powers). A window 5 dB under the
+settled level is a loss. Then a search on the samples kept: over the symbols
+since the loss, the despread power at every lag within ±60 ms; a shift of the
+fingers' whole pattern that collects twice what it collects where it is, and at
+least 0.4 of the settled signal, is a slip if the energy moved in one clean step
+(the old lag empty after it and the new lag empty before it, noise taken off; a
+fade of one path onto another path fails this). The tracking state goes back
+to the snapshot (taken every window) from before the step, the symbols are
+despread again from there with the track moved from the step on, and the block's
+known-chip refinement starts at the step. A fade is left alone: holding the loops
+in it, as BinModem does, cost DS4 whole transmissions on moderate fading, because
+the loops were held at the start before they had settled.
+
 Why not one early/late loop on one finger: with two paths a chip or so apart the
 late arm picks up the next path's correlation tail, and the loop settles
 between the paths or walks off them. This was found, not guessed: a stretch of
@@ -875,6 +895,55 @@ and SSB filter make the band look 25 dB above a floor that is outside the
 filter. There a chip-level LMMSE gained 0.7 dB of chip SINR over a rake on
 average (0 to 1.2 dB a recording), and the receiver decoded the same frames with
 and without the G-RAKE.
+
+### Dropped and repeated audio (2026-10-19)
+
+`rx::payload::tests::sync_slip_curve` (ignored): six blocks of depth 2, a stretch
+of audio cut out (−) or silence put in (+) in the middle of block 2, four seeds,
+offset 3 Hz, 20 ppm; AWGN at Eb/N0 10 dB, moderate fading at 20 dB. Frames
+received of 48:
+
+| Mode, channel | before | with the rewind |
+|---|---|---|
+| DS4 2/3 AWGN, ±1 to ±50 ms | 16 (every block after the cut lost) | 48 at every size |
+| DS8 1/2 AWGN, ±1 to ±50 ms | 16 to 30 (16 from 5 ms) | 48 at every size |
+| CSK64 1/2 AWGN, ±1 to ±50 ms | 40 at ±1 and +5 ms, 16 at −5 ms and from ±20 ms | 48 at every size |
+| DS4 2/3 moderate, ±5 to ±50 ms | 14 | 32 to 40 |
+| DS8 1/2 moderate, ±5 to ±50 ms | 16 to 22 | 44 to 46 |
+| CSK64 1/2 moderate, ±5 to ±50 ms | 16 to 40 | 48 |
+| no cut (AWGN; moderate) | 48; DS4 46, DS8 42, CSK64 48 | 48; DS4 46, DS8 46, CSK64 48 |
+
+On moderate fading DS4 still often loses the block the slip is in (the search
+needs the signal back from a fade to see where it went) but no longer the blocks
+after. DS8 on moderate fading reports a few slips with no cut at all; they cost
+nothing there (46 against 42 frames without the rewind). The on-air recordings in
+`reference/` (27, from two WebSDRs and a KiwiSDR on 40 and 20 m) decode exactly
+the same frames with and without it.
+
+With no cut at all it is never worse and sometimes better: one build, the
+rewind switched off by `DECDSSS_NO_REWIND` for the comparison, `decdsss sweep
+--trials 128 --offset 5 --clock-ppm 10`, depth 4, Eb/N0 6 to 30 dB. Frame loss,
+off → on, where it moved:
+
+| Mode | Channel | Eb/N0 | off | on |
+|---|---|---|---|---|
+| CSK64 1/2 | good | 14 / 18 / 22 / 26 / 30 dB | 10.55 / 4.30 / 5.86 / 4.59 / 3.71 % | 4.79 / 0.78 / 1.56 / 0.78 / 0 % |
+| CSK64 1/2 | moderate | 10 / 14-22 dB | 5.27 / 0.39 % | 3.52 / 0 % |
+| DS4 3/4 | good | 14 to 30 dB | 14.06 to 5.18 % | 13.28 to 4.39 % (0.8 less at each) |
+| DS4 2/3 | good | 14 to 30 dB | 10.35 to 4.00 % | 9.57 to 3.22 % |
+| DS4 2/3 | moderate | 10 / 14 dB | 8.11 / 4.39 % | 7.52 / 3.22 % |
+| DS8 1/2 | moderate, good | 10 dB | 2.54, 5.37 % | 1.17, 4.59 % |
+
+Everything else (DS4 3/4 moderate, the rest of DS8, AWGN DS4 3/4 and CSK64 1/2
+at their thresholds) the same to the frame. So part of the floor at high SNR on
+fading was the track losing the signal for good after a deep fade, which the
+search now finds again. What is left of it (DS4 about 3 % on moderate fading at
+any SNR) is still to be found.
+
+Not covered: a slip in the preamble or the header (the header is one codeword;
+its CSK256 symbols are long), one larger than 60 ms, and one in the last
+quarter second or so of a block, which costs that block (a block cannot be
+rewound once decoded).
 
 ### Not yet measured
 

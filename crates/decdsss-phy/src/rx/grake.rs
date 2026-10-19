@@ -180,7 +180,12 @@ pub fn weights(
     }
     let (mut q, p0) = model(grid, lags, a, sigma2);
     let w = cholesky_solve(&mut q, grid.len(), &p0)?;
-    let gamma = p0.iter().zip(&w).map(|(p, w)| p.conj() * w).sum::<Complex64>().re;
+    let gamma = p0
+        .iter()
+        .zip(&w)
+        .map(|(p, w)| p.conj() * w)
+        .sum::<Complex64>()
+        .re;
     (gamma.is_finite() && gamma > 0.0).then_some((w, gamma))
 }
 
@@ -189,7 +194,12 @@ pub fn weights(
 pub fn sinr(grid: &[f64], lags: &[f64], a: &[Complex64], sigma2: f64, w: &[Complex64]) -> f64 {
     let n = grid.len();
     let (q, p0) = model(grid, lags, a, sigma2);
-    let num = w.iter().zip(&p0).map(|(w, p)| w.conj() * p).sum::<Complex64>().norm_sqr();
+    let num = w
+        .iter()
+        .zip(&p0)
+        .map(|(w, p)| w.conj() * p)
+        .sum::<Complex64>()
+        .norm_sqr();
     let mut den = Complex64::new(0.0, 0.0);
     for i in 0..n {
         for j in 0..n {
@@ -270,7 +280,13 @@ mod tests {
     #[test]
     #[ignore]
     fn reach_curve() {
-        for (lags, a1) in [([0.0, 1.0], 1.0), ([0.0, 1.0], 0.7), ([0.0, 1.0], 0.5), ([0.0, 2.0], 1.0), ([0.0, 0.5], 1.0)] {
+        for (lags, a1) in [
+            ([0.0, 1.0], 1.0),
+            ([0.0, 1.0], 0.7),
+            ([0.0, 1.0], 0.5),
+            ([0.0, 2.0], 1.0),
+            ([0.0, 0.5], 1.0),
+        ] {
             let a = [Complex64::new(1.0, 0.0), Complex64::new(0.0, a1)];
             for snr in [10.0, 20.0, 30.0] {
                 let s2 = 10f64.powf(-snr / 10.0);
@@ -292,7 +308,9 @@ mod tests {
         let c = |re, im| Complex64::new(re, im);
         let q0 = vec![c(4.0, 0.0), c(1.0, 1.0), c(1.0, -1.0), c(3.0, 0.0)];
         let x = vec![c(0.5, -1.0), c(2.0, 0.25)];
-        let b: Vec<Complex64> = (0..2).map(|i| q0[i * 2] * x[0] + q0[i * 2 + 1] * x[1]).collect();
+        let b: Vec<Complex64> = (0..2)
+            .map(|i| q0[i * 2] * x[0] + q0[i * 2 + 1] * x[1])
+            .collect();
         let mut q = q0.clone();
         let got = cholesky_solve(&mut q, 2, &b).unwrap();
         for (g, x) in got.iter().zip(&x) {
@@ -303,7 +321,11 @@ mod tests {
     #[test]
     fn paths_come_back_from_what_the_fingers_see() {
         let lags = [0.0, 0.75, 2.0];
-        let a = [Complex64::new(1.0, 0.0), Complex64::new(0.3, -0.6), Complex64::new(-0.2, 0.1)];
+        let a = [
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.3, -0.6),
+            Complex64::new(-0.2, 0.1),
+        ];
         let h = response(&lags, &lags, &a, 0.0);
         let back = paths(&lags, &h);
         for (b, a) in back.iter().zip(&a) {
@@ -352,7 +374,11 @@ mod tests {
         let sigma2 = 0.5;
         let g = grid(&lags);
         let (_, gamma) = weights(&g, &lags, &a, sigma2).unwrap();
-        assert!((db(gamma) - db(1.0 / sigma2)).abs() < 0.05, "{:.3} dB", db(gamma));
+        assert!(
+            (db(gamma) - db(1.0 / sigma2)).abs() < 0.05,
+            "{:.3} dB",
+            db(gamma)
+        );
     }
 
     #[test]
