@@ -138,6 +138,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "decdsss-fec"
+version = "0.0.1"
+dependencies = [
+ "decdsss-core",
+ "decdsss-dsp",
+]
+
+[[package]]
 name = "decdsss-phy"
 version = "0.0.1"
 dependencies = [

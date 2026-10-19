@@ -1,0 +1,13 @@
+# made by CasualArclamp
+[package]
+name = "decdsss-fec"
+description = "DecDSSS FEC: quasi-cyclic LDPC (seeded design, layered min-sum), interleaver, CRCs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdsss-core = { path = "../decdsss-core" }
+decdsss-dsp = { path = "../decdsss-dsp" }

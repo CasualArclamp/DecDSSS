@@ -156,12 +156,41 @@ samples/chip around the profile centre. Every profile is searched at once.
 
 ### FEC
 
-DecDSSS's own quasi-cyclic LDPC codes: IRA (dual-diagonal parity) so encoding is
-linear-time. Base matrices are built by a deterministic, seeded girth-
-conditioned search (offline, `decdsss ldpc-design`), frozen as tables in
-source, and verified by tests (girth, rank, simulated FER). Codeword lengths
-are chosen in M1 to fit voice latency (short) and file throughput (long). A
-convolutional block interleaver spans HF fades. Frame CRCs are CRC-16/32.
+DecDSSS's own quasi-cyclic LDPC codes: IRA (a block zig-zag accumulator as the
+parity part), so encoding is a running XOR. The payload codes are n = 1152
+(Z = 48, 24 block columns) at rates ½, ⅔ and ¾ (k = 576 / 768 / 864); the header
+code is n = 256, k = 128 (Z = 16). The info part is designed here: six columns
+of weight 5 and the rest weight 3 (the best of six weight patterns tried), rows
+filled evenly, and circulant shifts drawn from a seeded PCG32 so the lifted
+graph has no 4-cycle (tested by brute force). The design seed is the best of 40
+on simulated frame errors. The designs are regenerated from the seeds at start-
+up and pinned by a fingerprint test, so a change that would make old
+transmissions undecodable fails CI.
+
+The decoder is layered normalised min-sum (α = 0.8) on float LLRs, stopping as
+soon as the syndrome is zero.
+
+Measured on BPSK/AWGN, 400 frames a point, true-LLR input, noise the seed
+selection never saw (`cargo test -p decdsss-fec --release -- --ignored
+--nocapture sweep`):
+
+| Code | Eb/N0 for FER 10⁻² | Normal-approximation limit | Gap |
+|---|---|---|---|
+| payload ½ (n = 1152) | ≈ 2.4 dB | 0.85 dB | ≈ 1.5 dB |
+| payload ⅔ | ≈ 2.7 dB | 1.65 dB | ≈ 1.0 dB |
+| payload ¾ | ≈ 3.0 dB | 2.19 dB | ≈ 0.8 dB |
+| header ½ (n = 256) | ≈ 3.1 dB | 1.47 dB | ≈ 1.6 dB |
+
+The limit is the normal approximation to the finite-length capacity of the
+BI-AWGN channel (Polyanskiy–Poor–Verdú: R ≈ C − √(V/n)·Q⁻¹(ε) + log₂n / 2n),
+computed by numerical integration for this code size, rate and FER. It is an
+approximation, not a bound that a real code cannot beat. The ½-rate codes have
+the most room left.
+
+The time interleaver is a golden-ratio stride permutation over a block of
+codewords: a run of B consecutive faded bits comes from B coding positions about
+N/B apart and from every codeword in equal share (tested). Frame CRCs are
+CRC-16 (headers) and CRC-32 (payload frames).
 
 ## Payloads and link layer
 
