@@ -154,11 +154,19 @@ fn main() -> eframe::Result {
         auto.after = Some(20.0);
     }
     let autostart = matches!(source, SourceKind::Demo | SourceKind::Wav) || device.is_some();
+    // The window's own icon (title bar and taskbar while it runs). `include_bytes!`
+    // puts the PNG inside the executable at compile time, so nothing is read from
+    // disk; the exe's file icon comes from build.rs.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size([980.0, 600.0])
+        .with_title("DecDSSS");
+    match eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/decdsss-256.png")) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(e) => eprintln!("decdsss-gui: window icon: {e}"),
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(size)
-            .with_min_inner_size([980.0, 600.0])
-            .with_title("DecDSSS"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

@@ -22,3 +22,7 @@ decdsss-link = { path = "../../crates/decdsss-link" }
 decdsss-phy = { path = "../../crates/decdsss-phy" }
 anyhow.workspace = true
 clap = { version = "4.5", features = ["derive"] }
+
+[build-dependencies]
+# Puts assets/decdsss.ico into the Windows executable (see build.rs).
+winresource = "0.1.34"

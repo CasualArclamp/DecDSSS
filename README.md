@@ -1,4 +1,6 @@
 <!-- made by CasualArclamp -->
+<p align="center"><img src="assets/decdsss-256.png" width="128" alt="DecDSSS icon: a despread peak rising out of the noise floor above the wide spread signal, with a chip sequence below"></p>
+
 # DecDSSS
 
 A narrowband spread-spectrum modem for amateur radio. It uses direct-sequence

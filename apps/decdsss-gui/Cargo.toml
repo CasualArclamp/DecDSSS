@@ -35,3 +35,7 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 # re-enable them here (Linux only), so building needs no X11/Wayland dev packages.
 [target.'cfg(target_os = "linux")'.dependencies]
 winit = "0.30.13"
+
+[build-dependencies]
+# Puts assets/decdsss.ico into the Windows executable (see build.rs).
+winresource = "0.1.34"
