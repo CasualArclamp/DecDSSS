@@ -313,7 +313,7 @@ silent.
 | `decdsss-fec` | QC-LDPC (design, encoder, layered min-sum), the interleaver, CRCs. |
 | `decdsss-phy` | Codes, framing, the transmitter, the receiver (search, preamble, header, payload, refinement), the end-to-end simulator. |
 | `decdsss-chan` | Channel simulator: AWGN, carrier offset and drift, clock error, Watterson fading with the CCIR presets. |
-| `decdsss-link` | File container, sender planning (segments, repeat), receive-side assembly. |
+| `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes), receive-side assembly. |
 | `decdsss-audio` | Sound-card capture and playback (cpal) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
 | `decdsss-rig` | CAT keying (M4). |
 | `apps/decdsss-cli` | `decdsss`: modes, devices, tx, rx, channel, sweep. |
@@ -329,8 +329,8 @@ silent.
 - **M2** — GUI with every receiver panel, live sound card RX/TX, one-way files.
   Checked through VB-Audio cable A (a file sent by the CLI into CABLE-A Input
   and received in the GUI and the CLI from CABLE-A Output, byte-identical).
-  *Done.* Left for later: erasure-coded extra frames (the picture and file
-  modes will want them), a CI smoke test of the window.
+  Erasure-coded frames followed (any `K` distinct frames rebuild a file; see
+  Payloads). *Done.* Left for later: a CI smoke test of the window.
 - **M3** — pictures.
 - **M4** — voice, VOX/manual PTT, CAT keying.
 - **M5** — ARQ connected mode.
@@ -396,9 +396,11 @@ Doppler spectra: *good* 0.5 ms and 0.1 Hz spread, *moderate* 1 ms and 0.5 Hz,
 
 The slow *good* channel is the hard one: its fades last seconds, so a block (11 s
 for DS8, 25 s for CSK64 at depth 4) can lose a codeword to one. Deeper
-interleaving, repeating the transmission (`decdsss tx --repeat`) and, later,
-erasure-coded extra frames and ARQ are the remedies; a repeated pass fills a file's gaps
-(tested end to end).
+interleaving, coded frames (`decdsss tx --parity`), further passes
+(`--repeat`) and, later, ARQ are the remedies. With 10 coded frames on a
+38-frame file (depth 4, DS8 1/2, 8 dB, drift 0.05 Hz) four of five fading
+seeds delivered the file in one pass; the fifth lost 13 of 48 frames and was
+left 3 short.
 
 ### Not yet measured
 
