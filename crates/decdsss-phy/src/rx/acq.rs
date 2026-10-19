@@ -424,26 +424,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn debug_freq() {
-        for (snr, off) in [
-            (0.0, -1.0),
-            (0.0, 5.0),
-            (-10.0, -1.0),
-            (10.0, -1.0),
-            (-17.0, -1.0),
-        ] {
-            for seed in [507u64, 3] {
-                let (d, _) = acquire(Profile::W2400, snr, off, 5.0, seed).unwrap();
-                println!(
-                    "snr {snr} off {off} seed {seed}: freq {:.2} margin {:.1} dB (surface peak row {} of {})",
-                    d.freq_hz, d.margin_db, d.surface.peak_row, d.surface.rows
-                );
-            }
-        }
-    }
-
-    #[test]
     fn finds_it_at_the_weakest_mode_snr() {
         // −17 dB in the profile bandwidth, with a clock error.
         let (d, first) = acquire(Profile::W2400, -17.0, -55.0, 50.0, 8).expect("no detection");

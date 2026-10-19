@@ -41,27 +41,51 @@ impl DelayProfile {
         Self::LAG0 + i as f64 * Self::LAG_STEP
     }
 
-    /// Up to `max` fingers: local maxima within `within_db` of the peak and
-    /// above `floor` (power units of the profile), at least `sep` chips
-    /// apart, strongest first, as (lag in chips, power).
+    /// Up to `max` fingers by deconvolution (the CLEAN algorithm): take the
+    /// strongest peak, subtract the pulse's own response (the raised cosine of
+    /// the chip shaping, squared, since the profile is a power) at that lag,
+    /// and look again in what is left. Paths a chip apart overlap in a profile
+    /// sampled this coarsely and show as one hump; their templates do not
+    /// overlap once the first is taken off. A finger must stand `floor` (profile
+    /// power units) and within `within_db` of the strongest; fingers closer than
+    /// `sep` chips are not taken. Returns (lag in chips, power), strongest first.
     pub fn fingers(&self, max: usize, within_db: f64, floor: f32, sep: f64) -> Vec<(f64, f32)> {
         let n = self.power.len();
-        let peak = self.power.iter().copied().fold(0.0f32, f32::max);
-        let thr = (peak * 10f32.powf(-(within_db as f32) / 10.0)).max(floor);
-        let mut cand: Vec<(f64, f32)> = (0..n)
-            .filter(|&i| {
-                let p = self.power[i];
-                p >= thr
-                    && (i == 0 || p >= self.power[i - 1])
-                    && (i + 1 == n || p > self.power[i + 1])
-            })
-            .map(|i| (Self::lag(i), self.power[i]))
-            .collect();
-        cand.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut resid = self.power.clone();
         let mut out: Vec<(f64, f32)> = Vec::new();
-        for c in cand {
-            if out.len() < max && out.iter().all(|o| (o.0 - c.0).abs() >= sep) {
-                out.push(c);
+        let mut top = 0.0f32;
+        while out.len() < max {
+            // The largest residual not within `sep` of a finger already taken.
+            let Some((i, &v)) = resid
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| out.iter().all(|o| (Self::lag(*i) - o.0).abs() >= sep))
+                .max_by(|a, b| a.1.total_cmp(b.1))
+            else {
+                break;
+            };
+            if out.is_empty() {
+                top = v;
+            }
+            if v < floor || v < top * 10f32.powf(-(within_db as f32) / 10.0) {
+                break;
+            }
+            // Quadratic through the peak and its neighbours: better than a
+            // quarter chip.
+            let (a, c) = (
+                if i > 0 { resid[i - 1] } else { v },
+                if i + 1 < n { resid[i + 1] } else { v },
+            );
+            let d = a - 2.0 * v + c;
+            let frac = if d.abs() < 1e-12 {
+                0.0
+            } else {
+                f64::from(0.5 * (a - c) / d).clamp(-0.5, 0.5)
+            };
+            let lag = Self::lag(i) + frac * Self::LAG_STEP;
+            out.push((lag, v));
+            for (j, r) in resid.iter_mut().enumerate() {
+                *r -= v * pulse_power(Self::lag(j) - lag) as f32;
             }
         }
         out
@@ -284,33 +308,6 @@ impl PreambleTracker {
         }
         let tp = period / self.rate;
         let f_res = f64::from(s.arg()) / (std::f64::consts::TAU * tp);
-        if std::env::var("DSSS_DEBUG").is_ok() {
-            eprintln!(
-                "bounds diffs {:?}",
-                self.bounds
-                    .windows(2)
-                    .map(|w| ((w[1] - w[0]) * 100.0).round() / 100.0)
-                    .collect::<Vec<_>>()
-            );
-            eprintln!(
-                "errs {:?}",
-                self.errs
-                    .iter()
-                    .map(|e| (e * 100.0).round() / 100.0)
-                    .collect::<Vec<_>>()
-            );
-            eprintln!("fit period {period:.3} (nominal {}) k {k}", self.n);
-            eprintln!(
-                "preamble: f_ref {:.2} f_res {:.2} periods {} k {k} z {:?}",
-                self.f_ref,
-                f_res,
-                self.count,
-                self.z
-                    .iter()
-                    .map(|z| (z * 100.0).round() / 100.0)
-                    .collect::<Vec<_>>()
-            );
-        }
         // Delay profile: non-coherent sum over the A periods before the B pair.
         let a = preamble_a(self.profile);
         let mut power = vec![0.0f32; DelayProfile::LAGS];
@@ -330,6 +327,57 @@ impl PreambleTracker {
             profile: DelayProfile { power },
             periods: self.powers.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod pulse_tests {
+    use super::*;
+
+    fn profile_of(paths: &[(f64, f32)], noise: f32) -> DelayProfile {
+        DelayProfile {
+            power: (0..DelayProfile::LAGS)
+                .map(|i| {
+                    noise
+                        + paths
+                            .iter()
+                            .map(|&(lag, p)| p * pulse_power(DelayProfile::lag(i) - lag) as f32)
+                            .sum::<f32>()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_pulse_is_unity_at_zero_and_zero_a_chip_away() {
+        assert!((pulse_power(0.0) - 1.0).abs() < 1e-9);
+        assert!(pulse_power(1.0) < 1e-9);
+        assert!((pulse_power(0.5) - 0.39).abs() < 0.02);
+    }
+
+    #[test]
+    fn one_path_gives_one_finger_at_a_fractional_lag() {
+        let f = profile_of(&[(1.3, 100.0)], 1.0).fingers(3, 12.0, 4.0, 0.85);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!((f[0].0 - 1.3).abs() < 0.08, "{f:?}");
+    }
+
+    #[test]
+    fn two_paths_a_chip_apart_are_both_found() {
+        for (a, b) in [(0.0, 0.96), (0.25, 1.15), (-2.0, -1.1)] {
+            let f = profile_of(&[(a, 100.0), (b, 60.0)], 1.0).fingers(3, 12.0, 4.0, 0.85);
+            assert_eq!(f.len(), 2, "{a} {b}: {f:?}");
+            let mut lags: Vec<f64> = f.iter().map(|x| x.0).collect();
+            lags.sort_by(f64::total_cmp);
+            assert!((lags[0] - a.min(b)).abs() < 0.15, "{a} {b}: {f:?}");
+            assert!((lags[1] - a.max(b)).abs() < 0.15, "{a} {b}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn noise_alone_gives_no_finger_over_the_floor() {
+        let f = profile_of(&[], 1.0).fingers(3, 12.0, 4.0, 0.85);
+        assert!(f.is_empty());
     }
 }
 
@@ -449,4 +497,26 @@ mod tests {
         assert!(!f.is_empty());
         let _ = (PRE_A_PERIODS, PRE_B_PERIODS);
     }
+}
+
+/// Response of the correlator to one path, in power, at `t` chips from it: the
+/// raised-cosine pulse of the chip shaping (roll-off 0.25, the root-raised
+/// cosine at both ends), squared.
+pub fn pulse_power(t: f64) -> f64 {
+    use decdsss_core::profile::ROLLOFF;
+    let x = t.abs();
+    let sinc = if x < 1e-9 {
+        1.0
+    } else {
+        (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+    };
+    let den = 1.0 - (2.0 * ROLLOFF * x).powi(2);
+    let r = if den.abs() < 1e-6 {
+        // The removable singularity at 1/(2·roll-off).
+        let y = 1.0 / (2.0 * ROLLOFF);
+        std::f64::consts::FRAC_PI_4 * (std::f64::consts::PI * y).sin() / (std::f64::consts::PI * y)
+    } else {
+        sinc * (std::f64::consts::PI * ROLLOFF * x).cos() / den
+    };
+    r * r
 }

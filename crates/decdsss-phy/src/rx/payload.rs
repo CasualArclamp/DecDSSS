@@ -2,16 +2,24 @@
 //! The payload demodulator: one station's blocks, decoded in order.
 //!
 //! A block is processed in two passes. The first walks the symbols once,
-//! despreading each rake finger, running the delay-locked loop (early/late
-//! on the main finger) and the carrier loop, and keeping what the second
-//! pass needs: for CSK the Walsh correlations, for DS-PSK the despread
-//! symbols and the pilot gains. The second pass turns that into bit LLRs
-//! (a noncoherent Bessel metric for CSK, pilot-aided maximal-ratio combining
-//! for DS-PSK), de-interleaves, and LDPC-decodes each codeword.
+//! despreading each rake finger and keeping what the second needs: for CSK the
+//! Walsh correlations, for DS-PSK the despread symbols and the pilot gains.
+//! The second turns that into bit LLRs (a noncoherent Bessel metric for CSK,
+//! pilot-aided maximal-ratio combining for DS-PSK), de-interleaves, and
+//! LDPC-decodes each codeword.
+//!
+//! Timing is kept by a *searcher*, not an early/late loop. Every few seconds
+//! the delay profile is measured again from what is known (the pilots, or the
+//! symbols just decided), the reference is moved onto the strongest path and
+//! the fingers are placed on the peaks; the shifts also teach the clock error.
+//! An early/late loop on one finger cannot be trusted with several paths a chip
+//! or so apart: the late arm picks up the next path's correlation tail and the
+//! loop settles between the two.
 
 use super::despread::{Track, csk_bit_llrs, despread, ln_i0, sum, walsh_correlate, walsh_one};
 use super::frontend::Buf;
 use super::header::{Finger, HeaderResult};
+use super::preamble::DelayProfile;
 use crate::codes::{Scrambler, own_code};
 use crate::framing::{Header, Layout, check_frame};
 use crate::tx::{block_chips, pilot_symbol};
@@ -22,9 +30,11 @@ use decdsss_fec::interleave::Interleaver;
 use decdsss_fec::ldpc::Decoder;
 use std::f64::consts::TAU;
 
-/// Delay-locked loop noise bandwidth, Hz: wide for the first seconds of a
-/// segment, so a clock error left over from the start-up estimates is pulled in
-/// at once, then narrow.
+/// Rake fingers kept (the header's pick is limited the same way).
+const SLOTS: usize = 3;
+/// Timing loop noise bandwidth, Hz: wide for the first seconds of a segment, so
+/// a clock error left over from the start-up estimates is pulled in at once,
+/// then narrow.
 const DLL_BW_WIDE_HZ: f64 = 1.0;
 const DLL_BW_HZ: f64 = 0.25;
 /// Seconds of payload the wide bandwidth lasts.
@@ -35,6 +45,24 @@ const DLL_GROUP_S: f64 = 0.05;
 const FREQ_UPDATE_S: f64 = 1.5;
 /// LDPC iterations.
 const MAX_ITER: usize = 50;
+/// The block-start pre-pass looks at about this many seconds of the block's
+/// start, or at least this many pilots / symbols.
+const PREPASS_S: f64 = 3.0;
+const PREPASS_MIN: usize = 24;
+/// The searcher measures the profile again about this often (seconds), over at
+/// least this many pilots / symbols so the profile has something to stand on.
+const SEARCH_S: f64 = 6.0;
+const SEARCH_MIN_PILOTS: usize = 48;
+const SEARCH_MIN_SYMBOLS: usize = 24;
+/// Mid-block the reference moves only to a path at least this far (chips) from
+/// it and this many times stronger than what is at the reference now, so near
+/// equal paths cannot take turns pulling it about.
+const MOVE_MIN_CHIPS: f64 = 0.3;
+const MOVE_POWER_RATIO: f32 = 1.5;
+/// A profile is believed when its peak stands this far over its median.
+const PROFILE_PEAK_OVER_MEDIAN: f32 = 6.0;
+/// The clock error the searcher may learn, as a fraction.
+const MAX_CLOCK: f64 = 300e-6;
 /// A carrier update needs the phase steps it is built from to agree: the sum
 /// of products must be at least this fraction of the sum of their magnitudes.
 /// In a fade the steps are random and the ratio is small.
@@ -77,13 +105,15 @@ pub struct BlockResult {
 /// Loop gains of a second-order loop with ζ = 0.707.
 fn loop_gains(bn_hz: f64, update_s: f64) -> (f64, f64) {
     let zeta = 0.707;
-    let wn = 2.0 * bn_hz / (zeta + 1.0 / (4.0 * zeta)) * 1.0;
+    let wn = 2.0 * bn_hz / (zeta + 1.0 / (4.0 * zeta));
     let w = wn * update_s;
     (2.0 * zeta * w, w * w)
 }
 
-/// The timing loop: early and late powers averaged over a group of symbols,
-/// then one update.
+/// The timing loop. Early and late magnitudes, summed over every rake finger
+/// (each finger's own bias towards a neighbouring path points the other way
+/// for the neighbour, so the sum is far better behaved than one finger's),
+/// are averaged over a group of symbols, then one update.
 struct Dll {
     kp: f64,
     ki: f64,
@@ -203,7 +233,7 @@ impl PayloadRx {
     /// Earliest sample still needed (the earliest finger's lag, with margin).
     pub fn oldest_needed(&self) -> i64 {
         let min_lag = self.fingers.iter().map(|f| f.lag).fold(0.0f64, f64::min);
-        (self.track.pos + (min_lag - 3.0) * self.track.step) as i64
+        (self.track.pos + (min_lag - 8.0) * self.track.step) as i64
     }
 
     /// Decodes the next block if the buffer holds all of it.
@@ -211,9 +241,11 @@ impl PayloadRx {
         if self.done() {
             return None;
         }
-        let max_lag = self.fingers.iter().map(|f| f.lag).fold(0.0f64, f64::max);
-        let need =
-            self.track.pos + (self.layout.chips() as f64 + max_lag + 6.0) * self.track.step + 16.0;
+        // The searcher may reach 20 chips past the reference.
+        let need = self.track.pos
+            + (self.layout.chips() as f64 + DelayProfile::lag(DelayProfile::LAGS - 1) + 6.0)
+                * self.track.step
+            + 16.0;
         if need > buf.end() as f64 {
             return None;
         }
@@ -226,15 +258,6 @@ impl PayloadRx {
         self.chip0 += self.layout.chips();
         self.next_block += 1;
         Some(result)
-    }
-
-    fn main_finger(&self) -> usize {
-        self.fingers
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.power.total_cmp(&b.1.power))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
     }
 
     /// LDPC-decodes the interleaved block LLRs into frames.
@@ -285,11 +308,7 @@ impl PayloadRx {
     fn refresh_fingers(&mut self, buf: &Buf, frames: &[Option<Vec<u8>>], start: Track) {
         let data: Vec<Vec<u8>> = frames.iter().map(|f| f.clone().unwrap()).collect();
         let chips = block_chips(&self.layout, &data, &self.scr, self.chip0);
-        let main_lag = self
-            .fingers
-            .iter()
-            .max_by(|a, b| a.power.total_cmp(&b.power))
-            .map_or(0.0, |f| f.lag);
+        let main_lag = self.fingers.first().map_or(0.0, |f| f.lag);
         let cr = self.rate / super::frontend::SPS as f64;
         let seg = super::refine::segment_chips(cr);
         let refined = super::refine::refine(buf, &start, &chips, main_lag, seg, 60e-6);
@@ -313,32 +332,206 @@ impl PayloadRx {
         self.fingers = fingers;
     }
 
+    /// Re-places the reference and the fingers from a measured profile, if the
+    /// profile has a clear peak; returns the chips the reference moved.
+    fn adopt(&mut self, profile: &DelayProfile) -> Option<f64> {
+        let mut p = profile.power.clone();
+        p.sort_by(f32::total_cmp);
+        let median = p[p.len() / 2].max(1e-30);
+        let peak = p[p.len() - 1];
+        if peak < PROFILE_PEAK_OVER_MEDIAN * median {
+            return None;
+        }
+        let (fingers, shift) = super::refine::fingers_from_profile(profile);
+        self.fingers = fingers;
+        Some(shift)
+    }
+
+    /// Mid-block, a measured profile only moves the reference, and only to a
+    /// clearly better path; the fingers keep their places relative to it.
+    /// Returns the chips moved.
+    fn adopt_track(&mut self, profile: &DelayProfile) -> Option<f64> {
+        let mut sorted = profile.power.clone();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[sorted.len() / 2].max(1e-30);
+        let (lag, power) = profile.fingers(1, 99.0, 0.0, 0.85).first().copied()?;
+        if power < PROFILE_PEAK_OVER_MEDIAN * median || lag.abs() < MOVE_MIN_CHIPS {
+            return None;
+        }
+        // What is at the reference now.
+        let i0 = ((0.0 - DelayProfile::LAG0) / DelayProfile::LAG_STEP).round() as usize;
+        if power < MOVE_POWER_RATIO * profile.power[i0] {
+            return None;
+        }
+        for f in &mut self.fingers {
+            f.lag -= lag;
+        }
+        Some(lag)
+    }
+
+    /// The delay profile of the DS-PSK pilots in symbols `s_lo..s_hi`, where
+    /// `tc` is the track at symbol `s_lo` and `scr` the block's scrambler chips.
+    fn profile_ds(
+        &self,
+        buf: &Buf,
+        tc: &Track,
+        scr: &[Iq],
+        s_lo: usize,
+        s_hi: usize,
+    ) -> DelayProfile {
+        let l = usize::from(self.header.mode.spread);
+        let per = PILOT_INTERVAL as usize;
+        let dphi = tc.dphase();
+        let mut power = vec![0.0f32; DelayProfile::LAGS];
+        for (i, pw) in power.iter_mut().enumerate() {
+            let lag = DelayProfile::lag(i);
+            for n in (s_lo..s_hi).filter(|n| n % per == 0) {
+                let p = pilot_symbol(n / per).conj();
+                let mut acc = Iq::new(0.0, 0.0);
+                for k in 0..l {
+                    let rel = (n - s_lo) * l + k;
+                    let (s, c) = (tc.phase + rel as f64 * dphi).sin_cos();
+                    let x = buf.at(tc.pos + (rel as f64 + lag) * tc.step);
+                    acc += x * Iq::new(c as f32, -(s as f32)) * scr[n * l + k].conj() * p;
+                }
+                *pw += (acc / l as f32).norm_sqr();
+            }
+        }
+        DelayProfile { power }
+    }
+
+    /// The delay profile from CSK symbols `s_lo..s_lo + codes.len()` whose
+    /// Walsh codes are known or decided.
+    fn profile_csk(
+        &self,
+        buf: &Buf,
+        tc: &Track,
+        scr: &[Iq],
+        s_lo: usize,
+        codes: &[usize],
+    ) -> DelayProfile {
+        let l = usize::from(self.header.mode.spread);
+        let dphi = tc.dphase();
+        let mut u = vec![Iq::new(0.0, 0.0); l];
+        let mut power = vec![0.0f32; DelayProfile::LAGS];
+        for (i, pw) in power.iter_mut().enumerate() {
+            for (j, &m) in codes.iter().enumerate() {
+                let mut tt = *tc;
+                tt.pos = tc.pos + (j * l) as f64 * tc.step;
+                tt.phase = tc.phase + (j * l) as f64 * dphi;
+                let s = s_lo + j;
+                despread(
+                    buf,
+                    &tt,
+                    &scr[s * l..(s + 1) * l],
+                    DelayProfile::lag(i),
+                    &mut u,
+                );
+                *pw += walsh_one(&u, m).norm_sqr();
+            }
+        }
+        DelayProfile { power }
+    }
+
+    /// Applies a chunk's measured shift: the reference moves, and the clock
+    /// estimate learns from how far it had to.
+    fn apply_shift(&self, t: &mut Track, shift: f64, chunk_chips: f64, step0: f64) {
+        t.pos += shift * t.step;
+        let learn = 0.3 * shift / chunk_chips.max(1.0);
+        t.step =
+            (t.step * (1.0 + learn)).clamp(step0 * (1.0 - MAX_CLOCK), step0 * (1.0 + MAX_CLOCK));
+    }
+
+    /// The CSK block-start pre-pass: over the first symbols, find the lag at
+    /// which the Walsh peaks are strongest, then the profile from the codes
+    /// decided there, and set the fingers and the reference from it.
+    fn csk_prepass(&mut self, buf: &Buf, scr: &[Iq]) {
+        let l = usize::from(self.header.mode.spread);
+        let t = self.track;
+        let dphi = t.dphase();
+        let sym_s = l as f64 / f64::from(self.header.profile.chip_rate());
+        let n = self
+            .layout
+            .symbols()
+            .min(((PREPASS_S / sym_s).ceil() as usize).max(PREPASS_MIN));
+        let mut u = vec![Iq::new(0.0, 0.0); l];
+        // The Walsh peak of symbol s at a lag: its power and its code.
+        let at_lag = |s: usize, lag: f64, u: &mut [Iq]| -> (f32, usize) {
+            let mut tt = t;
+            tt.pos = t.pos + (s * l) as f64 * t.step;
+            tt.phase = t.phase + (s * l) as f64 * dphi;
+            despread(buf, &tt, &scr[s * l..(s + 1) * l], lag, u);
+            let w = walsh_correlate(u);
+            w.iter()
+                .enumerate()
+                .map(|(m, z)| (z.norm_sqr(), m))
+                .fold((0.0f32, 0usize), |a, b| if b.0 > a.0 { b } else { a })
+        };
+        let mut score = vec![0.0f32; DelayProfile::LAGS];
+        for (i, sc) in score.iter_mut().enumerate() {
+            for s in 0..n {
+                *sc += at_lag(s, DelayProfile::lag(i), &mut u).0;
+            }
+        }
+        let best = score
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(i, _)| i);
+        let codes: Vec<usize> = (0..n)
+            .map(|s| at_lag(s, DelayProfile::lag(best), &mut u).1)
+            .collect();
+        let profile = self.profile_csk(buf, &t, scr, 0, &codes);
+        if let Some(shift) = self.adopt(&profile) {
+            self.track.pos += shift * self.track.step;
+        }
+    }
+
+    /// The DS-PSK block-start pre-pass: the profile of the first pilots.
+    fn ds_prepass(&mut self, buf: &Buf, scr: &[Iq]) {
+        let l = usize::from(self.header.mode.spread);
+        let per = PILOT_INTERVAL as usize;
+        let all = self.layout.symbols() / per + 1;
+        // Only the start of the block: a clock error left over from the start-up
+        // estimates moves the later pilots by chips.
+        let pilot_s = per as f64 * l as f64 / f64::from(self.header.profile.chip_rate());
+        let pilots = all.min(((PREPASS_S / pilot_s).ceil() as usize).max(PREPASS_MIN));
+        let t = self.track;
+        let profile = self.profile_ds(buf, &t, scr, 0, pilots * per);
+        if let Some(shift) = self.adopt(&profile) {
+            self.track.pos += shift * self.track.step;
+        }
+    }
+
     fn block_csk(&mut self, buf: &Buf) -> BlockResult {
-        let start = self.track;
         let l = usize::from(self.header.mode.spread);
         let bits = l.trailing_zeros() as usize;
         let s_count = self.layout.symbols();
         let scr = self.scr.chips(self.chip0, s_count * l);
-        let nf = self.fingers.len();
-        let main = self.main_finger();
+        self.csk_prepass(buf, &scr);
+        let start = self.track;
+        let step0 = start.step;
         let mut t = self.track;
         let mut u = vec![Iq::new(0.0, 0.0); l];
         let mut ue = u.clone();
         let mut ul = u.clone();
-        let mut w: Vec<Iq> = Vec::with_capacity(s_count * nf * l);
+        // W rows for every symbol and finger, flat, with where each symbol's
+        // rows start and how many fingers it had.
+        let mut w: Vec<Iq> = Vec::with_capacity(s_count * SLOTS * l);
+        let mut index: Vec<(usize, usize)> = Vec::with_capacity(s_count);
         let mut decisions = Vec::with_capacity(s_count);
         let t_sym = l as f64 * t.step / t.rate;
         let freq_every = ((FREQ_UPDATE_S / t_sym).ceil() as usize).max(4);
+        let chunk = (((SEARCH_S / t_sym).ceil() as usize).max(SEARCH_MIN_SYMBOLS)).min(s_count);
         let mut peak_prev: Option<Iq> = None;
         let mut freq_acc = Iq::new(0.0, 0.0);
         let mut freq_norm = 0.0f32;
-        let mut weights = vec![0.0f32; nf];
-        for (wt, f) in weights.iter_mut().zip(&self.fingers) {
-            *wt = f.power;
-        }
+        let (mut tc, mut s_lo) = (t, 0usize);
         for s in 0..s_count {
             let sc = &scr[s * l..(s + 1) * l];
+            let nf = self.fingers.len();
             let at = w.len();
+            index.push((at, nf));
             for f in &self.fingers {
                 despread(buf, &t, sc, f.lag, &mut u);
                 w.extend(walsh_correlate(&u));
@@ -347,7 +540,7 @@ impl PayloadRx {
             let mut best = (0usize, -1.0f32);
             for m in 0..l {
                 let p: f32 = (0..nf)
-                    .map(|f| weights[f] * w[at + f * l + m].norm_sqr())
+                    .map(|f| self.fingers[f].power * w[at + f * l + m].norm_sqr())
                     .sum();
                 if p > best.1 {
                     best = (m, p);
@@ -355,16 +548,19 @@ impl PayloadRx {
             }
             let m = best.0;
             decisions.push(m);
-            let lag = self.fingers[main].lag;
-            despread(buf, &t, sc, lag - 0.25, &mut ue);
-            despread(buf, &t, sc, lag + 0.25, &mut ul);
-            if let Some(c) = self.dll.push(
-                f64::from(walsh_one(&ue, m).norm()),
-                f64::from(walsh_one(&ul, m).norm()),
-            ) {
+            // Early and late arms of every finger, at the decided code.
+            let (mut e_sum, mut l_sum) = (0.0f64, 0.0f64);
+            for f in &self.fingers {
+                despread(buf, &t, sc, f.lag - 0.25, &mut ue);
+                despread(buf, &t, sc, f.lag + 0.25, &mut ul);
+                e_sum += f64::from(walsh_one(&ue, m).norm());
+                l_sum += f64::from(walsh_one(&ul, m).norm());
+            }
+            if let Some(c) = self.dll.push(e_sum, l_sum) {
                 t.pos += c * t.step;
             }
-            let peak = w[at + main * l + m];
+            // The strongest finger carries the carrier measurement.
+            let peak = w[at + m];
             if let Some(p) = peak_prev {
                 freq_acc += peak * p.conj();
                 freq_norm += peak.norm() * p.norm();
@@ -379,121 +575,102 @@ impl PayloadRx {
                 freq_acc = Iq::new(0.0, 0.0);
                 freq_norm = 0.0;
             }
+            // The searcher: at the end of each chunk (not the last: the
+            // known-chip refinement after the block does that better).
+            if (s + 1 - s_lo) >= chunk && s + 1 < s_count {
+                let profile = self.profile_csk(buf, &tc, &scr, s_lo, &decisions[s_lo..=s]);
+                if let Some(shift) = self.adopt_track(&profile) {
+                    self.apply_shift(&mut t, shift, ((s + 1 - s_lo) * l) as f64, step0);
+                }
+                tc = t;
+                s_lo = s + 1;
+            }
         }
         self.track = t;
 
         // Pass two: per-finger noise and amplitude, then the metric.
-        let mut sigma2 = vec![0.0f64; nf];
-        let mut amp2 = vec![0.0f64; nf];
+        let (mut sigma2, mut amp2, mut cnt) = ([0.0f64; SLOTS], [0.0f64; SLOTS], [0usize; SLOTS]);
         for (s, &m) in decisions.iter().enumerate() {
+            let (off, nf) = index[s];
             for f in 0..nf {
-                let row = &w[(s * nf + f) * l..(s * nf + f + 1) * l];
+                let row = &w[off + f * l..off + (f + 1) * l];
                 let total: f64 = row.iter().map(|z| f64::from(z.norm_sqr())).sum();
                 let pk = f64::from(row[m].norm_sqr());
                 sigma2[f] += (total - pk) / (l as f64 - 1.0);
                 amp2[f] += pk;
+                cnt[f] += 1;
             }
         }
-        for f in 0..nf {
-            sigma2[f] /= s_count as f64;
-            amp2[f] = (amp2[f] / s_count as f64 - sigma2[f]).max(0.01 * sigma2[f]);
+        let mut kappa = [0.0f64; SLOTS];
+        for f in 0..SLOTS {
+            if cnt[f] > 0 {
+                sigma2[f] /= cnt[f] as f64;
+                amp2[f] = (amp2[f] / cnt[f] as f64 - sigma2[f]).max(0.01 * sigma2[f]);
+                kappa[f] = 2.0 * amp2[f].sqrt() / sigma2[f].max(1e-30);
+            }
         }
-        let kappa: Vec<f64> = (0..nf)
-            .map(|f| 2.0 * amp2[f].sqrt() / sigma2[f].max(1e-30))
-            .collect();
         let mut llrs = Vec::with_capacity(s_count * bits);
         let mut metric = vec![0.0f64; l];
-        for s in 0..s_count {
+        for &(off, nf) in &index {
             for (m, v) in metric.iter_mut().enumerate() {
                 *v = (0..nf)
-                    .map(|f| ln_i0(kappa[f] * f64::from(w[(s * nf + f) * l + m].norm())))
+                    .map(|f| ln_i0(kappa[f] * f64::from(w[off + f * l + m].norm())))
                     .sum();
             }
             csk_bit_llrs(&metric, bits, &mut llrs);
         }
-        let snr = 10.0 * (amp2[main] / sigma2[main]).log10();
+        let snr = 10.0 * (amp2[0] / sigma2[0].max(1e-30)).log10();
         self.finish(buf, &llrs, snr, start)
-    }
-
-    /// Measures the block's delay profile from its pilots (known symbols, so
-    /// available whether or not the last block decoded) and sets the fingers
-    /// and the reference from it. A start that is a few chips off, because the
-    /// previous stage's estimate was wrong or a fade moved the strongest path,
-    /// is found here instead of costing the block.
-    fn ds_prepass(&mut self, buf: &Buf, scr: &[Iq]) {
-        use super::preamble::DelayProfile;
-        let l = usize::from(self.header.mode.spread);
-        let t = self.track;
-        let dphi = t.dphase();
-        let per = PILOT_INTERVAL as usize;
-        let pilots = self.layout.symbols() / per + 1;
-        let mut power = vec![0.0f32; DelayProfile::LAGS];
-        for (i, pw) in power.iter_mut().enumerate() {
-            let lag = DelayProfile::lag(i);
-            for g in 0..pilots {
-                let n = g * per;
-                let p = pilot_symbol(g).conj();
-                let mut acc = Iq::new(0.0, 0.0);
-                for k in 0..l {
-                    let kk = n * l + k;
-                    let (s, c) = (t.phase + kk as f64 * dphi).sin_cos();
-                    let x = buf.at(t.pos + (kk as f64 + lag) * t.step);
-                    acc += x * Iq::new(c as f32, -(s as f32)) * scr[kk].conj() * p;
-                }
-                *pw += (acc / l as f32).norm_sqr();
-            }
-        }
-        let (fingers, shift) = super::refine::fingers_from_profile(&DelayProfile { power });
-        self.fingers = fingers;
-        self.track.pos += shift * self.track.step;
     }
 
     fn block_ds(&mut self, buf: &Buf) -> BlockResult {
         let l = usize::from(self.header.mode.spread);
         let s_count = self.layout.symbols();
+        let per = PILOT_INTERVAL as usize;
         let scr = self.scr.chips(self.chip0, s_count * l);
         self.ds_prepass(buf, &scr);
         let start = self.track;
-        let nf = self.fingers.len();
-        let main = self.main_finger();
+        let step0 = start.step;
         let mut t = self.track;
         let mut u = vec![Iq::new(0.0, 0.0); l];
         let mut ue = u.clone();
         let mut ul = u.clone();
-        // y[f][s]
-        let mut y = vec![vec![Iq::new(0.0, 0.0); s_count]; nf];
-        let pilots = s_count / PILOT_INTERVAL as usize + 1;
-        // g[f][k]: pilot gain estimates.
-        let mut g = vec![vec![Iq::new(0.0, 0.0); pilots]; nf];
+        // y[s][f]: the despread symbol per finger slot; zero for unused slots.
+        let mut y = vec![[Iq::new(0.0, 0.0); SLOTS]; s_count];
+        let pilots = s_count / per + 1;
+        // g[k][f]: pilot gain estimates.
+        let mut g = vec![[Iq::new(0.0, 0.0); SLOTS]; pilots];
         let t_sym = l as f64 * t.step / t.rate;
-        let t_pilot = PILOT_INTERVAL as f64 * t_sym;
+        let t_pilot = per as f64 * t_sym;
         let freq_every = ((FREQ_UPDATE_S / t_pilot).ceil() as usize).max(3);
+        let chunk_pilots = ((SEARCH_S / t_pilot).ceil() as usize).max(SEARCH_MIN_PILOTS);
+        let chunk = chunk_pilots * per;
         let mut freq_acc = Iq::new(0.0, 0.0);
         let mut freq_norm = 0.0f32;
         let mut pilot_no = 0;
+        let (mut tc, mut s_lo) = (t, 0usize);
         for s in 0..s_count {
             let sc = &scr[s * l..(s + 1) * l];
-            for (fi, f) in self.fingers.iter().enumerate() {
+            let (mut e_sum, mut l_sum) = (0.0f64, 0.0f64);
+            for (fi, f) in self.fingers.iter().enumerate().take(SLOTS) {
                 despread(buf, &t, sc, f.lag, &mut u);
-                y[fi][s] = sum(&u);
+                y[s][fi] = sum(&u);
+                despread(buf, &t, sc, f.lag - 0.25, &mut ue);
+                despread(buf, &t, sc, f.lag + 0.25, &mut ul);
+                e_sum += f64::from(sum(&ue).norm());
+                l_sum += f64::from(sum(&ul).norm());
             }
-            let lag = self.fingers[main].lag;
-            despread(buf, &t, sc, lag - 0.25, &mut ue);
-            despread(buf, &t, sc, lag + 0.25, &mut ul);
-            if let Some(c) = self
-                .dll
-                .push(f64::from(sum(&ue).norm()), f64::from(sum(&ul).norm()))
-            {
+            if let Some(c) = self.dll.push(e_sum, l_sum) {
                 t.pos += c * t.step;
             }
             if self.layout.is_pilot(s) {
                 let p = pilot_symbol(pilot_no).conj();
-                for fi in 0..nf {
-                    g[fi][pilot_no] = y[fi][s] * p;
+                for fi in 0..SLOTS {
+                    g[pilot_no][fi] = y[s][fi] * p;
                 }
                 if pilot_no > 0 {
-                    freq_acc += g[main][pilot_no] * g[main][pilot_no - 1].conj();
-                    freq_norm += g[main][pilot_no].norm() * g[main][pilot_no - 1].norm();
+                    freq_acc += g[pilot_no][0] * g[pilot_no - 1][0].conj();
+                    freq_norm += g[pilot_no][0].norm() * g[pilot_no - 1][0].norm();
                 }
                 pilot_no += 1;
                 if pilot_no % freq_every == 0 {
@@ -506,30 +683,59 @@ impl PayloadRx {
                 }
             }
             t.advance(l);
+            if (s + 1 - s_lo) >= chunk && s + 1 < s_count {
+                let profile = self.profile_ds(buf, &tc, &scr, s_lo, s + 1);
+                if let Some(shift) = self.adopt_track(&profile) {
+                    self.apply_shift(&mut t, shift, ((s + 1 - s_lo) * l) as f64, step0);
+                }
+                tc = t;
+                s_lo = s + 1;
+            }
         }
         self.track = t;
         debug_assert_eq!(pilot_no, pilots);
 
         // Smooth the pilot gains ([1 2 1]/4, shorter at the ends) and
         // interpolate linearly to the data symbols.
-        let mut hs = vec![vec![Iq::new(0.0, 0.0); pilots]; nf];
-        for fi in 0..nf {
-            for k in 0..pilots {
-                hs[fi][k] = match (k.checked_sub(1), (k + 1 < pilots).then_some(k + 1)) {
-                    (Some(a), Some(b)) => (g[fi][a] + g[fi][k] * 2.0 + g[fi][b]) / 4.0,
-                    (None, Some(b)) => (g[fi][k] * 2.0 + g[fi][b]) / 3.0,
-                    (Some(a), None) => (g[fi][a] + g[fi][k] * 2.0) / 3.0,
-                    (None, None) => g[fi][k],
+        let mut hs = vec![[Iq::new(0.0, 0.0); SLOTS]; pilots];
+        for k in 0..pilots {
+            for fi in 0..SLOTS {
+                hs[k][fi] = match (k.checked_sub(1), (k + 1 < pilots).then_some(k + 1)) {
+                    (Some(a), Some(b)) => (g[a][fi] + g[k][fi] * 2.0 + g[b][fi]) / 4.0,
+                    (None, Some(b)) => (g[k][fi] * 2.0 + g[b][fi]) / 3.0,
+                    (Some(a), None) => (g[a][fi] + g[k][fi] * 2.0) / 3.0,
+                    (None, None) => g[k][fi],
                 };
             }
         }
-        // Noise per pilot from the second difference (the smooth channel
-        // cancels): var(g_k − (g_{k−1}+g_{k+1})/2) = 1.5 σ².
+        // Per finger, the noise in a pilot gain from the second difference (the
+        // smooth channel cancels): var(g_k − (g_{k−1}+g_{k+1})/2) = 1.5 σ². A
+        // smoothed estimate carries 0.375 σ² of it. Where a finger's estimate
+        // is not clearly above that (a noise peak taken for a path, a path in a
+        // fade) its weight is cut by power subtraction, so it stops adding noise.
+        for fi in 0..SLOTS {
+            let (mut acc, mut cnt) = (0.0f64, 0usize);
+            for k in 1..pilots.saturating_sub(1) {
+                let d = g[k][fi] - (g[k - 1][fi] + g[k + 1][fi]) * 0.5;
+                acc += f64::from(d.norm_sqr()) / 1.5;
+                cnt += 1;
+            }
+            if cnt == 0 {
+                continue;
+            }
+            let var = (0.375 * acc / cnt as f64) as f32;
+            for h in hs.iter_mut() {
+                let p = h[fi].norm_sqr();
+                if p > 0.0 {
+                    h[fi] *= ((p - var).max(0.0) / p).sqrt();
+                }
+            }
+        }
         let (mut n_acc, mut n_cnt, mut p_acc) = (0.0f64, 0usize, 0.0f64);
         for k in 1..pilots.saturating_sub(1) {
-            let d = g[main][k] - (g[main][k - 1] + g[main][k + 1]) * 0.5;
+            let d = g[k][0] - (g[k - 1][0] + g[k + 1][0]) * 0.5;
             n_acc += f64::from(d.norm_sqr()) / 1.5;
-            p_acc += f64::from(hs[main][k].norm_sqr());
+            p_acc += f64::from(hs[k][0].norm_sqr());
             n_cnt += 1;
         }
         let snr = if n_cnt > 0 && n_acc > 0.0 {
@@ -539,13 +745,12 @@ impl PayloadRx {
         };
 
         let mut llrs = Vec::with_capacity(self.layout.data_symbols() * 2);
-        let per = PILOT_INTERVAL as usize;
         for s in (0..s_count).filter(|&s| !self.layout.is_pilot(s)) {
             let (k, a) = (s / per, (s % per) as f32 / per as f32);
             let mut z = Iq::new(0.0, 0.0);
-            for fi in 0..nf {
-                let h = hs[fi][k] * (1.0 - a) + hs[fi][k + 1] * a;
-                z += h.conj() * y[fi][s];
+            for fi in 0..SLOTS {
+                let h = hs[k][fi] * (1.0 - a) + hs[k + 1][fi] * a;
+                z += h.conj() * y[s][fi];
             }
             // z = Σ conj(ĥ)·y: the strong paths weigh most, which is the
             // reliability the decoder needs. The factor is arbitrary (the
@@ -680,189 +885,6 @@ mod tests {
                 line += &format!("  {ebn0:.0}dB:{:.2}", bad as f64 / total as f64);
             }
             println!("{line}");
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_500_vs_truth() {
-        for profile in [Profile::N500] {
-            for (off, ppm, seed) in [(0.0, 0.0, 1u64)] {
-                let seg = segment(profile, "ds4-1/2", 2, 2);
-                let mut ch = channel(profile, 5.0);
-                ch.offset_hz = off;
-                ch.clock_ppm = ppm;
-                ch.seed = seed;
-                let audio = through(&seg, &ch);
-                let Ok(run) = to_header(&audio, profile) else {
-                    println!("{profile} off {off} ppm {ppm} seed {seed}: no header");
-                    continue;
-                };
-                let (g, _) = genie(&seg, &ch, &audio);
-                println!(
-                    "{profile} off {off} ppm {ppm} seed {seed}: lock step {:.5} (truth {:.5}) freq {:.2} | decoded pos err {:+.2} step {:.5} freq {:.3}",
-                    run.lock.step,
-                    g.track.step,
-                    run.lock.freq_hz,
-                    run.header.track.pos - g.track.pos,
-                    run.header.track.step,
-                    run.header.track.freq,
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_good_fading() {
-        let profile = Profile::W2400;
-        for seed in 0..10u64 {
-            let mut ch = channel(profile, 8.0);
-            ch.fading = Some(Watterson::GOOD);
-            ch.seed = 700 + seed;
-            ch.offset_hz = 5.0;
-            let (ok, total, note) = recover(profile, "ds8-1/2", 4, 2, &ch);
-            println!("seed {seed}: {ok}/{total} {note:?}");
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_good_seeds() {
-        let profile = Profile::W2400;
-        for seed in [0u64, 1, 7, 2] {
-            let seg = segment(profile, "ds8-1/2", 4, 2);
-            let mut ch = channel(profile, 8.0);
-            ch.fading = Some(Watterson::GOOD);
-            ch.seed = 700 + seed;
-            ch.offset_hz = 5.0;
-            let audio = through(&seg, &ch);
-            let Ok(run) = to_header(&audio, profile) else {
-                println!("seed {seed}: no header");
-                continue;
-            };
-            let (g, _) = genie(&seg, &ch, &audio);
-            let chip = run.header.track.step;
-            println!(
-                "seed {seed}: decoded pos - true path0 = {:+.2} chips (true path1 at +0.96), step err {:+.1} ppm, freq err {:+.3} Hz, fingers {:?}",
-                (run.header.track.pos - g.track.pos) / chip,
-                (run.header.track.step / g.track.step - 1.0) * 1e6,
-                run.header.track.freq - g.track.freq,
-                run.header.fingers
-            );
-            println!(
-                "   preamble profile fingers {:?}",
-                crate::rx::header::pick_fingers(&run.lock.profile, 3)
-            );
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_floor() {
-        let profile = Profile::W2400;
-        let mode = "ds16-1/2";
-        let m = decdsss_core::Mode::from_name(mode).unwrap();
-        for trial in 0..20usize {
-            let seg = segment(profile, mode, 4, 1);
-            let mut ch = channel(profile, 6.0 + m.snr_offset_db(profile));
-            ch.seed = 9000 + trial as u64;
-            ch.offset_hz = -10.0 + (trial % 7) as f64 * 3.0;
-            ch.clock_ppm = -30.0 + (trial % 5) as f64 * 15.0;
-            let audio = through(&seg, &ch);
-            let (mut rx, buf) = genie(&seg, &ch, &audio);
-            while let Some(r) = rx.step(&buf) {
-                if trial == 7 {
-                    // Truth coded bits of the block, in transmit order.
-                    let layout = *rx.layout();
-                    let truth = crate::tx::block_bits(
-                        &layout,
-                        &seg.frames[r.first_frame..r.first_frame + 4],
-                    );
-                    let wrong: Vec<usize> = (0..truth.len())
-                        .filter(|&i| (rx.last_llrs[i] < 0.0) != (truth[i] == 1))
-                        .collect();
-                    println!("hard-decision errors in the block: {}", wrong.len());
-                    let il = decdsss_fec::interleave::Interleaver::new(truth.len());
-                    let idx: Vec<usize> = (0..truth.len()).collect();
-                    let coding = il.invert(&idx);
-                    let _ = coding;
-                    let mut per_cw = [0usize; 4];
-                    let sent = il.apply(&(0..truth.len()).collect::<Vec<_>>());
-                    for &w in &wrong {
-                        per_cw[sent[w] / 1152] += 1;
-                    }
-                    println!(
-                        "per codeword: {per_cw:?}; first wrong transmit positions {:?}",
-                        &wrong[..wrong.len().min(20)]
-                    );
-                    {
-                        let il2 = decdsss_fec::interleave::Interleaver::new(truth.len());
-                        let coded = il2.invert(&rx.last_llrs[..truth.len()]);
-                        let code = layout.code();
-                        let cw = &coded[1152..2304];
-                        for alpha in [0.6f32, 0.7, 0.8, 0.9, 1.0] {
-                            for iters in [50usize, 200] {
-                                let mut d = decdsss_fec::ldpc::Decoder::new(code);
-                                d.alpha = alpha;
-                                let o = d.decode(cw, iters);
-                                println!("cw1 alpha {alpha} iters {iters}: {o:?}");
-                            }
-                        }
-                        // Scaled LLRs (min-sum should not care).
-                        let big: Vec<f32> = cw.iter().map(|x| x * 40.0).collect();
-                        let mut d = decdsss_fec::ldpc::Decoder::new(code);
-                        println!("cw1 scaled x40: {:?}", d.decode(&big, 50));
-                    }
-                    println!("LLR magnitude median {:.1}", {
-                        let mut m: Vec<f32> = rx.last_llrs.iter().map(|x| x.abs()).collect();
-                        m.sort_by(f32::total_cmp);
-                        m[m.len() / 2]
-                    });
-                }
-                let bad: Vec<usize> = r
-                    .frames
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, f)| f.as_ref() != Some(&seg.frames[r.first_frame + i]))
-                    .map(|(i, _)| i)
-                    .collect();
-                if !bad.is_empty() {
-                    println!(
-                        "trial {trial} (offset {:.0}, clock {:.0}): bad frames {bad:?}, iters {:?}, snr {:.1}, freq {:.2}",
-                        ch.offset_hz, ch.clock_ppm, r.iterations, r.snr_db, r.freq_hz
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_blocks() {
-        let profile = Profile::W2400;
-        let seg = segment(profile, "csk256-3/4", 1, 2);
-        let audio = through(&seg, &channel(profile, 0.0));
-        let run = to_header(&audio, profile).unwrap();
-        let mut rx = PayloadRx::new(&run.header, run.fe.out_rate()).unwrap();
-        let mut fe = crate::rx::frontend::Frontend::new(profile, FS);
-        let mut rest = Vec::new();
-        fe.push(&audio, &mut rest);
-        let mut buf = crate::rx::frontend::Buf::default();
-        buf.push(&rest);
-        println!("start track {:?} fingers {:?}", rx.track, rx.fingers);
-        while let Some(r) = rx.step(&buf) {
-            println!(
-                "block {} ok {:?} iters {:?} snr {:.1} fingers {:?} pos {:.2} freq {:.3} step {:.5}",
-                r.index,
-                r.frames.iter().map(|f| f.is_some()).collect::<Vec<_>>(),
-                r.iterations,
-                r.snr_db,
-                r.fingers,
-                rx.track.pos,
-                rx.track.freq,
-                rx.track.step
-            );
         }
     }
 

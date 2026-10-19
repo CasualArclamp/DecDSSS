@@ -155,15 +155,6 @@ pub fn refine(
     if df.abs() > 2.0 {
         return None;
     }
-    if std::env::var("DSSS_DEBUG").is_ok() {
-        eprintln!(
-            "refine: {} segments, clock {:+.1} ppm, rms {:.3} chip, carrier {:+.3} Hz",
-            pts.len(),
-            b * 1e6,
-            rms,
-            df
-        );
-    }
     let step = t.step * (1.0 + b);
     let pos0 = t.pos + (a - b * kbar) * t.step;
     // Timing at the end, from the last quarter of the segments, each carried

@@ -353,58 +353,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn debug_500() {
-        let profile = Profile::N500;
-        for (mode, snr) in [
-            ("ds4-1/2", 0.0),
-            ("ds4-1/2", 10.0),
-            ("csk64-1/2", 0.0),
-            ("ds16-1/2", 0.0),
-        ] {
-            let seg = segment(profile, mode, 2, 3);
-            let audio = through(&seg, &channel(profile, snr));
-            let mut rx = Receiver::new(profile, FS);
-            let events = run(&mut rx, &audio);
-            let got = frames_of(&events);
-            let status: Vec<bool> = got
-                .iter()
-                .map(|(i, f)| f.as_ref() == Some(&seg.frames[*i]))
-                .collect();
-            println!("{mode} {snr} dB: {status:?}");
-            for e in &events {
-                match e {
-                    Event::Acquired(d) => {
-                        println!("  acquired at {:.0} freq {:.2}", d.boundary, d.freq_hz)
-                    }
-                    Event::PreambleLocked(l) => println!(
-                        "  locked header_start {:.1} step {:.5} freq {:.2}",
-                        l.header_start, l.step, l.freq_hz
-                    ),
-                    Event::Lost(w) => println!("  lost: {w}"),
-                    Event::Header {
-                        channel, header, ..
-                    } => println!("  header ch {channel}: {} {}", header.call, header.mode),
-                    Event::SegmentEnd { channel } => println!("  end ch {channel}"),
-                    Event::Block { .. } => {}
-                }
-            }
-            for e in &events {
-                if let Event::Block { result, .. } = e {
-                    println!(
-                        "  block {} iters {:?} snr {:.1} freq {:.2} fingers {:?}",
-                        result.index,
-                        result.iterations,
-                        result.snr_db,
-                        result.freq_hz,
-                        result.fingers
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn receives_back_to_back_segments_and_joins_late() {
         // Two segments in one stream; a receiver that starts listening after
         // the first has begun still gets the second.

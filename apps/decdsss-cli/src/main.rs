@@ -87,6 +87,34 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Measure a mode: frame loss against Eb/N0 through the whole receiver.
+    Sweep {
+        #[arg(long, default_value = "2k4")]
+        profile: String,
+        #[arg(long)]
+        mode: String,
+        /// Codewords per block.
+        #[arg(long, default_value_t = 4)]
+        depth: usize,
+        /// Blocks per transmission.
+        #[arg(long, default_value_t = 2)]
+        blocks: u16,
+        /// Eb/N0 range start, end and step, dB.
+        #[arg(long, num_args = 3, value_names = ["FROM", "TO", "STEP"], allow_negative_numbers = true)]
+        ebn0: Vec<f64>,
+        /// Transmissions per point.
+        #[arg(long, default_value_t = 12)]
+        trials: usize,
+        /// Watterson fading: good, moderate, poor or flutter (default none).
+        #[arg(long)]
+        fading: Option<String>,
+        /// Carrier offset around which the trials are spread, Hz.
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        offset: f64,
+        /// Clock error around which the trials are spread, ppm.
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        clock_ppm: f64,
+    },
     /// Run a WAV through the HF channel simulator.
     Channel {
         input: PathBuf,
@@ -141,6 +169,27 @@ fn main() -> Result<()> {
             out_dir,
             verbose,
         } => rx(&input, &profile, &out_dir, verbose),
+        Command::Sweep {
+            profile,
+            mode,
+            depth,
+            blocks,
+            ebn0,
+            trials,
+            fading,
+            offset,
+            clock_ppm,
+        } => sweep(
+            &profile,
+            &mode,
+            depth,
+            blocks,
+            &ebn0,
+            trials,
+            fading.as_deref(),
+            offset,
+            clock_ppm,
+        ),
         Command::Channel {
             input,
             output,
@@ -503,5 +552,75 @@ fn channel(
         snr.map_or("none".into(), |s| format!("{s:.1} dB")),
         profile.bandwidth_hz()
     );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sweep(
+    profile: &str,
+    mode: &str,
+    depth: usize,
+    blocks: u16,
+    ebn0: &[f64],
+    trials: usize,
+    fading: Option<&str>,
+    offset: f64,
+    clock_ppm: f64,
+) -> Result<()> {
+    use decdsss_phy::sim::{Scenario, run_many, snr_for_ebn0};
+    let profile = parse_profile(profile)?;
+    let mode = Mode::from_name(mode).with_context(|| format!("unknown mode {mode:?}"))?;
+    if !decdsss_phy::framing::DEPTHS.contains(&depth) {
+        bail!("depth must be 1, 2, 4 or 8");
+    }
+    let fading = match fading {
+        Some(n) => Some(Watterson::from_name(n).with_context(|| format!("unknown fading {n:?}"))?),
+        None => None,
+    };
+    let [from, to, step] = match ebn0 {
+        [a, b, c] => [*a, *b, *c],
+        _ => bail!("--ebn0 FROM TO STEP is required, for example --ebn0 2 6 0.5"),
+    };
+    if step <= 0.0 || to < from {
+        bail!("--ebn0 needs FROM <= TO and a positive STEP");
+    }
+    let layout = Layout::new(profile, mode, depth);
+    println!(
+        "{} {} depth {depth}: {} frame(s) of {} bytes a transmission, {:.0} s of payload, {trials} transmissions a point, {}",
+        profile.label(),
+        mode,
+        usize::from(blocks) * depth,
+        layout.frame_bytes(),
+        layout.seconds() * f64::from(blocks),
+        fading.map_or("AWGN".to_string(), |_| "Watterson fading".into()),
+    );
+    println!("  Eb/N0     in-band SNR   headers   frame loss");
+    let mut x = from;
+    while x <= to + 1e-9 {
+        let t = run_many(
+            &Scenario {
+                profile,
+                mode,
+                depth,
+                nblocks: blocks,
+                ebn0_db: x,
+                fading,
+                offset_hz: offset,
+                clock_ppm,
+                seed: 1000,
+            },
+            trials,
+        );
+        println!(
+            "  {x:5.1} dB  {:8.1} dB   {:>3}/{:<3}   {:6.2} %  ({}/{} frames)",
+            snr_for_ebn0(&layout, x),
+            t.headers,
+            t.trials,
+            t.fer() * 100.0,
+            t.frames_ok,
+            t.frames_total
+        );
+        x += step;
+    }
     Ok(())
 }

@@ -5,6 +5,7 @@
 pub mod codes;
 pub mod framing;
 pub mod rx;
+pub mod sim;
 pub mod tx;
 
 pub use decdsss_dsp::Iq;

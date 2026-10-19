@@ -9,11 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+decdsss-chan = { path = "../decdsss-chan" }
 decdsss-core = { path = "../decdsss-core" }
 decdsss-dsp = { path = "../decdsss-dsp" }
 decdsss-fec = { path = "../decdsss-fec" }
 num-complex.workspace = true
 rustfft.workspace = true
-
-[dev-dependencies]
-decdsss-chan = { path = "../decdsss-chan" }

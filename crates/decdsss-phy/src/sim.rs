@@ -1,0 +1,292 @@
+// made by CasualArclamp
+//! End-to-end simulation: a segment of test frames synthesised, put through
+//! the channel simulator and fed to the receiver, counting what comes out.
+//! The thresholds in the documentation are measured with this, so they
+//! include acquisition, the preamble, the header and the payload together.
+
+use crate::framing::{Header, Layout, PayloadType};
+use crate::rx::{Event, Receiver};
+use crate::tx::{Segment, chips_to_audio, segment_chips};
+use decdsss_chan::{Channel, Watterson};
+use decdsss_core::{Mode, Profile};
+
+/// Sample rate of every simulation.
+pub const FS: f64 = 48_000.0;
+/// RMS level of the transmitted audio.
+pub const LEVEL: f32 = 0.2;
+
+/// What to simulate.
+#[derive(Clone, Debug)]
+pub struct Scenario {
+    pub profile: Profile,
+    pub mode: Mode,
+    pub depth: usize,
+    pub nblocks: u16,
+    /// Eb/N0 per information bit of a codeword (its CRC counted, the pilots
+    /// and padding of the block counted as air time), dB.
+    pub ebn0_db: f64,
+    pub fading: Option<Watterson>,
+    pub offset_hz: f64,
+    pub clock_ppm: f64,
+    pub seed: u64,
+}
+
+/// What came back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// A header was decoded.
+    pub header: bool,
+    pub frames_total: usize,
+    pub frames_ok: usize,
+}
+
+/// In-band SNR (in the profile's width) for an Eb/N0 on this layout:
+/// SNR = Eb/N0 · depth·k / (B · T_block).
+pub fn snr_for_ebn0(layout: &Layout, ebn0_db: f64) -> f64 {
+    let k = layout.code().k() as f64;
+    let b = layout.profile.bandwidth_hz();
+    ebn0_db + 10.0 * (layout.depth as f64 * k / (b * layout.seconds())).log10()
+}
+
+/// Test frames: a counting pattern.
+pub fn frames(layout: &Layout, n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| {
+            (0..layout.frame_bytes())
+                .map(|b| (i * 31 + b * 7 + 3) as u8)
+                .collect()
+        })
+        .collect()
+}
+
+/// Runs one scenario through the whole receiver.
+pub fn run(sc: &Scenario) -> Outcome {
+    let layout = Layout::new(sc.profile, sc.mode, sc.depth);
+    let n = usize::from(sc.nblocks) * sc.depth;
+    let seg = Segment {
+        header: Header {
+            profile: sc.profile,
+            mode: sc.mode,
+            depth: sc.depth,
+            ptype: PayloadType::Test,
+            call: "VK2ABC".into(),
+            session: 1,
+            frame0: 0,
+            nblocks: sc.nblocks,
+            total_frames: 0,
+        },
+        frames: frames(&layout, n),
+    };
+    let chips = segment_chips(&seg).expect("header packs");
+    let audio = chips_to_audio(&chips, sc.profile, FS, LEVEL, 1.0, 2.0);
+    let ch = Channel {
+        snr_db: Some(snr_for_ebn0(&layout, sc.ebn0_db)),
+        offset_hz: sc.offset_hz,
+        clock_ppm: sc.clock_ppm,
+        fading: sc.fading,
+        seed: sc.seed,
+        ..Channel::clean(f64::from(LEVEL), sc.profile.bandwidth_hz())
+    };
+    let audio = ch.apply(&audio, FS);
+    let mut rx = Receiver::new(sc.profile, FS);
+    let mut out = Outcome {
+        frames_total: n,
+        ..Outcome::default()
+    };
+    for chunk in audio.chunks(4800) {
+        for e in rx.push(chunk) {
+            match e {
+                Event::Header { .. } => out.header = true,
+                Event::Block { result, .. } => {
+                    for (i, f) in result.frames.iter().enumerate() {
+                        let idx = result.first_frame + i;
+                        if idx < n && f.as_ref() == Some(&seg.frames[idx]) {
+                            out.frames_ok += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The sum of several transmissions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    pub trials: usize,
+    /// Transmissions whose header was decoded.
+    pub headers: usize,
+    pub frames_ok: usize,
+    pub frames_total: usize,
+}
+
+impl Totals {
+    /// Fraction of frames lost (a transmission whose header was never found
+    /// loses all its frames).
+    pub fn fer(&self) -> f64 {
+        1.0 - self.frames_ok as f64 / self.frames_total.max(1) as f64
+    }
+}
+
+/// Runs `trials` independent transmissions on all cores and adds them up. The
+/// carrier offset and clock error are spread over the trials around the base
+/// values, so no result depends on one lucky alignment.
+pub fn run_many(base: &Scenario, trials: usize) -> Totals {
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(trials)
+        .max(1);
+    let total = std::sync::Mutex::new(Totals {
+        trials,
+        ..Totals::default()
+    });
+    std::thread::scope(|sc| {
+        for w in 0..workers {
+            let total = &total;
+            sc.spawn(move || {
+                for t in (w..trials).step_by(workers) {
+                    let mut s = base.clone();
+                    s.seed = base.seed + t as u64;
+                    s.offset_hz = base.offset_hz + (t % 7) as f64 * 2.0 - 6.0;
+                    s.clock_ppm = base.clock_ppm + (t % 5) as f64 * 15.0 - 30.0;
+                    let o = run(&s);
+                    let mut g = total.lock().unwrap();
+                    g.headers += usize::from(o.header);
+                    g.frames_ok += o.frames_ok;
+                    g.frames_total += o.frames_total;
+                }
+            });
+        }
+    });
+    total.into_inner().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hunts a seed that loses frames at high SNR and prints its blocks.
+    #[test]
+    #[ignore]
+    fn debug_loss() {
+        let base = Scenario {
+            profile: Profile::W2400,
+            mode: Mode::from_name("csk64-1/2").unwrap(),
+            depth: 4,
+            nblocks: 2,
+            ebn0_db: 22.0,
+            fading: Some(Watterson::GOOD),
+            offset_hz: 0.0,
+            clock_ppm: 0.0,
+            seed: 1000,
+        };
+        for (e, t) in [21.0f64, 24.0]
+            .iter()
+            .flat_map(|&e| (0..24usize).map(move |t| (e, t)))
+        {
+            let mut base = base.clone();
+            base.ebn0_db = e;
+            let mut s = base.clone();
+            s.seed = base.seed + t as u64;
+            s.offset_hz = base.offset_hz + (t % 7) as f64 * 2.0 - 6.0;
+            s.clock_ppm = base.clock_ppm + (t % 5) as f64 * 15.0 - 30.0;
+            let o = run(&s);
+            if o.frames_ok < o.frames_total {
+                println!(
+                    "ebn0 {e} trial {t}: seed {} offset {} clock {}: {}/{}",
+                    s.seed, s.offset_hz, s.clock_ppm, o.frames_ok, o.frames_total
+                );
+                run_verbose(&s);
+                break;
+            }
+        }
+    }
+
+    fn run_verbose(sc: &Scenario) {
+        let layout = Layout::new(sc.profile, sc.mode, sc.depth);
+        let n = usize::from(sc.nblocks) * sc.depth;
+        let seg = Segment {
+            header: Header {
+                profile: sc.profile,
+                mode: sc.mode,
+                depth: sc.depth,
+                ptype: PayloadType::Test,
+                call: "VK2ABC".into(),
+                session: 1,
+                frame0: 0,
+                nblocks: sc.nblocks,
+                total_frames: 0,
+            },
+            frames: frames(&layout, n),
+        };
+        let chips = segment_chips(&seg).unwrap();
+        let audio = chips_to_audio(&chips, sc.profile, FS, LEVEL, 1.0, 2.0);
+        let ch = Channel {
+            snr_db: Some(snr_for_ebn0(&layout, sc.ebn0_db)),
+            offset_hz: sc.offset_hz,
+            clock_ppm: sc.clock_ppm,
+            fading: sc.fading,
+            seed: sc.seed,
+            ..Channel::clean(f64::from(LEVEL), sc.profile.bandwidth_hz())
+        };
+        let audio = ch.apply(&audio, FS);
+        let mut rx = Receiver::new(sc.profile, FS);
+        for chunk in audio.chunks(4800) {
+            for e in rx.push(chunk) {
+                match e {
+                    Event::Header {
+                        header,
+                        snr_db,
+                        fingers,
+                        ..
+                    } => println!("  header {} snr {snr_db:.1} fingers {fingers}", header.mode),
+                    Event::Block { result, .. } => println!(
+                        "  block {}: ok {:?} iters {:?} snr {:.1} freq {:.2} fingers {:?}",
+                        result.index,
+                        result
+                            .frames
+                            .iter()
+                            .map(|f| f.is_some())
+                            .collect::<Vec<_>>(),
+                        result.iterations,
+                        result.snr_db,
+                        result.freq_hz,
+                        result.fingers
+                    ),
+                    Event::Lost(w) => println!("  lost: {w}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_strong_signal_gets_everything_through() {
+        let sc = Scenario {
+            profile: Profile::W2400,
+            mode: Mode::from_name("csk64-1/2").unwrap(),
+            depth: 2,
+            nblocks: 2,
+            ebn0_db: 12.0,
+            fading: None,
+            offset_hz: 4.0,
+            clock_ppm: 10.0,
+            seed: 1,
+        };
+        let o = run(&sc);
+        assert!(o.header);
+        assert_eq!((o.frames_ok, o.frames_total), (4, 4));
+    }
+
+    #[test]
+    fn ebn0_maps_to_the_expected_snr() {
+        // DS8 1/2 on 2k4: nominal offset is −10.6 dB; the exact one differs by
+        // the CRC, closing pilot and padding (a fraction of a dB).
+        let layout = Layout::new(Profile::W2400, Mode::from_name("ds8-1/2").unwrap(), 4);
+        let exact = snr_for_ebn0(&layout, 0.0);
+        let nominal = layout.mode.snr_offset_db(layout.profile);
+        assert!((exact - nominal).abs() < 0.5, "{exact} vs {nominal}");
+    }
+}

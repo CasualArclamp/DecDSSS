@@ -33,7 +33,7 @@ pub fn pick_fingers(profile: &super::preamble::DelayProfile, max: usize) -> Vec<
     }
     p.sort_by(f32::total_cmp);
     let median = p[p.len() / 2];
-    let found = profile.fingers(max, 12.0, 2.2 * median, 0.9);
+    let found = profile.fingers(max, 10.0, 3.5 * median, 0.85);
     if found.is_empty() {
         return vec![Finger {
             lag: 0.0,
@@ -142,13 +142,6 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64) -> HeaderOutcome 
         peak_prev = Some(peak);
         w.push(per_finger);
         t.advance(HEADER_CSK);
-    }
-    if std::env::var("DSSS_DEBUG").is_ok() {
-        eprintln!("decisions {decisions:?}");
-        eprintln!(
-            "start {:.2} end {:.2} step {:.5} freq {:.2}",
-            lock.header_start, t.pos, t.step, t.freq
-        );
     }
     let t_sym = HEADER_CSK as f64 * t.step / rate;
     let f_res = f64::from(freq_acc.arg()) / (std::f64::consts::TAU * t_sym);
@@ -311,35 +304,6 @@ mod tests {
                 println!("{name:9} {snr:6.1} dB: header ok {ok}/{trials} {why:?}");
             }
         }
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_one() {
-        use decdsss_fec::interleave::Interleaver;
-        let profile = Profile::W2400;
-        let seg = segment(profile, "csk256-1/2", 1, 1);
-        let mut ch = channel(profile, 0.0);
-        ch.seed = 507;
-        ch.offset_hz = -1.0;
-        ch.clock_ppm = 5.0;
-        let audio = through(&seg, &ch);
-        // Truth symbols.
-        let info = seg.header.pack().unwrap();
-        let cw = decdsss_fec::ldpc::Code::header().encode(&info);
-        let sent = Interleaver::new(cw.len()).apply(&cw);
-        let truth: Vec<usize> = sent
-            .chunks(8)
-            .map(|b| b.iter().fold(0usize, |a, &x| (a << 1) | usize::from(x)))
-            .collect();
-        println!("truth {truth:?}");
-        let r = to_header(&audio, profile);
-        println!(
-            "{:?}",
-            r.as_ref()
-                .map(|r| r.header.iterations)
-                .map_err(|e| e.clone())
-        );
     }
 
     #[test]
