@@ -188,6 +188,82 @@ pub fn vox_lead(rate: f64, level: f32, tone_s: f64, gap_s: f64) -> Vec<f32> {
     v
 }
 
+/// A transmission built a block at a time, for live voice: the preamble and the
+/// header first, then each block as its frames are ready. The pulse shaper carries
+/// on from one call to the next, so the audio is continuous and is exactly what
+/// [`chips_to_audio`] makes of all the chips at once.
+pub struct LiveTx {
+    header: Header,
+    layout: Layout,
+    scr: Scrambler,
+    chip0: usize,
+    shaper: Shaper,
+}
+
+impl LiveTx {
+    /// `None` if the header cannot be packed or the callsign has no code.
+    pub fn new(header: Header, sample_rate: f64, level: f32) -> Option<LiveTx> {
+        header.pack()?;
+        let layout = Layout::new(header.profile, header.mode, header.depth);
+        let scr = Scrambler::new(own_code(&header.call)?);
+        let shaper = Shaper::new(
+            f64::from(header.profile.chip_rate()),
+            sample_rate,
+            header.profile.centre_hz(),
+            ROLLOFF,
+            10,
+            level,
+        );
+        Some(LiveTx {
+            header,
+            layout,
+            scr,
+            chip0: 0,
+            shaper,
+        })
+    }
+
+    /// The audio of the preamble and the header, to be sent first.
+    pub fn lead(&mut self) -> Vec<f32> {
+        let mut chips = preamble_chips(self.header.profile);
+        chips.extend(header_chips(&self.header).expect("the header packed in new()"));
+        let mut audio = Vec::new();
+        self.shaper.push(&chips, &mut audio);
+        audio
+    }
+
+    /// The audio of the next block from `frames` (at most `depth`; fewer are
+    /// padded with zero frames).
+    pub fn block(&mut self, frames: &[Vec<u8>]) -> Vec<f32> {
+        let chips = block_chips(&self.layout, frames, &self.scr, self.chip0);
+        self.chip0 += chips.len();
+        let mut audio = Vec::new();
+        self.shaper.push(&chips, &mut audio);
+        audio
+    }
+
+    /// The end of the shaped signal (the filter's tail), after the last block.
+    pub fn finish(&mut self) -> Vec<f32> {
+        let mut audio = Vec::new();
+        self.shaper.flush(&mut audio);
+        audio
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Seconds of signal in a block.
+    pub fn block_seconds(&self) -> f64 {
+        self.layout.seconds()
+    }
+
+    /// Seconds of signal before the first block (preamble and header).
+    pub fn lead_seconds(&self) -> f64 {
+        lead_chips(self.header.profile) as f64 / f64::from(self.header.profile.chip_rate())
+    }
+}
+
 /// Chips up to the first payload block: preamble plus header.
 pub fn lead_chips(profile: Profile) -> usize {
     (PRE_A_PERIODS + PRE_B_PERIODS) * crate::codes::preamble_len(profile)
@@ -247,6 +323,38 @@ mod tests {
             })
             .collect();
         Segment { header, frames }
+    }
+
+    #[test]
+    fn a_live_transmission_is_the_audio_of_the_whole_segment() {
+        let s = seg("ds4-2/3", 2, 3);
+        let whole = chips_to_audio(
+            &segment_chips(&s).unwrap(),
+            Profile::W2400,
+            48_000.0,
+            0.2,
+            0.0,
+            0.0,
+        );
+        let mut live = LiveTx::new(s.header.clone(), 48_000.0, 0.2).unwrap();
+        let mut audio = live.lead();
+        for b in s.frames.chunks(2) {
+            audio.extend(live.block(b));
+        }
+        audio.extend(live.finish());
+        assert_eq!(audio.len(), whole.len());
+        let worst = audio
+            .iter()
+            .zip(&whole)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-6, "{worst}");
+        assert!((live.lead_seconds() - 12.27).abs() < 0.02);
+        assert!(
+            (live.block_seconds() - 2.75).abs() < 0.05,
+            "{}",
+            live.block_seconds()
+        );
     }
 
     #[test]

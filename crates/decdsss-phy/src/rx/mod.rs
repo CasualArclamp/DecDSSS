@@ -114,9 +114,28 @@ struct Attempt {
 /// Candidates followed at once.
 const MAX_ATTEMPTS: usize = 4;
 
+/// A live voice transmission has no end announced in its header; it is over when
+/// this many blocks in a row decode nothing (the talker has let go, or the signal
+/// is gone).
+const LIVE_LOST_BLOCKS: usize = 6;
+
 struct Channel {
     id: usize,
     rx: PayloadRx,
+    /// Blocks in a row with no frame decoded.
+    lost_run: usize,
+}
+
+impl Channel {
+    /// A live voice stream: speech with no frame total.
+    fn is_live(&self) -> bool {
+        let h = &self.rx.header;
+        h.total_frames == 0
+            && matches!(
+                h.ptype,
+                crate::framing::PayloadType::Voice | crate::framing::PayloadType::Voice450
+            )
+    }
 }
 
 pub struct Receiver {
@@ -205,13 +224,18 @@ impl Receiver {
         while i < self.channels.len() {
             let ch = &mut self.channels[i];
             while let Some(result) = ch.rx.step(&self.buf) {
+                ch.lost_run = if result.frames.iter().any(Option::is_some) {
+                    0
+                } else {
+                    ch.lost_run + 1
+                };
                 self.pending.push_back(Event::Block {
                     channel: ch.id,
                     header: Box::new(ch.rx.header.clone()),
                     result: Box::new(result),
                 });
             }
-            if ch.rx.done() {
+            if ch.rx.done() || (ch.is_live() && ch.lost_run >= LIVE_LOST_BLOCKS) {
                 self.pending.push_back(Event::SegmentEnd { channel: ch.id });
                 self.channels.remove(i);
             } else {
@@ -321,7 +345,11 @@ impl Receiver {
         if rx.done() {
             self.pending.push_back(Event::SegmentEnd { channel: id });
         } else {
-            self.channels.push(Channel { id, rx });
+            self.channels.push(Channel {
+                id,
+                rx,
+                lost_run: 0,
+            });
         }
     }
 }

@@ -4,6 +4,7 @@
 
 use crate::container;
 use crate::erasure::Decoder;
+use crate::live::LiveDecoder;
 use crate::send::FRAME_META;
 use crate::voice;
 use decdsss_codec2::Mode as Codec;
@@ -79,11 +80,36 @@ struct VoiceTransfer {
     done: bool,
 }
 
+/// Speech of a live transmission, as it comes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveChunk {
+    pub call: String,
+    pub session: u8,
+    pub codec: Codec,
+    /// 8 kHz speech to play next, silence for frames that were lost.
+    pub pcm: Vec<i16>,
+    /// Speech frames lost just before this chunk.
+    pub lost: usize,
+    /// The talker let go: this is the last chunk (it may be empty).
+    pub ended: bool,
+}
+
+/// A live transmission being received.
+struct LiveTransfer {
+    decoder: LiveDecoder,
+    /// All the speech so far (for the saved file and the display).
+    speech: Vec<i16>,
+    lost: usize,
+    done: bool,
+}
+
 /// Gathers frames by (callsign, session).
 #[derive(Default)]
 pub struct Assembler {
     transfers: BTreeMap<(String, u8), Transfer>,
     voices: BTreeMap<(String, u8), VoiceTransfer>,
+    lives: BTreeMap<(String, u8), LiveTransfer>,
+    live_chunks: Vec<LiveChunk>,
     finished_voice: Vec<ReceivedVoice>,
 }
 
@@ -159,7 +185,69 @@ impl Assembler {
         finished
     }
 
+    /// A live transmission (a header with no frame total): its frames go to a
+    /// decoder in the order they come, and the speech out as chunks.
+    fn push_live(&mut self, header: &Header, block: &BlockResult, codec: Codec) {
+        let key = (header.call.clone(), header.session);
+        let Some(decoder) = LiveDecoder::new(codec) else {
+            return;
+        };
+        let live = self
+            .lives
+            .entry(key.clone())
+            .or_insert_with(|| LiveTransfer {
+                decoder,
+                speech: Vec::new(),
+                lost: 0,
+                done: false,
+            });
+        if live.done {
+            return;
+        }
+        for data in block.frames.iter().flatten() {
+            let played = live.decoder.push(data);
+            if played.pcm.is_empty() && !played.ended {
+                continue;
+            }
+            live.speech.extend_from_slice(&played.pcm);
+            live.lost += played.lost;
+            self.live_chunks.push(LiveChunk {
+                call: key.0.clone(),
+                session: key.1,
+                codec,
+                pcm: played.pcm,
+                lost: played.lost,
+                ended: played.ended,
+            });
+            if played.ended {
+                live.done = true;
+                self.finished_voice.push(ReceivedVoice {
+                    call: key.0.clone(),
+                    session: key.1,
+                    codec,
+                    speech: live.speech.clone(),
+                    lost: live.lost,
+                });
+                break;
+            }
+        }
+    }
+
+    /// Speech of live transmissions that has come since the last call, in order.
+    pub fn take_live(&mut self) -> Vec<LiveChunk> {
+        std::mem::take(&mut self.live_chunks)
+    }
+
+    /// All the speech of a live transmission so far, and whether it has ended.
+    pub fn live_speech(&self, call: &str, session: u8) -> Option<(&[i16], bool)> {
+        let l = self.lives.get(&(call.to_string(), session))?;
+        Some((&l.speech, l.done))
+    }
+
     fn push_voice(&mut self, header: &Header, block: &BlockResult, codec: Codec) {
+        if header.total_frames == 0 {
+            return self.push_live(header, block, codec);
+        }
         let key = (header.call.clone(), header.session);
         let total = usize::from(header.total_frames);
         // A different transmission under the same call and session starts over.
