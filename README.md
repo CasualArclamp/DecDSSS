@@ -18,13 +18,16 @@ The receiver shows what it is doing, in the style of DecSAT's DVB-CID card:
 - the audio spectrum and waterfall with the three profiles marked, so you can see
   the spread signal sitting under the noise floor;
 - pictures, drawn as they arrive: a progressive JPEG shows the whole picture
-  early and sharpens it as more of the file comes in.
+  early and sharpens it as more of the file comes in;
+- speech, as a waveform with the frames that have not come shaded, and a Play
+  button; record into the Transmit window from any input device.
 
-![The GUI decoding two stations at once](docs/gui-demo.png)
+![The GUI decoding three stations at once](docs/gui-demo.png)
 
-*Two stations on one 2.4 kHz channel, on different spreading codes (VK2ABC DS8
-sending a picture, W1AW CSK64 sending a file), through moderate HF fading with a
-14 Hz carrier offset: the demo signal, caught while the picture is half in.*
+*Three stations on one 2.4 kHz channel, on different spreading codes (VK2ABC DS8
+sending a picture, W1AW CSK64 sending a file, JA1XYZ DS4 sending speech), through
+moderate HF fading with a 14 Hz carrier offset: the demo signal, at its end, with
+the picture and the speech received.*
 
 ## How it works
 

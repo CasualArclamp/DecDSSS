@@ -172,6 +172,22 @@ pub fn segment_chips(seg: &Segment) -> Option<Vec<Iq>> {
     Some(chips)
 }
 
+/// A lead for a radio that keys on VOX: a 1 kHz tone of `tone_s` seconds at RMS
+/// `level`, then `gap_s` of silence, for the audio to follow.
+pub fn vox_lead(rate: f64, level: f32, tone_s: f64, gap_s: f64) -> Vec<f32> {
+    let n = (tone_s * rate) as usize;
+    let amp = level * std::f32::consts::SQRT_2;
+    let mut v: Vec<f32> = (0..n)
+        .map(|i| {
+            // Short ramps so the burst does not click.
+            let ramp = (i.min(n - i) as f32 / (0.01 * rate as f32)).min(1.0);
+            amp * ramp * (std::f32::consts::TAU * 1000.0 * i as f32 / rate as f32).sin()
+        })
+        .collect();
+    v.extend(std::iter::repeat_n(0.0, (gap_s * rate) as usize));
+    v
+}
+
 /// Chips up to the first payload block: preamble plus header.
 pub fn lead_chips(profile: Profile) -> usize {
     (PRE_A_PERIODS + PRE_B_PERIODS) * crate::codes::preamble_len(profile)

@@ -309,7 +309,10 @@ CRC-16 (headers) and CRC-32 (payload frames).
     missing) and the whole is handed over when every frame is in (`take_voice`).
     The CLI writes `CALL-SESSION.wav` (8 kHz) and a `-partial.wav` for a
     transmission that did not finish.
-  - *Not yet:* live (streamed) voice, GUI record/play, VOX tone and CAT keying.
+  - *Keying.* `--vox` (CLI) and the VOX box (GUI) put 0.4 s of 1 kHz and a 0.3 s
+    pause ahead of the signal so a radio on VOX is transmitting before the
+    preamble; otherwise you key the radio, as for any transmission.
+  - *Not yet:* live (streamed) voice and CAT keying (voicemodem's rig crate).
 - **ARQ** (M5): a connected mode for files on both stations' own codes, with
   selective repeat and ACK bitmaps sent at a robust mode.
 
@@ -335,16 +338,26 @@ hairline frames, one muted hue per quantity.
   - symbol SNR and carrier strips
   - the last codeword's soft bits, and a frame map of the transmission
 - **Files** — the received list (click to open), progress bars, the log.
+- **Speech** — cards in the same strip: the waveform of the speech so far
+  (frames not yet in are shaded red and silent), frames in against frames in
+  all, and a *Play* button that plays it on the output device chosen in the
+  Transmit window. A completed transmission is saved as `CALL-SESSION.wav`.
 - **Pictures** — a strip under the band view with one card per picture (newest
   first, up to 8): the picture as far as it has arrived, upscaled, with bytes in
   against bytes in all and the scans decoded; it sharpens as blocks arrive.
-- **Transmit** — file, callsign, profile, mode (with its rate and the SNR it
+- **Transmit** — *send as* file, picture or voice; callsign, profile, mode (with its rate and the SNR it
   needs), depth, preamble interval, coded frames, passes, level, output device;
   play to the sound card (at that device's own rate) or save a WAV. Choosing an
   image switches on *As a picture*: air time a pass and the lowest quality
   accepted, and the window shows the picture exactly as it will arrive (decoded
   from the JPEG that will be sent), its size, quality, bytes and seconds of
-  signal. Compression runs off the UI thread.
+  signal. Compression runs off the UI thread. Voice: record from any input
+  device (up to 60 s) or choose a WAV, hear it as is or *as Codec2 will send it*
+  (compressed and expanded again), pick 450 or 700C (default by profile), see the
+  frames, seconds of signal and the payload's rate against the codec's; *Use it*
+  switches to the profile's voice mode. Recording was checked through VB-Audio
+  cable A (`--record-for 8 --mic "CABLE-A Output"` while the CLI played a
+  transmission into the cable: a 7.4 s clip).
 
 Sources: a sound card or virtual cable (stereo is mixed to mono), a WAV file at
 any speed, or the built-in demo (two stations, one DS8 and one CSK64, on one
@@ -367,7 +380,7 @@ silent.
 | `decdsss-fec` | QC-LDPC (design, encoder, layered min-sum), the interleaver, CRCs. |
 | `decdsss-phy` | Codes, framing, the transmitter, the receiver (search, preamble, header, payload, refinement), the end-to-end simulator. |
 | `decdsss-chan` | Channel simulator: AWGN, carrier offset and drift, clock error, Watterson fading with the CCIR presets. |
-| `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes, air time and byte budget), receive-side assembly (and the readable front of a file still arriving). |
+| `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes, air time and byte budget), voice framing, receive-side assembly (the readable front of a file still arriving, speech so far). |
 | `decdsss-codec2` | Codec2 (vendored C core, LGPL-2.1) with a safe wrapper: modes 3200 … 450, bit-exact frame packing. |
 | `decdsss-image` | Pictures: load, scale and compress to a byte budget as a progressive JPEG; decode one that is cut short. |
 | `decdsss-audio` | Sound-card capture and playback (cpal) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
@@ -391,7 +404,8 @@ silent.
   the CLI (`tx --picture --air`, a partial PNG saved by `rx` for a picture that
   did not finish) and the GUI. *Done* (see Verification).
 - **M4** — voice, VOX/manual PTT, CAT keying. Link layer and CLI (`tx --voice`,
-  `rx` writes the speech) *done*; GUI, VOX and CAT to do.
+  `rx` writes the speech), GUI (record, send, receive cards, play) and VOX tone
+  *done*; CAT keying and the fast-mode fix (see Verification) to do.
 - **M5** — ARQ connected mode.
 - **M6** — polish and the first release (portable exes), when Rory says so.
 

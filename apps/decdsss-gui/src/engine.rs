@@ -7,8 +7,9 @@
 use crate::demo;
 use crate::spectrum::Spectrum;
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav};
+use decdsss_codec2::Mode as Codec;
 use decdsss_core::Profile;
-use decdsss_link::{Assembler, ReceivedFile};
+use decdsss_link::{Assembler, ReceivedFile, ReceivedVoice};
 use decdsss_phy::framing::PayloadType;
 use decdsss_phy::rx::{Event, MultiReceiver, Snapshot};
 use std::collections::{BTreeMap, VecDeque};
@@ -79,6 +80,24 @@ pub struct PictureView {
     pub version: u64,
 }
 
+/// Speech as far as it has arrived.
+#[derive(Clone, Debug)]
+pub struct VoiceView {
+    pub call: String,
+    pub session: u8,
+    pub codec: Codec,
+    /// Frames in, frames in all, and which are in.
+    pub have: usize,
+    pub total: usize,
+    pub map: Vec<bool>,
+    /// 8 kHz speech, silence where frames are missing.
+    pub speech: Arc<Vec<i16>>,
+    /// Lowest and highest sample in each column of the waveform, −1…1.
+    pub wave: Vec<(f32, f32)>,
+    pub seconds: f64,
+    pub complete: bool,
+}
+
 /// How far a transmission has got, for the progress bars.
 #[derive(Clone, Debug)]
 pub struct Transfer {
@@ -115,6 +134,8 @@ pub struct Shared {
     pub transfers: Vec<Transfer>,
     /// Pictures received or arriving, oldest first.
     pub pictures: Vec<Arc<PictureView>>,
+    /// Speech received or arriving, oldest first.
+    pub voices: Vec<Arc<VoiceView>>,
     pub tx: TxState,
     /// Bumped whenever something the UI draws changed.
     pub version: u64,
@@ -194,6 +215,91 @@ struct Run {
     /// they were last drawn from.
     pictures: Vec<((String, u8), usize, Arc<PictureView>)>,
     picture_version: u64,
+    /// The same for speech: with the frames it was last drawn from.
+    voices: Vec<((String, u8), usize, Arc<VoiceView>)>,
+}
+
+/// Speech cards kept on the display.
+const VOICES_MAX: usize = 6;
+/// Columns of a speech waveform.
+const WAVE_COLS: usize = 300;
+
+/// Redraws a speech transmission from the frames that have arrived.
+fn update_voice(r: &mut Run, call: &str, session: u8) {
+    let Some(p) = r.asm.voice_progress(call, session) else {
+        return;
+    };
+    let key = (call.to_string(), session);
+    let at = r.voices.iter().position(|(k, ..)| *k == key);
+    if at.is_some_and(|i| r.voices[i].1 == p.have) {
+        return;
+    }
+    let Some((speech, _)) = r.asm.voice_speech(call, session) else {
+        return;
+    };
+    let per_col = speech.len().div_ceil(WAVE_COLS).max(1);
+    let wave: Vec<(f32, f32)> = speech
+        .chunks(per_col)
+        .map(|c| {
+            let lo = c.iter().copied().min().unwrap_or(0);
+            let hi = c.iter().copied().max().unwrap_or(0);
+            (f32::from(lo) / 32768.0, f32::from(hi) / 32768.0)
+        })
+        .collect();
+    let view = Arc::new(VoiceView {
+        call: call.to_string(),
+        session,
+        codec: p.codec,
+        have: p.have,
+        total: p.total,
+        map: p.map,
+        seconds: speech.len() as f64 / 8000.0,
+        speech: Arc::new(speech),
+        wave,
+        complete: p.have == p.total,
+    });
+    match at {
+        Some(i) => r.voices[i] = (key, p.have, view),
+        None => {
+            r.voices.push((key, p.have, view));
+            if r.voices.len() > VOICES_MAX {
+                r.voices.remove(0);
+            }
+        }
+    }
+}
+
+/// Writes a received speech transmission as a WAV and lists it with the files.
+fn save_voice(shared: &Arc<Mutex<Shared>>, r: &Run, t: f64, v: ReceivedVoice) {
+    let name = clean_name(&format!("{}-{}.wav", v.call, v.session));
+    let path = unique(&r.out_dir, &name);
+    let audio: Vec<f32> = v.speech.iter().map(|&s| f32::from(s) / 32768.0).collect();
+    match wav::write(&path, &audio, 8000) {
+        Ok(_) => {
+            log(
+                shared,
+                format!(
+                    "[{t:6.1}s] VOICE from {} ({:.1} s of Codec2 {}) saved to {}",
+                    v.call,
+                    v.speech.len() as f64 / 8000.0,
+                    v.codec,
+                    path.display()
+                ),
+            );
+            let ptype = decdsss_link::voice::ptype_of(v.codec).unwrap_or(PayloadType::Voice);
+            let file = ReceivedFile {
+                call: v.call,
+                session: v.session,
+                ptype,
+                name,
+                data: v.speech.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            };
+            let mut g = shared.lock().unwrap();
+            g.files.push(FileEntry { file, path });
+            g.version += 1;
+        }
+        Err(e) => log(shared, format!("cannot write {}: {e}", path.display())),
+    }
 }
 
 /// Pictures kept on the display.
@@ -365,6 +471,7 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
         g.spectrum = None;
         g.transfers.clear();
         g.pictures.clear();
+        g.voices.clear();
         g.version += 1;
     }
     log(shared, format!("Listening on {what}, {} Hz", rate as u32));
@@ -382,6 +489,7 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
         transfers: BTreeMap::new(),
         pictures: Vec::new(),
         picture_version: 0,
+        voices: Vec::new(),
     })
 }
 
@@ -504,6 +612,12 @@ fn handle_event(shared: &Arc<Mutex<Shared>>, r: &mut Run, t: f64, profile: Profi
                 );
             }
             let finished = r.asm.push(&header, &result);
+            if decdsss_link::voice::codec_of(header.ptype).is_some() {
+                update_voice(r, &header.call, header.session);
+                for v in r.asm.take_voice() {
+                    save_voice(shared, r, t, v);
+                }
+            }
             // Progress comes from the assembler: distinct frames in against the
             // frames needed (any that many rebuild the file).
             if let Some(p) = r.asm.progress(&header.call, header.session) {
@@ -600,11 +714,13 @@ fn publish(shared: &Arc<Mutex<Shared>>, r: &mut Run, force: bool) {
     };
     let transfers: Vec<Transfer> = r.transfers.values().cloned().collect();
     let pictures: Vec<Arc<PictureView>> = r.pictures.iter().map(|(.., v)| v.clone()).collect();
+    let voices: Vec<Arc<VoiceView>> = r.voices.iter().map(|(.., v)| v.clone()).collect();
     let mut g = shared.lock().unwrap();
     g.snapshots = snaps;
     g.spectrum = Some(view);
     g.transfers = transfers;
     g.pictures = pictures;
+    g.voices = voices;
     g.seconds = r.samples as f64 / r.rate;
     g.version += 1;
 }

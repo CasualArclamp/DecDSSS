@@ -6,8 +6,9 @@
 //! receiver, so every panel has something to show without a radio.
 
 use decdsss_chan::{Channel, Watterson};
+use decdsss_codec2::Mode as Codec;
 use decdsss_core::{Mode, Profile};
-use decdsss_link::{SendSpec, container, segments};
+use decdsss_link::{SendSpec, VoiceSpec, container, plan_voice, segments};
 use decdsss_phy::framing::PayloadType;
 use decdsss_phy::tx::{chips_to_audio, segment_chips};
 
@@ -96,6 +97,72 @@ fn station(
     chips_to_audio(&chips, Profile::W2400, f64::from(RATE), 0.2, lead, 2.0)
 }
 
+/// Speech-like audio for the demo, 8 kHz: syllables of vowel-like sounds (a pulse
+/// train through formants) at a gliding pitch, with gaps between words.
+fn speech_clip(seconds: f64) -> Vec<i16> {
+    const VOWELS: [[f64; 3]; 5] = [
+        [700.0, 1220.0, 2600.0],
+        [300.0, 2300.0, 3000.0],
+        [500.0, 1500.0, 2500.0],
+        [800.0, 1100.0, 2500.0],
+        [350.0, 900.0, 2400.0],
+    ];
+    let n = (seconds * 8000.0) as usize;
+    let mut out = vec![0.0f64; n];
+    let mut phase = 0.0;
+    let mut state = [[0.0f64; 2]; 3];
+    let syllable = 2600usize;
+    for (i, o) in out.iter_mut().enumerate() {
+        let k = i / syllable;
+        let within = (i % syllable) as f64 / syllable as f64;
+        // The envelope of a syllable, and a pause after every third.
+        let env = if k % 3 == 2 && within > 0.5 {
+            0.0
+        } else {
+            (std::f64::consts::PI * within).sin().powi(2)
+        };
+        let f0 = 105.0 + 30.0 * (i as f64 / 9000.0).sin() + 12.0 * (k % 4) as f64;
+        phase += f0 / 8000.0;
+        let pulse = if phase >= 1.0 {
+            phase -= 1.0;
+            1.0
+        } else {
+            0.0
+        };
+        let mut x = pulse;
+        for (f, st) in VOWELS[k % VOWELS.len()].iter().zip(state.iter_mut()) {
+            let r = (-std::f64::consts::PI * 110.0 / 8000.0).exp();
+            let (a1, a2) = (-2.0 * r * (std::f64::consts::TAU * f / 8000.0).cos(), r * r);
+            let y = x - a1 * st[0] - a2 * st[1];
+            st[1] = st[0];
+            st[0] = y;
+            x = y;
+        }
+        *o = x * env;
+    }
+    let peak = out.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    out.iter().map(|v| (v / peak * 9000.0) as i16).collect()
+}
+
+/// A station sending speech as Codec2 450 on 2.4 kHz.
+fn voice_station(call: &str, session: u8, pcm: &[i16], lead: f64) -> Vec<f32> {
+    let spec = VoiceSpec {
+        profile: Profile::W2400,
+        mode: Mode::voice(Profile::W2400).expect("2.4 kHz has a voice mode"),
+        depth: 2,
+        call: call.into(),
+        session,
+        codec: Codec::C450,
+        resync_s: 40.0,
+    };
+    let plan = plan_voice(&spec, pcm).expect("demo speech");
+    let mut chips = Vec::new();
+    for s in &plan.segments {
+        chips.extend(segment_chips(s).expect("demo header"));
+    }
+    chips_to_audio(&chips, Profile::W2400, f64::from(RATE), 0.2, lead, 2.0)
+}
+
 /// A linear-phase FIR band-pass (Hamming-windowed sinc, `taps` odd), applied
 /// with the delay taken out.
 fn bandpass(x: &[f32], lo_hz: f64, hi_hz: f64, taps: usize) -> Vec<f32> {
@@ -150,13 +217,18 @@ pub fn make() -> Demo {
         23,
         30.0,
     );
-    let n = a.len().max(b.len());
+    // Speech needs the fast, fragile DS4, so this station is stronger.
+    let c = voice_station("JA1XYZ", 37, &speech_clip(9.0), 152.0);
+    let n = a.len().max(b.len()).max(c.len());
     let mut mix = vec![0.0f32; n];
     for (i, v) in a.iter().enumerate() {
         mix[i] += v;
     }
     for (i, v) in b.iter().enumerate() {
         mix[i] += 0.8 * v;
+    }
+    for (i, v) in c.iter().enumerate() {
+        mix[i] += 2.2 * v;
     }
     let ch = Channel {
         snr_db: Some(2.0),
@@ -171,7 +243,7 @@ pub fn make() -> Demo {
     let audio = bandpass(&ch.apply(&mix, f64::from(RATE)), 250.0, 3400.0, 255);
     Demo {
         audio,
-        what: "VK2ABC (DS8 ½, a picture) and W1AW (CSK64 ½, a file) on 2.4 kHz, moderate fading, +14 Hz, -15 ppm"
+        what: "VK2ABC (DS8 ½, a picture), W1AW (CSK64 ½, a file) and JA1XYZ (DS4 ⅔, speech) on 2.4 kHz, moderate fading, +14 Hz, -15 ppm"
             .into(),
     }
 }

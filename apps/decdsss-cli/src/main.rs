@@ -99,6 +99,10 @@ enum Command {
         /// Seconds of silence after.
         #[arg(long, default_value_t = 1.0)]
         tail: f64,
+        /// Ahead of the signal, a 1 kHz tone (0.4 s) and a pause (0.3 s) to key a
+        /// radio that transmits on VOX.
+        #[arg(long)]
+        vox: bool,
         /// The WAV to write.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -210,6 +214,7 @@ fn main() -> Result<()> {
             level,
             lead,
             tail,
+            vox,
             output,
             play,
         } => tx(
@@ -237,6 +242,7 @@ fn main() -> Result<()> {
             level,
             lead,
             tail,
+            vox,
             output.as_deref(),
             play.as_deref(),
         ),
@@ -362,6 +368,7 @@ fn tx(
     level: f32,
     lead: f64,
     tail: f64,
+    vox: bool,
     output: Option<&Path>,
     play: Option<&str>,
 ) -> Result<()> {
@@ -470,7 +477,12 @@ fn tx(
     for s in &segs {
         chips.extend(segment_chips(s).context("cannot build the header")?);
     }
-    let audio = chips_to_audio(&chips, profile, f64::from(rate), level, lead, tail);
+    let mut audio = chips_to_audio(&chips, profile, f64::from(rate), level, lead, tail);
+    if vox {
+        let mut v = decdsss_phy::tx::vox_lead(f64::from(rate), level, 0.4, 0.3);
+        v.extend(audio);
+        audio = v;
+    }
     println!("{summary}");
     let secs = audio.len() as f64 / f64::from(rate);
     if let Some(output) = output {
@@ -504,13 +516,8 @@ struct VoiceOpts {
 fn load_speech(file: &Path) -> Result<Vec<i16>> {
     let (audio, rate) =
         wav::read(file).with_context(|| format!("cannot read {}", file.display()))?;
-    let x = decdsss_dsp::resample::resample_real(&audio, f64::from(rate), 8000.0, 3500.0, 4000.0);
-    let peak = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    if peak < 1e-4 {
-        bail!("{} is silent", file.display());
-    }
-    let gain = (0.8 / peak).min(31.6);
-    Ok(x.iter().map(|&v| (v * gain * 32767.0) as i16).collect())
+    decdsss_link::voice::speech_from_audio(&audio, f64::from(rate))
+        .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))
 }
 
 /// Writes 8 kHz speech as a WAV in `dir` under a name not already taken.

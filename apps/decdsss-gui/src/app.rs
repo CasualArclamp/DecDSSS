@@ -1,7 +1,9 @@
 // made by CasualArclamp
 //! The application window.
 
-use crate::engine::{Cmd, Config, Engine, PictureView, Shared, Source, SpectrumView, Transfer};
+use crate::engine::{
+    Cmd, Config, Engine, PictureView, Shared, Source, SpectrumView, Transfer, VoiceView,
+};
 use crate::prefs::Prefs;
 use crate::scope::{self, HeatTexture, col};
 use crate::tx::TxPanel;
@@ -31,6 +33,10 @@ pub struct Automation {
     pub open_tx: bool,
     /// Open the transmit window with this file chosen.
     pub tx_file: Option<PathBuf>,
+    /// Record speech in the transmit window for this many seconds from the
+    /// input named `mic` (part of its name), starting at launch.
+    pub record_for: Option<f64>,
+    pub mic: Option<String>,
     pub requested_at: Option<Instant>,
 }
 
@@ -54,6 +60,8 @@ pub struct App {
     waterfall_version: u64,
     heat: [HeatTexture; 3],
     tx: TxPanel,
+    /// `--record-for` has started its recording.
+    recording_started: bool,
     /// The last view of each station, kept after its segment ends so the card
     /// does not flicker away between segments: (profile, call, session).
     stations: std::collections::BTreeMap<(usize, String, u8), (ChannelView, Instant)>,
@@ -129,6 +137,7 @@ impl App {
             waterfall_version: u64::MAX,
             heat: Default::default(),
             tx,
+            recording_started: false,
             stations: Default::default(),
             pictures: Default::default(),
         }
@@ -511,7 +520,12 @@ impl App {
     }
 
     /// Pictures received or arriving, newest first, each as far as it has come.
-    fn pictures_panel(&mut self, ui: &mut Ui, pictures: &[Arc<PictureView>]) {
+    fn pictures_panel(
+        &mut self,
+        ui: &mut Ui,
+        pictures: &[Arc<PictureView>],
+        voices: &[Arc<VoiceView>],
+    ) {
         self.pictures
             .retain(|k, _| pictures.iter().any(|p| (p.call.clone(), p.session) == *k));
         egui::ScrollArea::horizontal().show(ui, |ui| {
@@ -519,7 +533,22 @@ impl App {
                 for p in pictures.iter().rev() {
                     self.picture_card(ui, p);
                 }
+                for v in voices.iter().rev() {
+                    if crate::voice::voice_card(ui, v) {
+                        self.play_speech(&v.speech);
+                    }
+                }
             });
+        });
+    }
+
+    /// Plays received speech on the output device chosen in the transmit window.
+    fn play_speech(&mut self, speech: &[i16]) {
+        let (device, rate) = self.tx.output(&self.devices_out);
+        self.engine.send(Cmd::Transmit {
+            audio: crate::voice::speech_to_audio(speech, rate),
+            rate,
+            device,
         });
     }
 
@@ -640,8 +669,20 @@ impl App {
 
     /// Screenshots and timed exits for unattended runs.
     fn automate(&mut self, ctx: &egui::Context) {
-        let Some(after) = self.auto.after else { return };
         let now = Instant::now();
+        if let Some(secs) = self.auto.record_for {
+            let t = now.duration_since(self.started).as_secs_f64();
+            if t >= 0.5 && !self.recording_started {
+                self.recording_started = true;
+                let hint = self.auto.mic.clone().unwrap_or_default();
+                self.tx.auto_record(&self.devices_in, &hint);
+            }
+            if t >= secs {
+                self.auto.record_for = None;
+                self.tx.auto_stop();
+            }
+        }
+        let Some(after) = self.auto.after else { return };
         if now.duration_since(self.started).as_secs_f64() < after {
             return;
         }
@@ -829,6 +870,7 @@ impl eframe::App for App {
             files,
             transfers,
             pictures,
+            voices,
             tx,
         ) = {
             let g = self.engine.shared.lock().unwrap();
@@ -849,6 +891,7 @@ impl eframe::App for App {
                 g.files.clone(),
                 g.transfers.clone(),
                 g.pictures.clone(),
+                g.voices.clone(),
                 g.tx.clone(),
             )
         };
@@ -863,6 +906,7 @@ impl eframe::App for App {
             files,
             transfers,
             pictures,
+            voices,
             tx,
             ..Shared::default()
         };
@@ -871,10 +915,10 @@ impl eframe::App for App {
         egui::Panel::bottom("log")
             .resizable(false)
             .show(ui, |ui| self.files_and_log(ui, &sh));
-        if !sh.pictures.is_empty() {
+        if !sh.pictures.is_empty() || !sh.voices.is_empty() {
             egui::Panel::bottom("pictures")
                 .resizable(false)
-                .show(ui, |ui| self.pictures_panel(ui, &sh.pictures));
+                .show(ui, |ui| self.pictures_panel(ui, &sh.pictures, &sh.voices));
         }
         egui::Panel::right("stations")
             .resizable(true)
@@ -912,7 +956,14 @@ impl eframe::App for App {
                 self.band_view(ui, &sh);
             });
         let devices_out = self.devices_out.clone();
-        self.tx
-            .show(ui.ctx(), &self.engine, &sh.tx, &devices_out, &self.out_dir);
+        let devices_in = self.devices_in.clone();
+        self.tx.show(
+            ui.ctx(),
+            &self.engine,
+            &sh.tx,
+            &devices_out,
+            &devices_in,
+            &self.out_dir,
+        );
     }
 }

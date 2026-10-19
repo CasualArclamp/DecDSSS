@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 decdsss-codec2 = { path = "../decdsss-codec2" }
 decdsss-core = { path = "../decdsss-core" }
+decdsss-dsp = { path = "../decdsss-dsp" }
 decdsss-fec = { path = "../decdsss-fec" }
 decdsss-phy = { path = "../decdsss-phy" }
 

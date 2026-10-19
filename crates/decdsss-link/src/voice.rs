@@ -47,6 +47,22 @@ pub fn default_codec(profile: Profile) -> Option<Codec> {
     }
 }
 
+/// 8 kHz mono speech from audio at `rate` (mono, ±1): resampled, and its peak brought
+/// to 80 % of full scale (at most 30 dB of gain, so a near-silent recording is
+/// refused rather than amplified into noise).
+pub fn speech_from_audio(audio: &[f32], rate: f64) -> Result<Vec<i16>, String> {
+    if audio.is_empty() {
+        return Err("no audio".into());
+    }
+    let x = decdsss_dsp::resample::resample_real(audio, rate, 8000.0, 3500.0, 4000.0);
+    let peak = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    if peak < 1e-4 {
+        return Err("it is silent".into());
+    }
+    let gain = (0.8 / peak).min(31.6);
+    Ok(x.iter().map(|&v| (v * gain * 32767.0) as i16).collect())
+}
+
 /// How a speech transmission is sent.
 #[derive(Clone, Debug)]
 pub struct VoiceSpec {
@@ -225,6 +241,20 @@ mod tests {
             codec,
             resync_s: 60.0,
         }
+    }
+
+    #[test]
+    fn speech_from_audio_resamples_and_levels() {
+        // A 1 kHz tone at 48 kHz, quiet: comes out at 8 kHz, peak 80 %.
+        let tone: Vec<f32> = (0..48_000)
+            .map(|i| 0.1 * (std::f32::consts::TAU * 1000.0 * i as f32 / 48_000.0).sin())
+            .collect();
+        let s = speech_from_audio(&tone, 48_000.0).unwrap();
+        assert_eq!(s.len(), 8000);
+        let peak = s.iter().map(|v| v.unsigned_abs()).max().unwrap();
+        assert!((26_000..26_400).contains(&peak), "{peak}");
+        assert!(speech_from_audio(&vec![0.0; 1000], 8000.0).is_err());
+        assert!(speech_from_audio(&[], 8000.0).is_err());
     }
 
     #[test]

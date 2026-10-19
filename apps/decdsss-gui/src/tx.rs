@@ -4,13 +4,18 @@
 
 use crate::engine::{Cmd, Engine, TxState};
 use crate::prefs::Prefs;
+use crate::voice::{Play, VoicePanel};
 use decdsss_audio::wav;
+use decdsss_codec2::Mode as Codec;
 use decdsss_core::{Mode, Profile};
 use decdsss_image::Source;
-use decdsss_link::{SendSpec, air_seconds, container, max_stream_bytes, segments};
+use decdsss_link::voice::{default_codec, render_speech};
+use decdsss_link::{
+    SendSpec, VoiceSpec, air_seconds, container, max_stream_bytes, plan_voice, segments,
+};
 use decdsss_phy::codes::normalise_call;
 use decdsss_phy::framing::{DEPTHS, Layout, PayloadType};
-use decdsss_phy::tx::{chips_to_audio, segment_chips};
+use decdsss_phy::tx::{chips_to_audio, segment_chips, vox_lead};
 use eframe::egui::{self, ColorImage, Context, RichText, TextureHandle, TextureOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -108,6 +113,15 @@ pub struct TxPanel {
     pic_job: Option<PicJob>,
     pic_result: Option<(PicKey, PicResult)>,
     pic_tex: Option<(PicKey, TextureHandle)>,
+    /// Send speech: a recording or a WAV, as Codec2.
+    voice: bool,
+    vp: VoicePanel,
+    /// The Codec2 mode; `None` is the profile's own (450 on 2.4 kHz, 700C on 3 kHz).
+    codec: Option<Codec>,
+    /// A 1 kHz tone ahead of the signal, to key a radio on VOX.
+    vox: bool,
+    /// What the speech summary was worked out for, and the summary.
+    voice_summary: Option<(String, Result<String, String>)>,
 }
 
 impl Default for TxPanel {
@@ -133,6 +147,11 @@ impl Default for TxPanel {
             pic_job: None,
             pic_result: None,
             pic_tex: None,
+            voice: false,
+            vp: VoicePanel::default(),
+            codec: None,
+            vox: false,
+            voice_summary: None,
         }
     }
 }
@@ -167,11 +186,170 @@ impl TxPanel {
         }
     }
 
+    /// Opens the window in voice mode and starts recording (for `--record-for`).
+    pub fn auto_record(&mut self, devices_in: &[String], hint: &str) {
+        self.voice = true;
+        self.open = true;
+        self.vp.record_on(devices_in, hint);
+    }
+
+    /// Stops a recording started by [`TxPanel::auto_record`].
+    pub fn auto_stop(&mut self) {
+        self.vp.finish();
+    }
+
     /// Opens the window with a file chosen, as if from the dialog.
     pub fn preload(&mut self, path: PathBuf) {
-        self.picture = is_picture(&path);
-        self.file = Some(path);
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+        {
+            // A WAV is speech to send.
+            self.voice = true;
+            if let Some(vm) = Mode::voice(self.profile) {
+                self.mode = vm.name();
+            }
+            self.vp.load(&path);
+        } else {
+            self.picture = is_picture(&path);
+            self.file = Some(path);
+        }
         self.open = true;
+    }
+
+    /// The output device chosen and the rate it runs at.
+    pub fn output(&self, devices_out: &[(String, u32)]) -> (Option<String>, u32) {
+        let device = if self.device == 0 {
+            None
+        } else {
+            devices_out.get(self.device - 1).map(|d| d.0.clone())
+        };
+        (device, self.device_rate(devices_out))
+    }
+
+    /// The transmission as speech will be sent.
+    fn voice_spec(&self) -> Option<VoiceSpec> {
+        Some(VoiceSpec {
+            profile: self.profile,
+            mode: Mode::from_name(&self.mode)?,
+            depth: self.depth,
+            call: "AA0AA".into(),
+            session: 0,
+            codec: self.codec.or_else(|| default_codec(self.profile))?,
+            resync_s: self.resync,
+        })
+    }
+
+    /// Plays the clip, as it is or as Codec2 will send it.
+    fn play_voice(&mut self, which: Play, engine: &Engine, devices_out: &[(String, u32)]) {
+        let Some(clip) = &self.vp.clip else { return };
+        let pcm: Vec<i16> = match which {
+            Play::Nothing => return,
+            Play::Clip => clip.pcm.clone(),
+            Play::AsSent => {
+                let Some(spec) = self.voice_spec() else {
+                    self.note = "this bandwidth is too narrow for voice".into();
+                    return;
+                };
+                match plan_voice(&spec, &clip.pcm) {
+                    Ok(p) => {
+                        let frames: Vec<Option<&[u8]>> = p
+                            .segments
+                            .iter()
+                            .flat_map(|s| s.frames.iter().map(|f| Some(f.as_slice())))
+                            .collect();
+                        render_speech(spec.codec, &frames).0
+                    }
+                    Err(e) => {
+                        self.note = e;
+                        return;
+                    }
+                }
+            }
+        };
+        let (device, rate) = self.output(devices_out);
+        engine.send(Cmd::Transmit {
+            audio: crate::voice::speech_to_audio(&pcm, rate),
+            rate,
+            device,
+        });
+    }
+
+    /// The speech controls and what sending the clip comes to.
+    fn voice_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices_in: &[String],
+        engine: &Engine,
+        devices_out: &[(String, u32)],
+    ) {
+        let play = self.vp.ui(ui, devices_in);
+        self.play_voice(play, engine, devices_out);
+        ui.horizontal(|ui| {
+            ui.label("Codec2");
+            let auto =
+                default_codec(self.profile).map_or("none".to_string(), |c| c.name().to_string());
+            ui.selectable_value(&mut self.codec, None, format!("automatic ({auto})"));
+            ui.selectable_value(&mut self.codec, Some(Codec::C450), "450");
+            ui.selectable_value(&mut self.codec, Some(Codec::C700C), "700C");
+        });
+        if let Some(vm) = Mode::voice(self.profile)
+            && vm.name() != self.mode
+        {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} is the voice mode for {}",
+                    vm.name(),
+                    self.profile
+                ));
+                if ui.button("Use it").clicked() {
+                    self.mode = vm.name();
+                }
+            });
+        }
+        // Compressing a minute of speech takes a few milliseconds: do it when
+        // the clip, the mode or the codec has changed, not every frame.
+        let Some(clip) = &self.vp.clip else { return };
+        let Some(spec) = self.voice_spec() else {
+            ui.colored_label(crate::scope::col::BAD, "500 Hz is too narrow for voice");
+            return;
+        };
+        let key = format!(
+            "{} {} {} {} {} {} {}",
+            clip.pcm.len(),
+            clip.pcm.first().copied().unwrap_or(0),
+            spec.profile,
+            spec.mode,
+            spec.depth,
+            spec.codec,
+            spec.resync_s
+        );
+        if self.voice_summary.as_ref().is_none_or(|(k, _)| *k != key) {
+            let result = plan_voice(&spec, &clip.pcm).map(|p| {
+                format!(
+                    "{:.1} s of speech → {} frames, {:.0} s of signal; the payload runs at {:.2}× the codec's rate{}",
+                    p.speech_seconds,
+                    p.frames,
+                    p.air_seconds,
+                    p.throughput_ratio,
+                    if p.throughput_ratio < 1.0 {
+                        " (slower than the speech: the other end waits for it all)"
+                    } else {
+                        ""
+                    }
+                )
+            });
+            self.voice_summary = Some((key, result));
+        }
+        match self.voice_summary.as_ref().map(|(_, r)| r) {
+            Some(Ok(s)) => {
+                ui.label(RichText::new(s).size(11.0));
+            }
+            Some(Err(e)) => {
+                ui.colored_label(crate::scope::col::BAD, e);
+            }
+            None => {}
+        }
     }
 
     pub fn remember(&self, p: &mut Prefs) {
@@ -326,10 +504,49 @@ impl TxPanel {
         }
     }
 
+    /// A lead for VOX, if asked for, ahead of the audio.
+    fn with_vox(&self, rate: u32, audio: Vec<f32>) -> Vec<f32> {
+        if !self.vox {
+            return audio;
+        }
+        let mut v = vox_lead(f64::from(rate), self.level, 0.4, 0.3);
+        v.extend(audio);
+        v
+    }
+
     fn build(&self, rate: u32) -> Result<Plan, String> {
-        let path = self.file.as_ref().ok_or("choose a file")?;
         let call = normalise_call(&self.call)
             .ok_or("enter your callsign (letters, digits and /, up to 9)")?;
+        let session = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            % 64) as u8;
+        if self.voice {
+            let clip = self
+                .vp
+                .clip
+                .as_ref()
+                .ok_or("record some speech or choose a WAV")?;
+            let mut spec = self
+                .voice_spec()
+                .ok_or("this bandwidth is too narrow for voice")?;
+            spec.call = call;
+            spec.session = session;
+            let plan = plan_voice(&spec, &clip.pcm)?;
+            let mut chips = Vec::new();
+            for s in &plan.segments {
+                chips.extend(segment_chips(s).ok_or("cannot build the header")?);
+            }
+            let audio = chips_to_audio(&chips, self.profile, f64::from(rate), self.level, 1.0, 1.0);
+            let audio = self.with_vox(rate, audio);
+            return Ok(Plan {
+                frames: plan.frames,
+                segments: plan.segments.len(),
+                seconds: audio.len() as f64 / f64::from(rate),
+                audio,
+            });
+        }
+        let path = self.file.as_ref().ok_or("choose a file")?;
         let mode = Mode::from_name(&self.mode).ok_or("choose a mode")?;
         let (name, data, ptype) = if self.picture {
             let key = self.wanted_key().ok_or("choose a picture")?;
@@ -352,10 +569,7 @@ impl TxPanel {
             mode,
             depth: self.depth,
             call,
-            session: (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs())
-                % 64) as u8,
+            session,
             ptype,
             resync_s: self.resync,
             parity: self.parity / 100.0,
@@ -367,6 +581,7 @@ impl TxPanel {
             chips.extend(segment_chips(s).ok_or("cannot build the header")?);
         }
         let audio = chips_to_audio(&chips, self.profile, f64::from(rate), self.level, 1.0, 1.0);
+        let audio = self.with_vox(rate, audio);
         Ok(Plan {
             frames: segs.iter().map(|s| s.frames.len()).sum(),
             segments: segs.len(),
@@ -381,9 +596,11 @@ impl TxPanel {
         engine: &Engine,
         state: &TxState,
         devices_out: &[(String, u32)],
+        devices_in: &[String],
         _out_dir: &Path,
     ) {
         self.drive_picture(ctx);
+        self.vp.tick(ctx);
         let mut open = self.open;
         egui::Window::new("Transmit")
             .open(&mut open)
@@ -398,9 +615,11 @@ impl TxPanel {
                     .size(11.0),
                 );
                 egui::Grid::new("txgrid").num_columns(2).show(ui, |ui| {
-                    ui.label("File");
+                    ui.label(if self.voice { "Speech" } else { "File" });
                     ui.horizontal(|ui| {
-                        if ui.button("Choose…").clicked()
+                        if self.voice {
+                            ui.label(RichText::new("record, or choose a WAV, below").weak());
+                        } else if ui.button("Choose…").clicked()
                             && let Some(p) = rfd::FileDialog::new()
                                 .add_filter("Pictures", &PICTURE_EXTENSIONS)
                                 .add_filter("All files", &["*"])
@@ -410,16 +629,38 @@ impl TxPanel {
                             self.picture = is_picture(&p);
                             self.file = Some(p);
                         }
-                        ui.label(
-                            self.file
-                                .as_ref()
-                                .and_then(|p| p.file_name())
-                                .map_or("none".into(), |n| n.to_string_lossy().into_owned()),
-                        );
+                        if !self.voice {
+                            ui.label(
+                                self.file
+                                    .as_ref()
+                                    .and_then(|p| p.file_name())
+                                    .map_or("none".into(), |n| n.to_string_lossy().into_owned()),
+                            );
+                        }
                     });
                     ui.end_row();
-                    ui.label("As a picture");
-                    ui.checkbox(&mut self.picture, "scale and compress to the air time");
+                    ui.label("Send as");
+                    ui.horizontal(|ui| {
+                        let mut kind = if self.voice {
+                            2
+                        } else {
+                            usize::from(self.picture)
+                        };
+                        ui.radio_value(&mut kind, 0, "file");
+                        ui.radio_value(&mut kind, 1, "picture")
+                            .on_hover_text("Scaled and compressed to the air time");
+                        ui.radio_value(&mut kind, 2, "voice")
+                            .on_hover_text("Speech, as Codec2");
+                        let was_voice = self.voice;
+                        self.picture = kind == 1;
+                        self.voice = kind == 2;
+                        if self.voice
+                            && !was_voice
+                            && let Some(vm) = Mode::voice(self.profile)
+                        {
+                            self.mode = vm.name();
+                        }
+                    });
                     ui.end_row();
                     if self.picture {
                         ui.label("Air time");
@@ -435,6 +676,10 @@ impl TxPanel {
                     }
                     ui.label("Callsign");
                     ui.text_edit_singleline(&mut self.call);
+                    ui.end_row();
+                    ui.label("VOX");
+                    ui.checkbox(&mut self.vox, "a tone ahead of the signal, to key the radio")
+                        .on_hover_text("0.4 s of 1 kHz and a pause, so the radio is transmitting before the preamble");
                     ui.end_row();
                     ui.label("Bandwidth");
                     ui.horizontal(|ui| {
@@ -466,12 +711,15 @@ impl TxPanel {
                     ui.label("Preamble every");
                     ui.add(egui::Slider::new(&mut self.resync, 15.0..=300.0).suffix(" s").logarithmic(true));
                     ui.end_row();
-                    ui.label("Coded frames");
-                    ui.add(egui::Slider::new(&mut self.parity, 0.0..=100.0).suffix(" % extra"));
-                    ui.end_row();
-                    ui.label("Passes");
-                    ui.add(egui::Slider::new(&mut self.repeat, 1..=5));
-                    ui.end_row();
+                    // Speech has no coded frames or passes: it goes out once, as it is.
+                    if !self.voice {
+                        ui.label("Coded frames");
+                        ui.add(egui::Slider::new(&mut self.parity, 0.0..=100.0).suffix(" % extra"));
+                        ui.end_row();
+                        ui.label("Passes");
+                        ui.add(egui::Slider::new(&mut self.repeat, 1..=5));
+                        ui.end_row();
+                    }
                     ui.label("Level");
                     ui.add(egui::Slider::new(&mut self.level, 0.02..=0.3));
                     ui.end_row();
@@ -506,6 +754,9 @@ impl TxPanel {
                 }
                 if self.picture {
                     self.picture_status(ui);
+                }
+                if self.voice {
+                    self.voice_section(ui, devices_in, engine, devices_out);
                 }
                 ui.separator();
                 ui.horizontal(|ui| {

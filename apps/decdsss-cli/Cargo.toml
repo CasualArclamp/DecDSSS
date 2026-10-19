@@ -15,7 +15,6 @@ path = "src/main.rs"
 [dependencies]
 decdsss-audio = { path = "../../crates/decdsss-audio" }
 decdsss-codec2 = { path = "../../crates/decdsss-codec2" }
-decdsss-dsp = { path = "../../crates/decdsss-dsp" }
 decdsss-core = { path = "../../crates/decdsss-core" }
 decdsss-chan = { path = "../../crates/decdsss-chan" }
 decdsss-image = { path = "../../crates/decdsss-image" }
