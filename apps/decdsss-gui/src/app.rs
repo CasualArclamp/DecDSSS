@@ -29,6 +29,8 @@ pub enum SourceKind {
     Device,
     Wav,
     Demo,
+    /// A KiwiSDR, straight off the network (no browser, no virtual cable).
+    Kiwi,
 }
 
 /// What the window shows: the receiver, the transmitter, or both side by side
@@ -74,6 +76,9 @@ pub struct Automation {
     pub tx_file: Option<PathBuf>,
     /// Open the transmit window set to send this text (a message; `cq` for a CQ call).
     pub tx_text: Option<String>,
+    /// Listen to this KiwiSDR (`--kiwi`), at this dial frequency, kHz (`--kiwi-freq`).
+    pub kiwi: Option<String>,
+    pub kiwi_freq: Option<f64>,
     /// With `tx_text` or `tx_file`: the profile, and for 500 Hz a slot, as `500@+500`.
     pub tx_band: Option<String>,
     /// Open the transmit window with the waterfall ID on.
@@ -109,6 +114,11 @@ pub struct App {
     engine: Engine,
     source: SourceKind,
     wav: Option<PathBuf>,
+    /// The KiwiSDR source: its address, the dial frequency (kHz, as typed) and
+    /// the sideband.
+    kiwi_addr: String,
+    kiwi_freq: String,
+    kiwi_lsb: bool,
     devices_in: Vec<String>,
     /// Output devices with the rate each runs at.
     devices_out: Vec<(String, u32)>,
@@ -330,10 +340,24 @@ impl App {
                     .unwrap_or(Plot::Delay)
             }),
         ];
+        let kiwi_addr = auto
+            .kiwi
+            .clone()
+            .or_else(|| prefs.get("kiwi_addr").map(String::from))
+            .unwrap_or_default();
+        let kiwi_freq = auto
+            .kiwi_freq
+            .map(|f| format!("{f:.3}"))
+            .or_else(|| prefs.get("kiwi_freq").map(String::from))
+            .unwrap_or_else(|| "7074.000".into());
+        let kiwi_lsb = prefs.get("kiwi_lsb") == Some("1");
         let mut app = App {
             engine: Engine::spawn(radio.clone()),
             source,
             wav,
+            kiwi_addr,
+            kiwi_freq,
+            kiwi_lsb,
             devices_in,
             devices_out,
             audio_hosts,
@@ -421,6 +445,26 @@ impl App {
                 None => return,
             },
             SourceKind::Demo => Source::Demo,
+            SourceKind::Kiwi => {
+                let Ok(freq_khz) = self.kiwi_freq.trim().parse::<f64>() else {
+                    self.engine.note(format!(
+                        "{:?} is not a frequency: give the dial frequency in kHz, e.g. 7074",
+                        self.kiwi_freq
+                    ));
+                    return;
+                };
+                // The Kiwi's owner sees this as the listener's name.
+                let ident = match self.prefs.get("call").filter(|c| !c.trim().is_empty()) {
+                    Some(c) => format!("DecDSSS {}", c.trim()),
+                    None => "DecDSSS".into(),
+                };
+                Source::Kiwi {
+                    address: self.kiwi_addr.trim().to_string(),
+                    freq_khz,
+                    lsb: self.kiwi_lsb,
+                    ident,
+                }
+            }
         };
         let bands: Vec<Band> = Band::ALL
             .iter()
@@ -442,6 +486,10 @@ impl App {
             if let Some(n) = self.devices_in.get(self.device_in.wrapping_sub(1)) {
                 self.prefs.set("device_in", n.clone());
             }
+            self.prefs.set("kiwi_addr", self.kiwi_addr.trim());
+            self.prefs.set("kiwi_freq", self.kiwi_freq.trim());
+            self.prefs
+                .set("kiwi_lsb", if self.kiwi_lsb { "1" } else { "0" });
             self.tx.remember(&mut self.prefs);
             self.prefs.save();
         }
@@ -484,11 +532,18 @@ impl App {
                     SourceKind::Device => "Sound card",
                     SourceKind::Wav => "WAV file",
                     SourceKind::Demo => "Demo signal",
+                    SourceKind::Kiwi => "KiwiSDR",
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.source, SourceKind::Device, "Sound card");
                     ui.selectable_value(&mut self.source, SourceKind::Wav, "WAV file");
                     ui.selectable_value(&mut self.source, SourceKind::Demo, "Demo signal");
+                    ui.selectable_value(&mut self.source, SourceKind::Kiwi, "KiwiSDR")
+                        .on_hover_text(
+                            "A KiwiSDR's audio straight off the network. Better than its web \
+                             page into a virtual cable: the browser drops and repeats bits of \
+                             audio, which a DSSS receiver sees as the signal jumping away.",
+                        );
                 });
             match self.source {
                 SourceKind::Device => {
@@ -536,6 +591,26 @@ impl App {
                             .logarithmic(true)
                             .text("× speed"),
                     );
+                }
+                SourceKind::Kiwi => {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.kiwi_addr)
+                            .desired_width(200.0)
+                            .hint_text("kiwi.example.org:8073"),
+                    )
+                    .on_hover_text(
+                        "The KiwiSDR's address: host, host:port, or its web address as the \
+                         browser shows it",
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.kiwi_freq)
+                            .desired_width(72.0)
+                            .hint_text("kHz"),
+                    )
+                    .on_hover_text("The dial frequency, kHz, as on a radio");
+                    ui.label("kHz");
+                    ui.selectable_value(&mut self.kiwi_lsb, false, "USB");
+                    ui.selectable_value(&mut self.kiwi_lsb, true, "LSB");
                 }
             }
         });

@@ -320,9 +320,16 @@ fn harmonic(n: usize) -> f64 {
 
 /// Measurement switch (environment `DECDSSS_NO_REWIND`, any value): no watch,
 /// no rewind, as before them. Read once.
-fn no_rewind() -> bool {
+pub(crate) fn no_rewind() -> bool {
     static NO_REWIND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *NO_REWIND.get_or_init(|| std::env::var_os("DECDSSS_NO_REWIND").is_some())
+}
+
+/// Measurement switch (environment `DECDSSS_NO_START_SLIP`): no search at a
+/// block's start (see `PayloadRx::check_start`). Read once.
+pub(crate) fn no_start_slip() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("DECDSSS_NO_START_SLIP").is_some())
 }
 
 /// How long the watch stays lost before it gives up and takes what there is as the
@@ -685,6 +692,15 @@ pub struct PayloadRx {
     /// The watch on the energy the fingers collect (see [`rewind`]); it runs on
     /// from block to block.
     watch: Watch,
+    /// Search for a slip once the block's first window is in, lost or not: the
+    /// first block's (the watch has nothing to compare it with yet, and a slip
+    /// in the header's last symbols or between it and the payload leaves the
+    /// whole payload at the wrong lag) and a block's after one that failed.
+    check_start: bool,
+    /// That search is under way (it is not a loss the watch saw): it looks
+    /// for a slip only, and the reacquisition is not started from it.
+    start_search: bool,
+    probing_start: bool,
     /// The last block's interleaved LLRs (kept for the tests).
     #[cfg(test)]
     pub last_llrs: Vec<f32>,
@@ -720,6 +736,9 @@ impl PayloadRx {
             eot_pending: None,
             fresh: true,
             watch: Watch::default(),
+            check_start: true,
+            start_search: false,
+            probing_start: false,
             #[cfg(test)]
             last_llrs: Vec::new(),
         })
@@ -940,6 +959,8 @@ impl PayloadRx {
             );
         }
         self.eot_probed = false;
+        self.check_start = (self.next_block == 0 || prepass) && !no_start_slip();
+        self.start_search = false;
         // A loss carried over from the last block: its symbols are gone, so
         // there is nothing to rewind to before this block's start.
         self.watch.restart_window();
@@ -1484,8 +1505,19 @@ impl PayloadRx {
                     return false;
                 }
                 wk.search = false;
-                if self.resync_csk(buf, wk, win) {
+                let at_start = std::mem::take(&mut self.start_search);
+                self.probing_start = at_start;
+                let rewound = self.resync_csk(buf, wk, win);
+                self.probing_start = false;
+                if rewound {
+                    if at_start {
+                        // What the watch settled to was the wrong lag's.
+                        self.watch.settled = None;
+                    }
                     continue;
+                }
+                if at_start {
+                    self.watch.lost = None;
                 }
             }
             if let Some((at, d, df)) = wk.slip
@@ -1495,6 +1527,19 @@ impl PayloadRx {
                 wk.t.freq += df;
                 wk.slip = None;
                 wk.slipped_at = Some(wk.s);
+                // The searcher's chunk starts again here: a chunk that straddles
+                // the slip has the signal at the old lag in its first part, and
+                // its profile could move the reference back there.
+                wk.tc = wk.t;
+                wk.s_lo = wk.s;
+                // A snapshot from here, with the slip taken: a later slip close
+                // after it rewinds to this, not to one from before this slip,
+                // which would undo it.
+                let snap = self.csk_snap(wk);
+                if wk.snaps.len() > rewind::SNAPS {
+                    wk.snaps.remove(1);
+                }
+                wk.snaps.push(snap);
             }
             let s = wk.s;
             wk.ts.push((wk.t, wk.shifted));
@@ -1625,9 +1670,13 @@ impl PayloadRx {
             wk.s += 1;
             self.live.symbol = wk.s;
             if wk.s > wk.replay_until && !no_rewind() {
-                // The decided code's power at the fingers; the noise from the
-                // other codes, times H_L: when the signal is gone the decided
-                // code is the largest of L noise powers.
+                // The decided code's power at the fingers, less the other codes'
+                // mean times H_L: when the signal is gone the decided code is the
+                // largest of L noise powers. Taken off symbol by symbol, not as a
+                // smoothed noise level: at a wrong lag a small alphabet's largest
+                // code still holds a third of the chips' energy (H_L/L at CSK8),
+                // and a noise level that follows slowly let that pass for signal,
+                // so a slip at CSK8 was never seen.
                 let (mut e, mut others) = (0.0f64, 0.0f64);
                 for f in 0..nf {
                     let row = &wk.w[at + f * l..at + (f + 1) * l];
@@ -1636,8 +1685,19 @@ impl PayloadRx {
                     others += (row.iter().map(|z| f64::from(z.norm_sqr())).sum::<f64>() - p)
                         / (l as f64 - 1.0);
                 }
-                match self.watch.push(e, h_l * others, win, wk.s, max_windows) {
+                let judged = self
+                    .watch
+                    .push(e - h_l * others, 0.0, win, wk.s, max_windows);
+                match judged {
                     Some(Judged::Locked) => {
+                        if std::mem::take(&mut self.check_start) {
+                            self.watch.lost = Some(rewind::Lost {
+                                since: wk.snaps[0].s,
+                                windows: 1,
+                            });
+                            self.start_search = true;
+                            wk.search = true;
+                        }
                         let snap = self.csk_snap(wk);
                         if wk.snaps.len() > rewind::SNAPS {
                             wk.snaps.remove(1);
@@ -1712,12 +1772,15 @@ impl PayloadRx {
         if wk.s == 0 {
             return false;
         }
-        let csk = |buf: &Buf, t: &Track, sc: &[Iq], lag: f64, u: &mut [Iq]| {
+        // The decided code's power less what noise alone would give the largest
+        // code: at a wrong lag a small alphabet's largest code still holds a good
+        // share of the chips' energy (about H_L/L of it, a third at CSK8), which
+        // the plain largest power counted as signal, so the old lag never looked
+        // empty after a slip and no slip was ever clean.
+        let h_l = harmonic(usize::from(self.header.mode.spread));
+        let csk = move |buf: &Buf, t: &Track, sc: &[Iq], lag: f64, u: &mut [Iq]| {
             despread(buf, t, sc, lag, u);
-            walsh_correlate(u)
-                .iter()
-                .map(|z| f64::from(z.norm_sqr()))
-                .fold(0.0, f64::max)
+            rewind::csk_excess(&walsh_correlate(u), h_l)
         };
         let span = (self.slip_span_from(lost.since, wk.s, win), wk.s);
         if let Some((k, d)) = self.find_slip(
@@ -1729,6 +1792,7 @@ impl PayloadRx {
             span,
             win,
             &csk,
+            true,
         ) {
             self.csk_rewind(wk, k);
             wk.slip = Some((k, d, 0.0));
@@ -1737,7 +1801,7 @@ impl PayloadRx {
             self.live.slips += 1;
             return true;
         }
-        if reacq::disabled() {
+        if reacq::disabled() || self.probing_start {
             return false;
         }
         let found = self.reacquire(
@@ -2073,9 +2137,20 @@ impl PayloadRx {
                     return false;
                 }
                 wk.search = false;
-                if self.resync_ds(buf, wk, win) {
+                let at_start = std::mem::take(&mut self.start_search);
+                self.probing_start = at_start;
+                let rewound = self.resync_ds(buf, wk, win);
+                self.probing_start = false;
+                if rewound {
+                    if at_start {
+                        // What the watch settled to was the wrong lag's.
+                        self.watch.settled = None;
+                    }
                     // Rewound: on from the snapshot.
                     continue;
+                }
+                if at_start {
+                    self.watch.lost = None;
                 }
             }
             if let Some((at, d, df)) = wk.slip
@@ -2088,6 +2163,19 @@ impl PayloadRx {
                 wk.t.freq += df;
                 wk.slip = None;
                 wk.slipped_at = Some(wk.s);
+                // The searcher's chunk starts again here: a chunk that straddles
+                // the slip has the signal at the old lag in its first part, and
+                // its profile could move the reference back there.
+                wk.tc = wk.t;
+                wk.s_lo = wk.s;
+                // A snapshot from here, with the slip taken: a later slip close
+                // after it rewinds to this, not to one from before this slip,
+                // which would undo it.
+                let snap = self.ds_snap(wk);
+                if wk.snaps.len() > rewind::SNAPS {
+                    wk.snaps.remove(1);
+                }
+                wk.snaps.push(snap);
             }
             let s = wk.s;
             wk.ts.push((wk.t, wk.shifted));
@@ -2253,6 +2341,14 @@ impl PayloadRx {
                 }
                 match self.watch.push(e, noise, win, wk.s, max_windows) {
                     Some(Judged::Locked) => {
+                        if std::mem::take(&mut self.check_start) {
+                            self.watch.lost = Some(rewind::Lost {
+                                since: wk.snaps[0].s,
+                                windows: 1,
+                            });
+                            self.start_search = true;
+                            wk.search = true;
+                        }
                         let snap = self.ds_snap(wk);
                         // The block's start stays; then the newest few.
                         if wk.snaps.len() > rewind::SNAPS {
@@ -2387,6 +2483,7 @@ impl PayloadRx {
         (from, to): (usize, usize),
         win: usize,
         energy_at: &EnergyAt,
+        clear_of_noise: bool,
     ) -> Option<(usize, f64)> {
         let l = usize::from(self.header.mode.spread);
         let nf = self.fingers.len().min(SLOTS);
@@ -2422,8 +2519,15 @@ impl PayloadRx {
         let symbols = (to - from) as f64;
         let settled = self.watch.settled.unwrap_or(0.0);
         let (d, got, here) = rewind::best_shift(&energy, lag0, step, &lags, reach)?;
-        if got < rewind::SLIP_RATIO * here
-            || got / symbols - self.watch.noise.unwrap_or(0.0) < rewind::SLIP_MIN * settled
+        // `clear_of_noise`: `energy_at` has taken the noise off already.
+        let noise_sym = if clear_of_noise {
+            0.0
+        } else {
+            self.watch.noise.unwrap_or(0.0)
+        };
+        if !rewind::significant(&energy, lags.len(), got)
+            || got < rewind::SLIP_RATIO * here.max(0.0)
+            || got / symbols - noise_sym < rewind::SLIP_MIN * settled
         {
             return None;
         }
@@ -2473,6 +2577,7 @@ impl PayloadRx {
             span,
             win,
             &ds,
+            false,
         ) {
             if debug_usize("DEBUG_REACQ").is_some() {
                 eprintln!(
@@ -2487,7 +2592,7 @@ impl PayloadRx {
             self.live.slips += 1;
             return true;
         }
-        if reacq::disabled() {
+        if reacq::disabled() || self.probing_start {
             return false;
         }
         let found = self.reacquire(

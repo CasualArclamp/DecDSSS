@@ -406,6 +406,63 @@ known-chip refinement starts at the step. A fade is left alone: holding the loop
 in it, as BinModem does, cost DS4 whole transmissions on moderate fading, because
 the loops were held at the start before they had settled.
 
+**Slips in the preamble and the header** (2026-10-20). Rory's listeners on other
+computers lost sync in the preamble and the header, listening to a KiwiSDR's web page
+played into VB-Cable: the browser bridges the Kiwi's clock and the sound card's with a
+buffer that runs dry or overflows, and the audio after that point arrives a few
+milliseconds early or late (seen in their videos: the preamble's A correlation gone
+after eight or nine periods with the signal still strong, a second candidate picking
+the same preamble up again, the header's Walsh peaks clean and then noise; the
+payload's delay profile peaking 6, 13 and 20 chips from the fingers at 3k, close to
+multiples of a 128-sample Web Audio block at 48 kHz, 6.4 chips, *derived*). The
+preamble and header had nothing to follow it with, and a few slips in a row also beat
+the payload's rewind. Now:
+
+- *The simulator slips* (`decdsss_chan::slip`, `sweep --slip-every SECS`): at
+  exponential gaps, 1 to 3 blocks of 128 samples are dropped or played as silence,
+  with even odds.
+- *Preamble* (`rx/preamble.rs`): when a strong preamble drops out (a period under −5
+  dB of the strongest), the period and, failing that, the next one are searched over
+  ±60 ms, a sample at a time, for A or B. A lag that holds half the strongest period's
+  power, with the old lag empty (under a quarter of it) and the new lag empty in the
+  period before (a path that was there all along, not a slip), moves the track. The
+  period the slip fell in stays out of the clock line, the delay profile and the
+  carrier steps; the line is fitted to the boundaries with the slips before each
+  taken off, and the header starts after all of them.
+- *Header* (`rx/header.rs`): the symbol loop keeps where it stood before each symbol
+  and runs the payload's watch on it (windows of a quarter second, four symbols at
+  least). On a loss, the symbols since are searched over ±60 ms on the fingers'
+  pattern, and a clean step rewinds the loop to the symbol it slipped at, with the
+  track moved, and takes the symbols again. The known-chip refinement after the
+  header decodes starts at the last slip (it fits one line).
+- *CSK's watch and search* take the decided code's power less H_L times the other
+  codes' mean, symbol by symbol. At a wrong lag a small alphabet's largest code still
+  holds about H_L/L of the chips' energy (a third at CSK8, *derived*), which a
+  smoothed noise level let pass for signal: no CSK8 slip was ever seen before.
+- *A search at the payload's start*: after the first window of the first block, and
+  of a block after one that failed, the slip search runs whether or not the watch saw
+  a loss (it has nothing to compare the first window with, and a slip at the end of
+  the header leaves the whole payload at the wrong lag). It never starts the
+  reacquisition (*Reacquisition*, below).
+- *Two slips close together*: a slip found is taken with a snapshot at the symbol it
+  is applied at. Without it a second slip rewound to a snapshot from before the
+  first, undid it, and the two were found and undone in turn for the rest of the
+  block; this alone took CSK64 ½ with a slip every 3 s from 31 % frames lost to 0.
+  The in-block path searcher also starts its chunk again at a slip (a chunk across
+  one shows the signal at the old lag too).
+- *Noise is not a slip*: a shift is taken only if what it collects stands 8 robust
+  standard deviations (1.4826 MAD over the lags searched) above their median.
+  Near threshold the watch dips by chance, and the best of a thousand noise lags had
+  been taken for the signal: DS64 ½ at 3 dB Eb/N0 decoded 8 headers of 24, against 22
+  before the header search, until this went in.
+
+Switches for measuring: `DECDSSS_NO_PREAMBLE_SLIP`, `DECDSSS_NO_HEADER_SLIP`,
+`DECDSSS_NO_START_SLIP` (and `DECDSSS_NO_REWIND` as before). One thing tried and
+taken out: requiring both B periods to carry a tenth of the strongest period's power
+before the preamble may end (so that a preamble that slips away into noise does not
+look like A then B). On moderate fading a B period is that far down often enough to
+cost DS8 ½ seven headers in 32 at 12 dB; the searches make it unnecessary.
+
 **`dsc` blocks** (`rx/payload.rs`, the DS-PSK path with `DsWork::cdm`). Every
 symbol is despread once per finger, as for DS-PSK, and correlated twice: with
 Walsh code 0 (the pilot; the plain sum) and with code 1 (the data). The pilot is
@@ -863,6 +920,26 @@ so match by a unique part of the name; a name saved under one API is matched to 
 other's by prefix. Playback sits 120 ms behind the renderer (`OutputStream::drain` waits
 it out before the key is let go).
 
+**KiwiSDR** (`crates/decdsss-kiwi`; GUI SOURCE *KiwiSDR*, CLI `rx --kiwi HOST --freq
+KHZ [--lsb] [--save F.wav]`). The Kiwi's own audio stream over WebSocket, with no
+browser and no virtual cable: the samples arrive as the Kiwi made them, on its clock,
+at the rate it states (`MSG sample_rate`, 11 998.896 and 11 998.996 Hz from the two
+Kiwis tried, *measured*; the receiver runs at that rate), and a frame missing from
+the sequence numbers is put back as silence of its own length, so nothing after it
+moves. Written from the KiwiSDR server's source (jks-prv/Beagle_SDR_GPS: `rx_server.cpp`,
+`rx_sound.cpp`, `rx_sound_cmd.cpp`, `rx_cmd.cpp`); kiwiclient carries no licence, so
+nothing is copied from it. A minimal WebSocket client of our own (`ws.rs`: the upgrade,
+masked text frames out, frames in, no TLS: a Kiwi serves `ws://`), IMA ADPCM decoding
+for a Kiwi that compresses anyway (DecDSSS asks it not to), USB or LSB with a 100 to
+3600 Hz passband (every band with the search's margin), the Kiwi's AGC. It identifies
+itself honestly: the `/<timestamp>/SND` path of a program, as kiwirecorder uses, and
+`ident_user` "DecDSSS CALL". A Kiwi may limit how many programs connect (its owner's
+`ext_api_nchans`); it then answers `too_busy`, which the window logs. Checked
+2026-10-20: a stand-in Kiwi in the tests (sequence gap filled); live, 15 s from
+vk6seg.proxy.kiwisdr.com with nothing missing, its audio flat from 150 to 3500 Hz and
+57 to 70 dB down above 3.8 kHz (*measured*), and sdr.ironstonerange.com streamed 20 s,
+then on a second connection refused us as a program (`too_busy`).
+
 **Linux audio:** cpal reaches the sound card through PipeWire or ALSA. The `pipewire` feature of `decdsss-audio`
 (default on in both apps) adds the PipeWire host, which cpal then prefers when a
 PipeWire daemon is running; with no daemon, or built `--no-default-features`, it
@@ -1020,7 +1097,8 @@ text, a choice of size or speed (a slow waterfall, such as WSJT-X's, needs a row
 | `decdsss-dsp` | RRC, pulse shaper, resampler, decimator, matched filter, interpolation, Hilbert, a seeded RNG. |
 | `decdsss-fec` | QC-LDPC (design, encoder, layered min-sum), the interleaver, CRCs. |
 | `decdsss-phy` | Codes, framing, the transmitter, the receiver (search, preamble, header, payload, refinement), the end-to-end simulator. |
-| `decdsss-chan` | Channel simulator: AWGN, carrier offset and drift, clock error, Watterson fading with the CCIR presets. |
+| `decdsss-chan` | Channel simulator: AWGN, carrier offset and drift, clock error, Watterson fading with the CCIR presets; audio that slips (blocks dropped or silent). |
+| `decdsss-kiwi` | A KiwiSDR as an audio source: its SND stream over a minimal WebSocket client. |
 | `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes, air time and byte budget), voice framing, receive-side assembly (the readable front of a file still arriving, speech so far). |
 | `decdsss-codec2` | Codec2 (vendored C core, LGPL-2.1) with a safe wrapper: modes 3200 … 450, bit-exact frame packing. |
 | `decdsss-image` | Pictures: load, scale and compress to a byte budget as a progressive JPEG; decode one that is cut short. |
@@ -1279,10 +1357,63 @@ fading was the track losing the signal for good after a deep fade, which the
 search now finds again. What is left of it (DS4 about 3 % on moderate fading at
 any SNR) is still to be found.
 
-Not covered: a slip in the preamble or the header (the header is one codeword;
-its CSK256 symbols are long), one larger than 60 ms, and one in the last
+Not covered then: a slip in the preamble or the header (followed since
+2026-10-20, *Slips from a live web SDR*), one larger than 60 ms, and one in the last
 quarter second or so of a block, which costs that block (a block cannot be
 rewound once decoded).
+
+### Slips from a live web SDR (2026-10-20)
+
+The changes under *Slips in the preamble and the header*, measured with `decdsss sweep
+--slip-every SECS` (1 to 3 blocks of 128 samples at 48 kHz dropped or silent, even odds,
+exponential gaps), 2.4 kHz unless marked, depth 4 and two blocks (CSK8 on 3k: depth 1,
+six blocks), offset 5 Hz, 24 transmissions a point; headers decoded and frames lost.
+All *measured*.
+
+Before, at 14 dB Eb/N0 on AWGN (one build, from before any of the changes):
+
+| Mode | no slips | a slip every 8 s | every 3 s |
+|---|---|---|---|
+| CSK8 ¾ (3k, 16 tx) | 16/16, 0 % | 14/16, 14.6 % | 8/16, 80.2 % |
+| DS8 ½ (16 tx) | 16/16, 0 % | 14/16, 12.5 % | 8/16, 53.1 % |
+
+After (merged with main ae62abf, its reacquisition included):
+
+| Mode | every 8 s: 5 / 14 dB (CSK8: 7 / 14) | every 3 s: 5 / 14 dB |
+|---|---|---|
+| DS4 ⅔ (6 / 14 dB) | 0 / 0 % | 6.3 / 0 % (23/24 headers at 6) |
+| DS8 ½ | 0 / 0 % | 0 / 0 % |
+| DS64 ½ | 4.2 / 0 % | 16.7 / 0 % (22/24 at 5) |
+| CSK64 ½ | 4.2 / 2.1 % | 8.3 / 0 % |
+| CSK8 ¾ (3k) | 0.7 / 0 % | 9.7 / 4.9 % (23/24) |
+| BCSK64 ½ | 2.1 / 0 % | 4.2 / 0 % |
+| DS1 ½ | 8.9 / 4.2 % | 46.9 / 43.2 % |
+| DS8 ½ (500, 16 tx) | 11.7 / 0 % | 39.1 / 0 % |
+
+On moderate fading at 12 dB, the same build with the three new searches switched off
+(`DECDSSS_NO_PREAMBLE_SLIP`, `_HEADER_SLIP`, `_START_SLIP`; the CSK watch and the
+snapshot fix cannot be switched, so this is better than before them) against on:
+
+| Mode | every 8 s, off → on | every 3 s, off → on |
+|---|---|---|
+| DS8 ½ | 18/24, 27.1 % → 24/24, 2.1 % | 10/24, 62.5 % → 20/24, 20.8 % |
+| CSK64 ½ | 18/24, 60.4 % → 22/24, 35.4 % | 8/24, 85.9 % → 18/24, 45.8 % |
+
+What is left: DS1 (the payload's slip watch is blind at SF 2 and 1, *DS2 and DS1*: its
+energy statistic ignores the scrambler's alignment there; a fix exists on an unmerged
+branch); 500 Hz near threshold, where a 128-sample slip is about a chip (1.07 chips at
+400 chip/s, *derived*), close to the loop's own reach; and slips during a fade, which
+the search cannot see until the signal comes back. A 128-sample slip every 3 s is
+harsher than the videos showed (a few a minute). The KiwiSDR source (*Radio I/O*) has
+none of these, where a Kiwi lets it connect.
+
+With no slips nothing moved: the full receiver against main ae62abf on the same
+sweeps (`--offset 5 --clock-ppm 10`), AWGN near threshold for DS4 ⅔, DS8 ½, DS64 ½,
+CSK64 ½, CSK8 ¾ (3k), BCSK64 ½, DS1 ½ and DS8 ½ on 500, moderate fading for DS4 ⅔,
+DS8 ½, CSK64 ½ and CSK8 ¾, good fading for DS16 ¾, flutter for CSK64 ½: the same
+frames to within three in 256 either way (DS16 ¾ good: 31 → 32 headers, 198 → 202
+frames; DS64 ½ at 2 dB: 4 → 3 headers, none of either decoding a frame). The 27
+on-air recordings in `reference/` decode the same headers and frames.
 
 ### DS2 and DS1 (2026-10-20)
 

@@ -27,12 +27,20 @@ const SEARCH_COLS: usize = 192;
 /// Log lines kept.
 const LOG_MAX: usize = 400;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Source {
     /// A sound card or virtual cable; `None` is the system default input.
     Device(Option<String>),
     Wav(PathBuf),
     Demo,
+    /// A KiwiSDR's audio stream: its address, the dial frequency (kHz), the
+    /// sideband, and the name its owner sees.
+    Kiwi {
+        address: String,
+        freq_khz: f64,
+        lsb: bool,
+        ident: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +243,11 @@ impl Engine {
         }
     }
 
+    /// A line for the log, from the window.
+    pub fn note(&self, line: String) {
+        log(&self.shared, line);
+    }
+
     pub fn send(&self, c: Cmd) {
         let _ = self.cmd.send(c);
     }
@@ -252,6 +265,12 @@ impl Drop for Engine {
 /// An audio source the worker reads.
 enum Reader {
     Device(Box<InputStream>),
+    /// A KiwiSDR stream, and how much of its notes and gaps is in the log.
+    Kiwi {
+        stream: Box<decdsss_kiwi::KiwiStream>,
+        notes: usize,
+        gaps: u64,
+    },
     /// Samples, the position, and when the run started.
     Memory {
         audio: Vec<f32>,
@@ -630,6 +649,38 @@ fn start(shared: &Arc<Mutex<Shared>>, cfg: &Config) -> Result<Run, String> {
                 p.display().to_string(),
             )
         }
+        Source::Kiwi {
+            address,
+            freq_khz,
+            lsb,
+            ident,
+        } => {
+            let mut k = decdsss_kiwi::Config::new(address, *freq_khz).map_err(|e| e.to_string())?;
+            k.lsb = *lsb;
+            k.ident = ident.clone();
+            log(
+                shared,
+                format!("Connecting to the KiwiSDR at {}:{}…", k.host, k.port),
+            );
+            let stream = decdsss_kiwi::KiwiStream::open(&k, Duration::from_secs(10))
+                .map_err(|e| e.to_string())?;
+            let rate = stream.sample_rate();
+            let what = format!(
+                "KiwiSDR {}:{}, {freq_khz:.3} kHz {} ({rate:.3} Hz)",
+                k.host,
+                k.port,
+                if *lsb { "LSB" } else { "USB" }
+            );
+            (
+                Reader::Kiwi {
+                    stream: Box::new(stream),
+                    notes: 0,
+                    gaps: 0,
+                },
+                rate,
+                what,
+            )
+        }
         Source::Demo => {
             let d = demo::make();
             (
@@ -715,6 +766,38 @@ fn step(
                 let ch = input.format().channels;
                 decdsss_audio::channels::downmix_to_mono(&input.read(frames), ch)
             }
+        }
+        Reader::Kiwi {
+            stream,
+            notes,
+            gaps,
+        } => {
+            let st = stream.status();
+            for n in &st.notes[*notes..] {
+                log(shared, format!("KiwiSDR: {n}"));
+            }
+            *notes = st.notes.len();
+            if st.gap_samples > *gaps {
+                log(
+                    shared,
+                    format!(
+                        "KiwiSDR: {:.0} ms of audio never came (put back as silence, so nothing \
+                         after it moved)",
+                        1e3 * (st.gap_samples - *gaps) as f64 / r.rate
+                    ),
+                );
+                *gaps = st.gap_samples;
+            }
+            if stream.is_dead() {
+                let why = stream.status().error.unwrap_or_default();
+                log(shared, format!("The KiwiSDR stream stopped: {why}"));
+                return false;
+            }
+            let audio = stream.read();
+            if audio.is_empty() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            audio
         }
         Reader::Memory {
             audio,

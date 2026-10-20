@@ -5,7 +5,8 @@
 
 use super::despread::{Track, csk_bit_llrs, despread, ln_i0, walsh_correlate, walsh_one};
 use super::frontend::Buf;
-use super::preamble::PreambleLock;
+use super::preamble::{DelayProfile, PreambleLock};
+use super::rewind::{self, Judged, Watch};
 use crate::codes::{CALL_CODE, Scrambler};
 use crate::framing::{HEADER_INFO_BITS, Header};
 use crate::tx::{header_bits, header_chips_l, header_len, header_symbols};
@@ -81,6 +82,7 @@ pub fn header_need(lock: &PreambleLock, alphabet: usize) -> f64 {
 }
 
 /// One header symbol as the demodulator saw it.
+#[derive(Clone)]
 struct Symbol {
     /// The Walsh correlations on each finger: `per_finger[finger][code]`.
     per_finger: Vec<Vec<Iq>>,
@@ -95,11 +97,39 @@ struct Symbol {
 /// The timing loop's proportional and integral gains, per symbol.
 const KP: f64 = 0.15;
 const KI: f64 = 0.01;
+/// The slip watch judges at least this many header symbols at a time (with
+/// [`rewind::WATCH_S`]). A header symbol is long (27 ms, CSK64 on 3k, to 640
+/// ms, CSK256 on 500), so a quarter second may hold only one or two; four keep
+/// a window's level steadier near threshold, and a slip is still found before
+/// it has spoilt much of a header only 64 to 86 symbols long.
+const WATCH_MIN_SYMBOLS: usize = 4;
+/// Slips one header may follow.
+const MAX_SLIPS: usize = 12;
+
+/// Measurement switch (environment `DECDSSS_NO_HEADER_SLIP`): the header
+/// follows no slips. Read once.
+fn no_header_slip() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("DECDSSS_NO_HEADER_SLIP").is_some())
+}
+
+/// Where the loop stood before a symbol, for a rewind.
+#[derive(Clone, Copy)]
+struct Start {
+    t: Track,
+    err_int: f64,
+    freq_acc: Iq,
+}
 
 /// The per-symbol part of the header demodulator: despreads a CSK symbol on
 /// every finger, decides its code, steers the timing from the decision and
 /// gathers the carrier's drift. [`demod_header`] runs it over the whole header
 /// at once; [`HeaderWatch`] runs it as the chips come in, for a display.
+///
+/// It also follows slips of the audio (see [`rewind`]): a watch on the energy
+/// the fingers collect, a search over ±[`rewind::SLIP_REACH_S`] on the symbols
+/// since the loss, and a rewind to the symbol it slipped at, from which the
+/// symbols are taken again on the moved track.
 struct SymbolLoop {
     hl: usize,
     nsym: usize,
@@ -113,8 +143,21 @@ struct SymbolLoop {
     peak_prev: Option<Iq>,
     /// Σ peak·conj(previous peak): its angle is the carrier's turn a symbol.
     freq_acc: Iq,
-    /// Symbols done.
-    done: usize,
+    /// Symbols so far, and where the loop stood before each.
+    syms: Vec<Symbol>,
+    starts: Vec<Start>,
+    watch: Watch,
+    win: usize,
+    max_windows: usize,
+    /// H_L: the mean of the largest of L unit exponentials, the noise the
+    /// decided code collects when there is no signal.
+    h_l: f64,
+    chip_rate: f64,
+    /// After a rewind, the symbols up to here come again and the watch has
+    /// judged them already.
+    replay_until: usize,
+    /// Each slip followed: the symbol it slipped at and the move, chips.
+    slips: Vec<(usize, f64)>,
 }
 
 impl SymbolLoop {
@@ -127,9 +170,14 @@ impl SymbolLoop {
             .max_by(|a, b| a.1.power.total_cmp(&b.1.power))
             .map(|(i, _)| i)
             .unwrap_or(0);
+        let nsym = header_symbols(alphabet);
+        let chip_rate = rate / lock.step;
+        let t_sym = alphabet as f64 / chip_rate;
+        let win = ((rewind::WATCH_S / t_sym).ceil() as usize).max(WATCH_MIN_SYMBOLS);
+        let max_windows = ((rewind::LOST_MAX_S / (win as f64 * t_sym)).ceil() as usize).max(2);
         SymbolLoop {
             hl: alphabet,
-            nsym: header_symbols(alphabet),
+            nsym,
             fingers,
             main,
             max_lag,
@@ -144,21 +192,42 @@ impl SymbolLoop {
             err_int: 0.0,
             peak_prev: None,
             freq_acc: Iq::new(0.0, 0.0),
-            done: 0,
+            syms: Vec::with_capacity(nsym),
+            starts: Vec::with_capacity(nsym),
+            watch: Watch::default(),
+            win,
+            max_windows,
+            h_l: (1..=alphabet).map(|k| 1.0 / k as f64).sum(),
+            chip_rate,
+            replay_until: 0,
+            slips: Vec::new(),
         }
+    }
+
+    /// Symbols done.
+    fn done(&self) -> usize {
+        self.syms.len()
     }
 
     /// True if there is a symbol left and its chips (and the fingers' and the
     /// interpolator's reach past them) are all in `buf`: the margin
     /// [`header_need`] allows for the whole header, a symbol at a time.
     fn ready(&self, buf: &Buf) -> bool {
-        self.done < self.nsym
+        self.done() < self.nsym
             && self.t.pos + (self.hl as f64 + self.max_lag + 6.0) * self.t.step + 16.0
                 <= buf.end() as f64
     }
 
+    /// Takes the next symbol and returns it. After it the loop may rewind to
+    /// an earlier symbol (a slip was found), so [`SymbolLoop::done`] can go
+    /// down; the symbols are then taken again.
     fn next(&mut self, buf: &Buf) -> Symbol {
-        let (hl, s) = (self.hl, self.done);
+        let (hl, s) = (self.hl, self.done());
+        self.starts.push(Start {
+            t: self.t,
+            err_int: self.err_int,
+            freq_acc: self.freq_acc,
+        });
         let sc = &self.scr[s * hl..(s + 1) * hl];
         let mut u = vec![Iq::new(0.0, 0.0); hl];
         let mut per_finger = Vec::with_capacity(self.fingers.len());
@@ -197,14 +266,111 @@ impl SymbolLoop {
         }
         self.peak_prev = Some(peak);
         self.t.advance(hl);
-        self.done += 1;
-        Symbol {
+        // The watch: the decided code's power at the fingers less the other
+        // codes' mean times H_L (the largest of L noise powers), symbol by
+        // symbol as in the payload's CSK watch.
+        let (mut energy, mut others) = (0.0f64, 0.0f64);
+        for wf in &per_finger {
+            let p = f64::from(wf[m].norm_sqr());
+            energy += p;
+            others +=
+                (wf.iter().map(|z| f64::from(z.norm_sqr())).sum::<f64>() - p) / (hl as f64 - 1.0);
+        }
+        let sym = Symbol {
             per_finger,
             power,
             code: m,
             early: e,
             late: l,
+        };
+        self.syms.push(sym.clone());
+        let n = self.done();
+        if n > self.replay_until && !super::payload::no_rewind() && !no_header_slip() {
+            let judged = self.watch.push(
+                energy - self.h_l * others,
+                0.0,
+                self.win,
+                n,
+                self.max_windows,
+            );
+            if matches!(judged, Some(Judged::Lost | Judged::StillLost)) {
+                self.resync(buf);
+            }
         }
+        sym
+    }
+
+    /// The watch saw the signal go: search the symbols since for a slip, and
+    /// on one, rewind to it with the track moved.
+    fn resync(&mut self, buf: &Buf) {
+        let Some(lost) = self.watch.lost else {
+            return;
+        };
+        let to = self.done();
+        let from = lost.since.min(to - 1);
+        let hl = self.hl;
+        let lags: Vec<f64> = self.fingers.iter().map(|f| f.lag).collect();
+        let reach = rewind::SLIP_REACH_S * self.chip_rate;
+        let step = DelayProfile::LAG_STEP;
+        let (lmin, lmax) = lags
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        let lag0 = lmin - reach;
+        let nlags = ((lmax + reach - lag0) / step).round() as usize + 1;
+        let mut u = vec![Iq::new(0.0, 0.0); hl];
+        let (starts, scr, h_l) = (&self.starts, &self.scr, self.h_l);
+        // Symbol `s` at `lag` chips from where it was taken.
+        let mut at = |s: usize, lag: f64| {
+            despread(buf, &starts[s].t, &scr[s * hl..(s + 1) * hl], lag, &mut u);
+            rewind::csk_excess(&walsh_correlate(&u), h_l)
+        };
+        let mut energy = vec![0.0f64; nlags];
+        for s in from..to {
+            for (i, e) in energy.iter_mut().enumerate() {
+                *e += at(s, lag0 + i as f64 * step);
+            }
+        }
+        let Some((d, got, here)) = rewind::best_shift(&energy, lag0, step, &lags, reach) else {
+            return;
+        };
+        let symbols = (to - from) as f64;
+        let settled = self.watch.settled.unwrap_or(0.0);
+        if got < rewind::SLIP_RATIO * here.max(0.0)
+            || got / symbols < rewind::SLIP_MIN * settled
+            || !rewind::significant(&energy, lags.len(), got)
+        {
+            return;
+        }
+        // Where it slipped: from a window before the loss on.
+        let lo = from.saturating_sub(self.win);
+        let (mut old, mut new) = (Vec::new(), Vec::new());
+        for s in lo..to {
+            old.push(lags.iter().map(|&g| at(s, g)).sum::<f64>());
+            new.push(lags.iter().map(|&g| at(s, g + d)).sum::<f64>());
+        }
+        let split = rewind::slip_at(&old, &new);
+        // The excess is already clear of the noise.
+        if !rewind::is_clean_slip(&old, &new, split, self.win, 0.0) {
+            return;
+        }
+        let k = lo + split;
+        // Slips come in order, and a header that keeps slipping is not worth
+        // following round in circles.
+        if self.slips.last().is_some_and(|&(j, _)| k < j) || self.slips.len() >= MAX_SLIPS {
+            return;
+        }
+        let st = self.starts[k];
+        self.t = st.t;
+        self.t.pos += d * self.t.step;
+        self.err_int = st.err_int;
+        self.peak_prev = None;
+        self.freq_acc = st.freq_acc;
+        self.syms.truncate(k);
+        self.starts.truncate(k);
+        self.replay_until = self.replay_until.max(to);
+        self.slips.push((k, d));
+        self.watch.lost = None;
+        self.watch.restart_window();
     }
 
     /// The track at the end of the header, its carrier moved half way to the
@@ -228,15 +394,28 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64, alphabet: usize) 
         return HeaderOutcome::NeedMore(need.ceil() as i64);
     }
     let mut lp = SymbolLoop::new(lock, rate, alphabet);
-    // W[symbol][finger] = the `hl` correlations.
-    let mut w: Vec<Vec<Vec<Iq>>> = Vec::with_capacity(nsym);
-    let mut decisions = Vec::with_capacity(nsym);
-    for _ in 0..nsym {
-        let s = lp.next(buf);
-        decisions.push(s.code);
-        w.push(s.per_finger);
+    while lp.done() < nsym {
+        lp.next(buf);
     }
     let mut t = lp.end_track();
+    // Where the known-chip refinement starts: after the last slip (it fits one
+    // line), on the track the symbols were taken from there.
+    let (from_sym, t_from) = match lp.slips.last() {
+        Some(&(k, _)) => (k, lp.starts[k].t),
+        None => (
+            0,
+            Track {
+                pos: lock.header_start,
+                step: lock.step,
+                freq: lock.freq_hz,
+                phase: 0.0,
+                rate,
+            },
+        ),
+    };
+    // W[symbol][finger] = the `hl` correlations.
+    let decisions: Vec<usize> = lp.syms.iter().map(|s| s.code).collect();
+    let w: Vec<Vec<Vec<Iq>>> = lp.syms.into_iter().map(|s| s.per_finger).collect();
     let (fingers, main) = (lp.fingers, lp.main);
 
     // Per-finger noise and amplitude from the decided symbols.
@@ -288,16 +467,14 @@ pub fn demod_header(buf: &Buf, lock: &PreambleLock, rate: f64, alphabet: usize) 
     let mut fingers = fingers;
     if let Some(known) = header_chips_l(&header, hl) {
         let t0 = Track {
-            pos: lock.header_start,
-            step: lock.step,
-            freq: lock.freq_hz,
             phase: 0.0,
-            rate,
+            ..t_from
         };
+        let known = &known[from_sym * hl..];
         let cr = rate / super::frontend::SPS as f64;
         let seg = super::refine::segment_chips(cr);
-        if let Some(r) = super::refine::refine(buf, &t0, &known, fingers[main].lag, seg, 300e-6) {
-            let (f, shift) = super::refine::tail_fingers(buf, &r, &t0, &known, seg);
+        if let Some(r) = super::refine::refine(buf, &t0, known, fingers[main].lag, seg, 300e-6) {
+            let (f, shift) = super::refine::tail_fingers(buf, &r, &t0, known, seg);
             fingers = f;
             t.pos = r.pos_end + shift * r.step;
             t.step = r.step;
@@ -390,7 +567,7 @@ impl HeaderWatch {
         while self.lp.ready(buf) {
             let s = self.lp.next(buf);
             let v = &mut self.view;
-            v.done = self.lp.done;
+            v.done = self.lp.done();
             let z = s.per_finger[self.lp.main][s.code];
             let a = z.norm();
             // Rust note: `if let Some(p) = self.prev` copies the `Iq` out (it is

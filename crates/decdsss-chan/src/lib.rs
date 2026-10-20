@@ -6,7 +6,9 @@
 //! 2. Watterson HF fading: two equal-power Rayleigh paths with Gaussian
 //!    Doppler spectra (CCIR Rec. 520 / ITU-R F.1487 presets);
 //! 3. frequency offset and linear drift (SSB mistuning, Doppler);
-//! 4. white Gaussian noise at a stated SNR in a stated bandwidth.
+//! 4. white Gaussian noise at a stated SNR in a stated bandwidth;
+//!
+//! and, separately ([`slip`]), the listener's own audio path skipping blocks.
 
 use decdsss_dsp::hilbert::analytic;
 use decdsss_dsp::interp::cubic;
@@ -182,9 +184,84 @@ pub fn tap_process(n: usize, fs: f64, spread_hz: f64, rng: &mut Rng) -> Vec<Iq> 
         .collect()
 }
 
+/// Audio that skips, as a live stream through a browser and a virtual cable does
+/// (a KiwiSDR or WebSDR web client playing into VB-Cable): now and then a few
+/// blocks are lost, or silence is played where they should be, so the signal
+/// after that point arrives early or late by whole blocks. Both happen when two
+/// sound clocks are bridged by a buffer that runs dry or overflows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slips {
+    /// Mean time between slips, s (the gaps are exponential).
+    pub every_s: f64,
+    /// Samples a block (128: a Web Audio render quantum).
+    pub block: usize,
+    /// Each slip is 1 to `max_blocks` blocks, early or late with equal odds.
+    pub max_blocks: usize,
+}
+
+/// Where a slip happened in the output of [`slip`], and by how much: samples
+/// of silence inserted (positive) or input samples dropped (negative).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlipAt {
+    pub at: usize,
+    pub samples: i64,
+}
+
+/// Puts `audio` through a stream that skips as `s` says. Returns the audio and
+/// the slips made.
+pub fn slip(audio: &[f32], fs: f64, s: Slips, seed: u64) -> (Vec<f32>, Vec<SlipAt>) {
+    let mut rng = Rng::new(seed ^ 0x5115_0000);
+    let mut out = Vec::with_capacity(audio.len() + audio.len() / 50);
+    let mut made = Vec::new();
+    let mut i = 0usize;
+    loop {
+        // Exponential gap; 1 − u is in (0, 1], so its log is finite.
+        let gap = (-(1.0 - rng.uniform()).ln() * s.every_s * fs) as usize;
+        let end = (i + gap.max(1)).min(audio.len());
+        out.extend_from_slice(&audio[i..end]);
+        i = end;
+        if i >= audio.len() {
+            break;
+        }
+        let k = 1 + (rng.uniform() * s.max_blocks as f64) as usize;
+        let n = k.min(s.max_blocks) * s.block;
+        if rng.bit() == 1 {
+            made.push(SlipAt {
+                at: out.len(),
+                samples: n as i64,
+            });
+            out.extend(std::iter::repeat_n(0.0, n));
+        } else {
+            made.push(SlipAt {
+                at: out.len(),
+                samples: -(n as i64),
+            });
+            i = (i + n).min(audio.len());
+        }
+    }
+    (out, made)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slips_insert_and_drop_whole_blocks() {
+        let audio: Vec<f32> = (0..480_000).map(|i| i as f32).collect();
+        let s = Slips {
+            every_s: 1.0,
+            block: 128,
+            max_blocks: 3,
+        };
+        let (out, made) = slip(&audio, 48_000.0, s, 7);
+        assert!(made.len() > 4, "{made:?}");
+        let net: i64 = made.iter().map(|m| m.samples).sum();
+        assert_eq!(out.len() as i64, audio.len() as i64 + net);
+        for m in &made {
+            assert!(m.samples.unsigned_abs() % 128 == 0 && m.samples.unsigned_abs() <= 384);
+        }
+    }
 
     fn rms(x: &[f32]) -> f64 {
         (x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / x.len() as f64).sqrt()

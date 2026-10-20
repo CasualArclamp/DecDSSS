@@ -100,6 +100,10 @@ cargo run --release -p decdsss-cli -- devices
 cargo run --release -p decdsss-cli -- rx --device "CABLE-A Output" --out-dir received
 cargo run --release -p decdsss-cli -- tx data.bin --call VK2ABC --play "CABLE-A Input"
 
+# A KiwiSDR straight off the network (no browser, no virtual cable): host or its web address,
+# the dial frequency in kHz; --save keeps the audio as a WAV. The window's SOURCE has it too.
+cargo run --release -p decdsss-cli -- rx --kiwi kiwi.example.org:8073 --freq 7074 --out-dir received
+
 # A picture: scaled and compressed to fit 120 s of signal a pass, as a progressive JPEG
 cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --mode ds8-1/2 --picture --air 120 -o pic.wav
 # rx saves the picture when it is whole, or a partial PNG of what came if it is not
