@@ -15,11 +15,12 @@ use crate::radio::Radio;
 use decdsss_audio::channels::downmix_to_mono;
 use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream};
 use decdsss_codec2::Mode as Codec;
-use decdsss_core::{Mode, Profile};
+use decdsss_core::{Band, Mode, Profile};
 use decdsss_dsp::Iq;
 use decdsss_dsp::resample::Resampler;
 use decdsss_link::live::{END, LiveEncoder};
 use decdsss_link::voice::ptype_of;
+use decdsss_phy::banner;
 use decdsss_phy::framing::Header;
 use decdsss_phy::tx::{LiveTx, vox_lead};
 use std::collections::VecDeque;
@@ -41,6 +42,8 @@ pub struct LiveConfig {
     pub level: f32,
     /// A tone ahead of the signal, to key a radio on VOX.
     pub vox: bool,
+    /// The callsign and mode written on the waterfall ahead of the signal.
+    pub wfid: bool,
     pub out_device: Option<String>,
     pub out_rate: u32,
     pub mic_device: Option<String>,
@@ -121,7 +124,13 @@ impl LiveTxSession {
             .ok_or("cannot build the header (check the callsign)")?;
         let frame_bytes = tx.layout().frame_bytes();
         let enc = LiveEncoder::new(cfg.codec, frame_bytes).ok_or("Codec2 cannot start")?;
-        let lead_s = tx.lead_seconds() + if cfg.vox { 0.7 } else { 0.0 };
+        let wfid_s = if cfg.wfid {
+            let said = cfg.mode.to_string();
+            banner::seconds(&[&cfg.call, &said], Band::mid(cfg.profile))
+        } else {
+            0.0
+        };
+        let lead_s = tx.lead_seconds() + if cfg.vox { 0.7 } else { 0.0 } + wfid_s;
         let frame_s = enc.frame_seconds();
         let shared = Arc::new(Mutex::new(Shared {
             frames: VecDeque::new(),
@@ -377,6 +386,15 @@ fn modulate(
     let mut alive = true;
     if cfg.vox {
         alive = play(&vox_lead(f64::from(cfg.out_rate), cfg.level, 0.4, 0.3));
+    }
+    if alive && cfg.wfid {
+        let said = cfg.mode.to_string();
+        alive = play(&banner::banner(
+            &[&cfg.call, &said],
+            Band::mid(cfg.profile),
+            f64::from(cfg.out_rate),
+            cfg.level,
+        ));
     }
     if alive {
         alive = play(&tx.lead());

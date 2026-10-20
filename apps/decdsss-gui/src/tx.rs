@@ -18,6 +18,7 @@ use decdsss_link::{
     SendSpec, Timeline, VoiceSpec, air_seconds, container, max_stream_bytes, plan_voice, segments,
     timeline,
 };
+use decdsss_phy::banner;
 use decdsss_phy::codes::normalise_call;
 use decdsss_phy::framing::{DEPTHS, Layout, PayloadType};
 use decdsss_phy::tx::{chips_to_audio_at, transmission_chips, vox_lead};
@@ -182,6 +183,9 @@ pub struct TxPanel {
     codec: Option<Codec>,
     /// A 1 kHz tone ahead of the signal, to key a radio on VOX.
     vox: bool,
+    /// The callsign and mode written on the waterfall ahead of the signal
+    /// (`decdsss_phy::banner`).
+    wfid: bool,
     /// What the speech summary was worked out for, the summary, and the
     /// transmission's timeline for the preview.
     voice_summary: Option<(String, VoicePlanned)>,
@@ -223,6 +227,7 @@ impl Default for TxPanel {
             vp: VoicePanel::default(),
             codec: None,
             vox: false,
+            wfid: false,
             voice_summary: None,
             live_mode: false,
             live: None,
@@ -261,6 +266,9 @@ impl TxPanel {
         }
         if let Some(a) = p.get("tx_air").and_then(|a| a.parse::<f64>().ok()) {
             self.air = a.clamp(20.0, 900.0);
+        }
+        if let Some(w) = p.get("tx_wfid") {
+            self.wfid = w == "1";
         }
     }
 
@@ -361,6 +369,11 @@ impl TxPanel {
         if let Some(s) = slot {
             self.slot = s;
         }
+    }
+
+    /// Turns the waterfall ID on (for `--tx-wfid`).
+    pub fn preset_wfid(&mut self) {
+        self.wfid = true;
     }
 
     /// Switches to a text message (for `--tx-text`); `cq` writes a CQ call.
@@ -589,6 +602,7 @@ impl TxPanel {
             codec: spec.codec,
             level: self.level,
             vox: self.vox,
+            wfid: self.wfid,
             out_device,
             out_rate,
             mic_device,
@@ -763,6 +777,7 @@ impl TxPanel {
         p.set("tx_mode", self.mode.clone());
         p.set("tx_depth", self.depth.to_string());
         p.set("tx_air", format!("{:.0}", self.air));
+        p.set("tx_wfid", if self.wfid { "1" } else { "0" });
     }
 
     /// Where in the passband the signal goes: the profile's place, or for 500 Hz
@@ -918,12 +933,43 @@ impl TxPanel {
         }
     }
 
-    /// A lead for VOX, if asked for, ahead of the audio.
-    fn with_vox(&self, rate: u32, audio: Vec<f32>) -> Vec<f32> {
-        if !self.vox {
-            return audio;
+    /// What the waterfall ID writes: `call` and the mode (CQ for a CQ packet, which
+    /// goes out in its own mode whatever is chosen).
+    fn wfid_words(&self, call: &str) -> [String; 2] {
+        let said = if self.text && self.cq_packet {
+            "CQ".to_string()
+        } else {
+            Mode::from_name(&self.mode).map_or_else(|| self.mode.clone(), |m| m.to_string())
+        };
+        [call.to_string(), said]
+    }
+
+    /// Seconds the waterfall ID takes if it is on (the gap after it included).
+    fn wfid_seconds(&self) -> f64 {
+        if !self.wfid {
+            return 0.0;
         }
-        let mut v = vox_lead(f64::from(rate), self.level, VOX_TONE_S, VOX_GAP_S);
+        let call = normalise_call(&self.call).unwrap_or_else(|| "CALL".into());
+        let [call, said] = self.wfid_words(&call);
+        banner::seconds(&[&call, &said], self.band())
+    }
+
+    /// The leads asked for, ahead of the audio: the VOX tone and pause, then the
+    /// waterfall ID of `call` (the callsign and mode written on the spectrum).
+    fn with_lead(&self, rate: u32, call: &str, audio: Vec<f32>) -> Vec<f32> {
+        let mut v = Vec::new();
+        if self.vox {
+            v = vox_lead(f64::from(rate), self.level, VOX_TONE_S, VOX_GAP_S);
+        }
+        if self.wfid {
+            let [call, said] = self.wfid_words(call);
+            v.extend(banner::banner(
+                &[&call, &said],
+                self.band(),
+                f64::from(rate),
+                self.level,
+            ));
+        }
         v.extend(audio);
         v
     }
@@ -946,7 +992,7 @@ impl TxPanel {
             let chips = transmission_chips(&segs).ok_or("cannot build the header")?;
             let audio =
                 chips_to_audio_at(&chips, self.band(), f64::from(rate), self.level, 1.0, 1.0);
-            let audio = self.with_vox(rate, audio);
+            let audio = self.with_lead(rate, &call, audio);
             return Ok(Plan {
                 frames: 0,
                 segments: segs.len(),
@@ -960,7 +1006,7 @@ impl TxPanel {
                 profile: self.profile,
                 mode,
                 depth: 1,
-                call,
+                call: call.clone(),
                 session,
                 ptype: PayloadType::Text,
                 resync_s: self.resync,
@@ -971,7 +1017,7 @@ impl TxPanel {
             let chips = transmission_chips(&plan.segments).ok_or("cannot build the header")?;
             let audio =
                 chips_to_audio_at(&chips, self.band(), f64::from(rate), self.level, 1.0, 1.0);
-            let audio = self.with_vox(rate, audio);
+            let audio = self.with_lead(rate, &call, audio);
             return Ok(Plan {
                 frames: plan.frames(),
                 segments: plan.segments.len(),
@@ -988,13 +1034,13 @@ impl TxPanel {
             let mut spec = self
                 .voice_spec()
                 .ok_or("this bandwidth is too narrow for voice")?;
-            spec.call = call;
+            spec.call = call.clone();
             spec.session = session;
             let plan = plan_voice(&spec, &clip.pcm)?;
             let chips = transmission_chips(&plan.segments).ok_or("cannot build the header")?;
             let audio =
                 chips_to_audio_at(&chips, self.band(), f64::from(rate), self.level, 1.0, 1.0);
-            let audio = self.with_vox(rate, audio);
+            let audio = self.with_lead(rate, &call, audio);
             return Ok(Plan {
                 frames: plan.frames,
                 segments: plan.segments.len(),
@@ -1024,7 +1070,7 @@ impl TxPanel {
             profile: self.profile,
             mode,
             depth: self.depth,
-            call,
+            call: call.clone(),
             session,
             ptype,
             resync_s: self.resync,
@@ -1034,7 +1080,7 @@ impl TxPanel {
         let segs = segments(&spec, &container::pack(&name, &data))?;
         let chips = transmission_chips(&segs).ok_or("cannot build the header")?;
         let audio = chips_to_audio_at(&chips, self.band(), f64::from(rate), self.level, 1.0, 1.0);
-        let audio = self.with_vox(rate, audio);
+        let audio = self.with_lead(rate, &call, audio);
         Ok(Plan {
             frames: segs.iter().map(|s| s.frames.len()).sum(),
             segments: segs.len(),
@@ -1206,6 +1252,22 @@ impl TxPanel {
             .on_hover_text(format!(
                 "{VOX_TONE_S} s of 1 kHz and a {VOX_GAP_S} s pause, so the radio is \
                  transmitting before the preamble"
+            ));
+            ui.end_row();
+            ui.label("Waterfall ID");
+            let call = normalise_call(&self.call).unwrap_or_else(|| "CALL".into());
+            let [call, said] = self.wfid_words(&call);
+            let parts = [call.as_str(), said.as_str()];
+            ui.checkbox(
+                &mut self.wfid,
+                "write the callsign and mode on the waterfall first",
+            )
+            .on_hover_text(format!(
+                "{:.1} s of tones whose spectrogram spells {:?} across the band the \
+                 signal will fill, then a pause, before the preamble: anyone watching \
+                 the band sees who is calling and in what mode. Nothing decodes it.",
+                banner::seconds(&parts, self.band()),
+                banner::lines(&parts, self.band()).join(" / ")
             ));
             ui.end_row();
             ui.label("Bandwidth");
@@ -1431,9 +1493,10 @@ impl TxPanel {
         } else {
             0.0
         };
+        let wfid_s = self.wfid_seconds();
         let total = t
             .as_ref()
-            .map_or(String::new(), |t| air_time(vox_s + t.seconds()));
+            .map_or(String::new(), |t| air_time(vox_s + wfid_s + t.seconds()));
         caption(ui, "Transmission", total);
         let t = match t {
             Ok(t) => t,
@@ -1457,11 +1520,17 @@ impl TxPanel {
         if vox_s > 0.0 {
             tip = format!("{tip}\nVOX tone and pause {vox_s:.1} s");
         }
-        timeline_bar(ui, &t, vox_s).on_hover_text(tip);
+        if wfid_s > 0.0 {
+            tip = format!("{tip}\nWaterfall ID and pause {wfid_s:.1} s");
+        }
+        timeline_bar(ui, &t, &[(vox_s, col::REF), (wfid_s, col::LOCK)]).on_hover_text(tip);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if vox_s > 0.0 {
                 swatch(ui, col::REF, "VOX");
+            }
+            if wfid_s > 0.0 {
+                swatch(ui, col::LOCK, "waterfall ID");
             }
             swatch(ui, col::MARK, "preamble + header");
             if t.frames > 0 {
@@ -1708,15 +1777,17 @@ fn band_strip(ui: &mut egui::Ui, band: Band) -> egui::Response {
     response
 }
 
-/// The transmission drawn to scale: the VOX tone, then each segment's preamble
+/// The transmission drawn to scale: what goes ahead of the signal (`ahead`: seconds
+/// and colour of the VOX tone, the waterfall ID), then each segment's preamble
 /// and header and its blocks (data frames first, then coded ones), then the
 /// postamble. The preambles and the postamble are drawn at least a pixel wide,
 /// so they show on a long transmission.
-fn timeline_bar(ui: &mut egui::Ui, t: &Timeline, vox_s: f64) -> egui::Response {
+fn timeline_bar(ui: &mut egui::Ui, t: &Timeline, ahead: &[(f64, Color32)]) -> egui::Response {
     let w = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::hover());
     let p = ui.painter_at(rect);
-    let px = f64::from(rect.width()) / (vox_s + t.seconds());
+    let lead_s: f64 = ahead.iter().map(|a| a.0).sum();
+    let px = f64::from(rect.width()) / (lead_s + t.seconds());
     let piece = |from: f64, secs: f64, colour: Color32, min_px: f32| {
         let x0 = rect.left() + (from * px) as f32;
         let x1 = (rect.left() + ((from + secs) * px) as f32).max(x0 + min_px);
@@ -1726,13 +1797,17 @@ fn timeline_bar(ui: &mut egui::Ui, t: &Timeline, vox_s: f64) -> egui::Response {
             colour,
         );
     };
-    if vox_s > 0.0 {
-        piece(0.0, vox_s, col::REF, 1.0);
+    let mut from = 0.0;
+    for &(secs, colour) in ahead {
+        if secs > 0.0 {
+            piece(from, secs, colour, 1.0);
+        }
+        from += secs;
     }
     // The bodies first, then the leads over them, so a lead widened to a pixel
     // is not painted over by the block after it.
     let mut leads = Vec::with_capacity(t.segments.len() + 1);
-    let (mut at, mut frame0) = (vox_s, 0usize);
+    let (mut at, mut frame0) = (lead_s, 0usize);
     for &n in &t.segments {
         leads.push(at);
         at += t.lead_s;
@@ -1828,5 +1903,46 @@ mod tests {
             Some(m("csk32-3/4"))
         );
         assert_eq!(nearest_mode(Family::Csk, None, p), Some(m("csk32-3/4")));
+    }
+
+    #[test]
+    fn the_waterfall_id_goes_after_the_vox_lead_and_ahead_of_the_signal() {
+        let mut p = TxPanel {
+            call: "vk2abc".into(),
+            text: true,
+            cq_packet: true,
+            ..TxPanel::default()
+        };
+        let rms = |a: &[f32]| (a.iter().map(|v| v * v).sum::<f32>() / a.len() as f32).sqrt();
+        for vox in [false, true] {
+            p.vox = vox;
+            // The session number in the header comes from the clock, so two builds
+            // either side of a second boundary differ: build the plain one again
+            // after, and use the pair only if the clock did not tick between.
+            let (plain, with) = loop {
+                p.wfid = false;
+                let plain = p.build(48_000).unwrap().audio;
+                p.wfid = true;
+                let with = p.build(48_000).unwrap().audio;
+                p.wfid = false;
+                if p.build(48_000).unwrap().audio == plain {
+                    break (plain, with);
+                }
+            };
+            p.wfid = true;
+            // The banner's seconds are what the timeline says, and the rest is the
+            // same audio as without it, after it.
+            let banner_n = with.len() - plain.len();
+            assert!((banner_n as f64 / 48_000.0 - p.wfid_seconds()).abs() < 1e-4);
+            let lead = if vox { 33_600 } else { 0 };
+            assert_eq!(with[..lead], plain[..lead]);
+            assert_eq!(with[lead + banner_n..], plain[lead..]);
+            // Tones, not silence, where it goes (the last half second is its gap).
+            assert!(rms(&with[lead..lead + banner_n - 24_000]) > 0.02);
+        }
+        // A CQ says CQ, and anything else says its mode.
+        assert_eq!(p.wfid_words("VK2ABC"), ["VK2ABC", "CQ"]);
+        p.cq_packet = false;
+        assert_eq!(p.wfid_words("VK2ABC"), ["VK2ABC", "DS8 1/2"]);
     }
 }

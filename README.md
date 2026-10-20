@@ -92,6 +92,8 @@ cargo run --release -p decdsss-cli -- tx speech.wav --call VK2ABC --profile 2k4 
 # rx writes CALL-SESSION.wav (8 kHz speech), or a -partial.wav if frames are missing
 # CQ: a header-only packet carrying the callsign, two copies; rx prints "CQ from ..."
 cargo run --release -p decdsss-cli -- tx --cq --call VK2ABC -o cq.wav
+# Waterfall ID: ahead of the signal, the callsign and mode written on the spectrum
+cargo run --release -p decdsss-cli -- tx --cq --call VK2ABC --wfid -o cq.wav
 # Text: a message (up to 1000 bytes); rx prints it and adds it to messages.log
 cargo run --release -p decdsss-cli -- tx --text "Hello, 73" --call VK2ABC --profile 500 --slot +500 -o chat.wav
 

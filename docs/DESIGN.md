@@ -18,7 +18,7 @@ milestones. Update it when a decision changes.
 | Spreading | Both families as modes: DS-PSK with a spreading-factor ladder, and M-ary code-shift keying (CSK). |
 | Channels | HF SSB skywave; sound card / virtual cable first. |
 | Bandwidths | 2.4 kHz (300–2700 Hz) and 3 kHz (300–3300 Hz), plus a 500 Hz weak-signal profile. |
-| Station ID | Callsign in the header only (no CW ID). |
+| Station ID | Callsign in the header only (no CW ID). An optional *waterfall ID* (the callsign and mode written on the spectrum ahead of the signal, for anyone watching a waterfall; nothing decodes it) was added when Rory asked for it on 2026-10-20: *Radio I/O*. |
 | Code use | CDMA: a common *call code* for preambles and headers, then data on a code derived from the station's callsign; the receiver despreads every station it finds at once. |
 | Radio I/O | Sound card with VOX/manual PTT; CAT keying for IC-7300 / FT-710 (from voicemodem), any Hamlib rig through `rigctld`, and DTR/RTS keying; WAV and IQ files in and out. |
 | Receiver panels | DVB-CID's set, plus acquisition heatmap, rake/multipath profile, waterfall + PSD against the noise floor, chip scope. |
@@ -751,6 +751,43 @@ and "let go" in that order (timing against the first sample was not measured her
 GUI path's ordering is tested in `engine::tests`). Not done from the WSJT-X dialog: OmniRig, a separate PTT input
 (CTS), the left-channel VOX tone (the Transmit panel's VOX box sends a tone ahead
 of the signal) and the rest of Hamlib's models other than through `rigctld`.
+
+**Waterfall ID** (`decdsss_phy::banner`; `tx --wfid`, the Transmit panel's *Waterfall ID*
+box, `--tx-wfid` for the GUI's screenshot runs). Ahead of the signal, after the VOX
+tone if there is one, a few seconds of audio whose spectrogram is the text
+`VK2ABC DS8 1/2` (a CQ packet says `VK2ABC CQ`), the way fldigi's waterfall ID does
+it. It is not part of the signal: no receiver decodes it and the preamble that
+follows is found as before. A 5×7 dot-matrix font; each bitmap column is a tone and
+each row 0.2 s (`ROW_S`) in which the tones of its lit pixels sound together, frequency
+left to right and, because a waterfall puts the newest line at the top (this one does;
+fldigi's and WSJT-X's do as far as is known, not checked here), the bottom row first. It stays inside the
+band the signal will fill (tones 10 Hz inside its edges, so a banner in one 500 Hz
+slot does not touch the next): 32 Hz between columns at most, and when the text
+would need less than 16 Hz it goes one part to a line (the callsign over the mode) instead
+of on one. Derived: on 2.4 kHz `VK2ABC DS8 1/2` is 83 columns at 29 Hz (7 rows, 1.4 s,
+1.93 s with the ramps and the 0.5 s pause that follows); in a 500 Hz slot it is two
+lines, 41 columns at 12 Hz (15 rows, 3.53 s), which a 4096-point spectrum at 48 kHz
+(11.7 Hz a bin) only just resolves: it reads, if fuzzily, in this program's waterfall
+and better in a display with finer bins. *Level:* every tone has the same
+amplitude, so every lit pixel is as bright as the next, and the busiest row would
+have the signal's RMS, but a comb of tones has the higher crest factor (measured:
+9.8, 10.3 and 11.2 dB for the banner's peak over its busiest row's RMS, drawn at 2.4 kHz
+and 500 Hz (`VK2ABC DS8 1/2`) and 3 kHz (`VK2ABC/QRP CSK256 3/4`), with Newman
+phases; 18.8 dB with every tone at phase zero) than the signal (7.7-7.9 dB, peak 2.4-2.5
+times RMS, 40 000 chips at each profile). A transmitter is set for the signal's
+peaks, so the banner is scaled until its peak is no higher than the signal's
+(`PEAK_PER_RMS` = 2.5 × the level): measured, its busiest row then comes out 1.8, 2.3
+and 3.2 dB under the signal's RMS. Measured out of band: 37.3 dB (2.4 kHz) and 35.7 dB
+(500 Hz slot) below the banner's own power. Tested (`phy::banner`,
+`link/tests/banner.rs`, `gui tx::tests`): the spectrogram reads back, with a
+Hann-windowed DFT of each row, as exactly the bitmap, newest line first; a CQ and a
+text behind a banner are heard as without one (a CQ 8 dB under the noise in at least 3
+of 4 runs, the bar the same test sets without a banner), only in the band they were sent in; and the banner alone is not
+taken for a signal at 30 or 0 dB SNR. Looked at in the GUI's waterfall (a 2.4 kHz
+CQ and a 500 Hz +500 slot CQ): both read. *Not done:* a banner at the end, a custom
+text, a choice of size or speed (a slow waterfall, such as WSJT-X's, needs a row longer than
+0.2 s to resolve the lines), the live-voice path checked on air (it is wired in
+`live.rs` the same way; the sound-card start is not exercised by a test).
 
 ## Crate layout
 

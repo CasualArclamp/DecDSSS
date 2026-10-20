@@ -12,6 +12,7 @@ use decdsss_link::{
     Assembler, SendSpec, VoiceSpec, container, cq::plan_cq, max_stream_bytes, plan, plan_text,
     plan_voice, text,
 };
+use decdsss_phy::banner;
 use decdsss_phy::codes::{normalise_call, own_code};
 use decdsss_phy::framing::{Layout, PayloadType};
 use decdsss_phy::rx::{Event, MultiReceiver};
@@ -147,6 +148,11 @@ enum Command {
         /// radio that transmits on VOX.
         #[arg(long)]
         vox: bool,
+        /// Ahead of the signal, write the callsign and mode on the waterfall: a few
+        /// seconds of tones whose spectrogram spells "VK2ABC DS8 1/2" (a CQ says CQ
+        /// for the mode), inside the band the signal will fill.
+        #[arg(long)]
+        wfid: bool,
         /// The WAV to write.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -288,6 +294,7 @@ fn main() -> Result<()> {
             lead,
             tail,
             vox,
+            wfid,
             output,
             play,
             ptt,
@@ -326,6 +333,7 @@ fn main() -> Result<()> {
             lead,
             tail,
             vox,
+            wfid,
             output.as_deref(),
             play.as_deref(),
             &KeyOpts {
@@ -503,6 +511,7 @@ fn tx(
     lead: f64,
     tail: f64,
     vox: bool,
+    wfid: bool,
     output: Option<&Path>,
     play: Option<&str>,
     keying: &KeyOpts,
@@ -664,6 +673,25 @@ fn tx(
     };
     let chips = transmission_chips(&segs).context("cannot build the header")?;
     let mut audio = chips_to_audio_at(&chips, band, f64::from(rate), level, lead, tail);
+    let mut summary = summary;
+    if wfid {
+        // What the waterfall will say: the callsign and the mode (a CQ is sent in the
+        // weakest mode whatever is set, so it says CQ).
+        let said = if matches!(payload, Payload::Cq(_)) {
+            "CQ".to_string()
+        } else {
+            mode.to_string()
+        };
+        let parts = [call.as_str(), said.as_str()];
+        let mut b = banner::banner(&parts, band, f64::from(rate), level);
+        summary = format!(
+            "{summary}; waterfall ID {:?} ({:.1} s)",
+            banner::lines(&parts, band).join(" / "),
+            banner::seconds(&parts, band)
+        );
+        b.extend(audio);
+        audio = b;
+    }
     if vox {
         let mut v = decdsss_phy::tx::vox_lead(f64::from(rate), level, 0.4, 0.3);
         v.extend(audio);

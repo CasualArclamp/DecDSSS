@@ -73,6 +73,8 @@ pub struct Automation {
     pub tx_text: Option<String>,
     /// With `tx_text` or `tx_file`: the profile, and for 500 Hz a slot, as `500@+500`.
     pub tx_band: Option<String>,
+    /// Open the transmit window with the waterfall ID on.
+    pub tx_wfid: bool,
     /// Record speech in the transmit window for this many seconds from the
     /// input named `mic` (part of its name), starting at launch.
     pub record_for: Option<f64>,
@@ -230,6 +232,9 @@ impl App {
         }
         if let Some(b) = auto.tx_band.as_deref() {
             tx.preset_band(b);
+        }
+        if auto.tx_wfid {
+            tx.preset_wfid();
         }
         if let Some(m) = auto.tx_text.clone() {
             tx.preload_text(m);
