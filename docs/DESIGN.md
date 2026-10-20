@@ -923,7 +923,7 @@ text, a choice of size or speed (a slow waterfall, such as WSJT-X's, needs a row
   measured on branch `claude/elastic-pike-1afe0d`, not yet merged.
 - **M5** — ARQ connected mode.
 - **M6** — polish and releases. Portable Windows exes are cut from `main` as GitHub
-  releases (v0.0.1 to v0.0.4 on 2026-10-19 and -20, v0.0.5 and v0.0.6 on 2026-10-20), each
+  releases (v0.0.1 to v0.0.4 on 2026-10-19 and -20, v0.0.5 to v0.0.7 on 2026-10-20), each
   with notes that say what was measured and what was not. Linux is build-from-source
   (`docs/LINUX.md`), checked by CI only.
 
