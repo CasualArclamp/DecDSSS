@@ -566,6 +566,114 @@ mod tests {
         }
     }
 
+    /// [`header_alphabet_curve`] on the 500 Hz profile, with the channel of the
+    /// `decdsss sweep --offset 1 --clock-ppm 10` runs (offsets 1 ± 6 Hz, clocks
+    /// 10 ± 30 ppm), split by what failed: no preamble lock, or the header. For each
+    /// lock it also tries the header again from the true carrier and start (a genie
+    /// for the preamble's estimates) and prints how far off the preamble was. Run
+    /// with `cargo test -p decdsss-phy --release -- --ignored --nocapture
+    /// header_alphabet_curve_500`; `HEADER_TRIALS` sets the trials a point (16),
+    /// `HEADER_L` the alphabets (`64,128,256`), `HEADER_CHAN` one channel only.
+    #[test]
+    #[ignore]
+    fn header_alphabet_curve_500() {
+        use super::{HeaderOutcome, demod_header};
+        use crate::tx::{chips_to_audio, header_chips_l, preamble_chips};
+        let profile = Profile::N500;
+        let trials: u64 = std::env::var("HEADER_TRIALS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let alphabets: Vec<usize> = std::env::var("HEADER_L")
+            .ok()
+            .map(|v| v.split(',').filter_map(|s| s.parse().ok()).collect())
+            .unwrap_or_else(|| vec![64, 128, 256]);
+        let seg = segment(profile, "dsc64-1/2", 2, 2);
+        let chans: [(&str, Option<Watterson>); 2] =
+            [("awgn", None), ("moderate", Some(Watterson::MODERATE))];
+        let centre = profile.centre_hz();
+        let only = std::env::var("HEADER_CHAN").ok();
+        for (name, fading) in chans {
+            if only.as_ref().is_some_and(|o| o != name) {
+                continue;
+            }
+            for &l in &alphabets {
+                let mut chips = preamble_chips(profile);
+                chips.extend(header_chips_l(&seg.header, l).unwrap());
+                chips.extend(std::iter::repeat_n(decdsss_dsp::Iq::new(0.0, 0.0), 400));
+                let audio = chips_to_audio(&chips, profile, 48_000.0, 0.2, 1.0, 1.0);
+                println!("{name} L={l}: in-band SNR: ok / no lock / ok from the true carrier and start; fails: carrier > 0.3 Hz off [carrier, start errors]");
+                for snr in [-16.0, -13.0, -10.0, -7.0, -4.0, -1.0, 2.0] {
+                    // (ok, no lock, ok with the true carrier and start, failed with
+                    // the carrier more than 0.3 Hz off, the fails' carrier and
+                    // start errors)
+                    let tally = std::sync::Mutex::new((0, 0, 0, 0, Vec::<(f64, f64)>::new()));
+                    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+                    // Rust note: `thread::scope` lets the threads borrow `audio`
+                    // and `tally` from this stack frame; they are all joined
+                    // before the scope returns.
+                    std::thread::scope(|sc| {
+                        for w in 0..workers as u64 {
+                            let (audio, tally, seg) = (&audio, &tally, &seg);
+                            sc.spawn(move || {
+                                for t in (w..trials).step_by(workers) {
+                                    let mut ch = channel(profile, snr);
+                                    ch.seed = 1000 + t;
+                                    ch.fading = fading;
+                                    ch.offset_hz = 1.0 + (t % 7) as f64 * 2.0 - 6.0;
+                                    ch.clock_ppm = 10.0 + (t % 5) as f64 * 15.0 - 30.0;
+                                    // The clock scales every audio frequency.
+                                    let truth = ch.offset_hz + centre * ch.clock_ppm * 1e-6;
+                                    let heard = ch.apply(audio, 48_000.0);
+                                    let Ok((fe, buf, lock)) = to_lock(&heard, profile) else {
+                                        tally.lock().unwrap().1 += 1;
+                                        continue;
+                                    };
+                                    let rate = fe.out_rate();
+                                    let good = |lk: &crate::rx::preamble::PreambleLock| {
+                                        matches!(demod_header(&buf, lk, rate, l),
+                                            HeaderOutcome::Decoded(h) if h.header == seg.header)
+                                    };
+                                    let err = lock.freq_hz - truth;
+                                    // Where the header truly starts (as `genie` in
+                                    // the test rig): one second of silence, the
+                                    // shaper's ten chips, the preamble.
+                                    let cr = f64::from(profile.chip_rate());
+                                    let r = 1.0 + ch.clock_ppm * 1e-6;
+                                    let first = ((1.0 + 10.0 / cr) * rate + fe.delay()) / r;
+                                    let start = first
+                                        + preamble_chips(profile).len() as f64
+                                            * crate::rx::frontend::SPS as f64
+                                            / r;
+                                    let terr = (lock.header_start - start) / lock.step;
+                                    let ok = good(&lock);
+                                    let mut genie = lock.clone();
+                                    genie.freq_hz = truth;
+                                    genie.header_start = start;
+                                    let ok_genie = good(&genie);
+                                    let mut g = tally.lock().unwrap();
+                                    g.0 += usize::from(ok);
+                                    g.2 += usize::from(ok_genie);
+                                    if !ok {
+                                        g.3 += usize::from(err.abs() > 0.3);
+                                        g.4.push((err, terr));
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    let (ok, nolock, genie, off, errs) = tally.into_inner().unwrap();
+                    let errs: Vec<String> =
+                        errs.iter().map(|(e, t)| format!("{e:+.2} Hz {t:+.2} chip")).collect();
+                    println!(
+                        "  {snr:+5.0} dB: {ok:2} / {nolock:2} / {genie:2} of {trials}, {off} off [{}]",
+                        errs.join(" ")
+                    );
+                }
+            }
+        }
+    }
+
     /// The watch on headers in AWGN and in moderate fading. In the alphabet sent:
     /// every symbol in, one cluster at 1. In a shorter one (as the receiver tries
     /// first): margins just as clear, since a longer Walsh code is a shorter one

@@ -137,6 +137,41 @@ pub fn to_header_in(audio: &[f32], profile: Profile, alphabets: &[usize]) -> Res
     Err("never got to the header".into())
 }
 
+/// The front end, acquisition and preamble tracker over all of `audio`: the
+/// preamble's lock and the whole buffer (every sample, not only up to the
+/// lock), for measuring a header stage on its own.
+pub fn to_lock(audio: &[f32], profile: Profile) -> Result<(Frontend, Buf, PreambleLock), String> {
+    let mut fe = Frontend::new(profile, FS);
+    let mut acq = Acquirer::new(profile, 100.0);
+    let mut buf = Buf::default();
+    let mut tracker: Option<PreambleTracker> = None;
+    let mut lock: Option<PreambleLock> = None;
+    let rate = fe.out_rate();
+    for chunk in audio.chunks(2400) {
+        let mut bb = Vec::new();
+        fe.push(chunk, &mut bb);
+        buf.push(&bb);
+        if lock.is_none() {
+            if tracker.is_none()
+                && let Some(d) = acq.run(&buf)
+            {
+                tracker = Some(PreambleTracker::new(profile, rate, &d));
+            }
+            if let Some(t) = tracker.as_mut() {
+                match t.step(&buf) {
+                    State::Locked(l) => lock = Some(l),
+                    State::Failed(why) => return Err(format!("preamble: {why}")),
+                    State::Working => {}
+                }
+            }
+        }
+    }
+    match lock {
+        Some(l) => Ok((fe, buf, l)),
+        None => Err("no preamble lock".into()),
+    }
+}
+
 /// A genie start for the payload demodulator: the true timing, clock, carrier
 /// and paths from the channel's own parameters, so payload thresholds can be
 /// measured without the preamble and header in the way.
