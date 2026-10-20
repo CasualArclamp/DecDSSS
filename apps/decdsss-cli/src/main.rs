@@ -7,7 +7,7 @@ use decdsss_audio::{InputOptions, InputStream, OutputOptions, OutputStream, wav}
 use decdsss_chan::{Channel, Watterson};
 use decdsss_codec2::Mode as Codec;
 use decdsss_core::{Band, Mode, Profile, Slot};
-use decdsss_link::voice::default_codec;
+use decdsss_link::voice::{default_codec, voice_mode};
 use decdsss_link::{
     Assembler, SendSpec, VoiceSpec, container, cq::plan_cq, max_stream_bytes, plan, plan_text,
     plan_voice, text,
@@ -89,7 +89,7 @@ enum Command {
         #[arg(long, default_value = "0", allow_hyphen_values = true)]
         slot: String,
         /// Mode, for example ds8-1/2, ds4-2/3, csk64-1/2 (see `decdsss modes`).
-        /// Default ds8-1/2; for --voice, the voice mode of the profile.
+        /// Default ds8-1/2; for --voice, the voice mode of the profile and codec.
         #[arg(long)]
         mode: Option<String>,
         /// Codewords per block: 1, 2, 4 or 8. Deeper rides out longer fades.
@@ -113,7 +113,9 @@ enum Command {
         /// Send a WAV recording as speech: Codec2 450 on 2k4, 700C on 3k.
         #[arg(long)]
         voice: bool,
-        /// With --voice, the Codec2 mode: 450 or 700C (default from the profile).
+        /// With --voice, the Codec2 mode: 450, 700C, 1200 or 1600 (default from
+        /// the profile). 1200 and 1600 go with the fast modes, DS2 and DS1, which
+        /// want a clean, strong channel; the mode follows the codec unless --mode says.
         #[arg(long)]
         codec: Option<String>,
         /// With --picture, seconds of signal one pass may take.
@@ -515,12 +517,24 @@ fn tx(
         bail!("slots are for the 500 Hz profile only (the wider profiles have just a middle)");
     }
     let band = Band::new(profile, slot);
-    let mode = match (mode, &payload) {
+    // The speech codec, for --voice: the one asked for, else the profile's.
+    let voice_codec = match &payload {
+        Payload::Voice(v) => Some(match &v.codec {
+            Some(c) => Codec::from_name(c).with_context(|| {
+                format!("unknown Codec2 mode {c:?}: use 450, 700C, 1200 or 1600")
+            })?,
+            None => default_codec(profile)
+                .context("500 Hz is too slow for voice: use --profile 2k4 or 3k")?,
+        }),
+        _ => None,
+    };
+    let mode = match (mode, voice_codec) {
         (Some(m), _) => Mode::from_name(m).with_context(|| format!("unknown mode {m:?}"))?,
-        (None, Payload::Voice(_)) => {
-            Mode::voice(profile).context("500 Hz is too slow for voice: use --profile 2k4 or 3k")?
-        }
-        (None, _) => Mode::from_name("ds8-1/2").expect("the default mode exists"),
+        // The mode that suits the codec, else the profile's voice mode.
+        (None, Some(codec)) => voice_mode(profile, codec)
+            .or_else(|| Mode::voice(profile))
+            .context("500 Hz is too slow for voice: use --profile 2k4 or 3k")?,
+        (None, None) => Mode::from_name("ds8-1/2").expect("the default mode exists"),
     };
     let call = normalise_call(call).with_context(|| {
         format!("{call:?} is not a callsign this modem can send (A-Z, 0-9 and /, up to 9)")
@@ -578,13 +592,7 @@ fn tx(
             mode,
         );
         (plan.segments, summary)
-    } else if let Payload::Voice(v) = &payload {
-        let codec = match &v.codec {
-            Some(c) => Codec::from_name(c)
-                .with_context(|| format!("unknown Codec2 mode {c:?}: use 450 or 700C"))?,
-            None => default_codec(profile)
-                .context("500 Hz is too slow for voice: use --profile 2k4 or 3k")?,
-        };
+    } else if let (Payload::Voice(_), Some(codec)) = (&payload, voice_codec) {
         let speech = load_speech(file.context("give the WAV to send")?)?;
         let vs = VoiceSpec {
             profile,

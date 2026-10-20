@@ -535,6 +535,10 @@ pub struct PayloadRx {
     eot: Option<f32>,
     /// The postamble was looked for at the start of the block in progress.
     eot_probed: bool,
+    /// A live stream whose blocks are shorter than the postamble's second: the block
+    /// ended before the samples for the question "was what came the postamble?"
+    /// were in, so it is asked later, of this block's start and chips-before.
+    eot_pending: Option<(Track, usize)>,
     /// The fingers and the reference were measured from known chips just before:
     /// from the header at the start, and after every block that decoded whole
     /// (the known-chip refinement). Then the block starts at once; otherwise it
@@ -575,6 +579,7 @@ impl PayloadRx {
             strip_noise: 0.0,
             eot: None,
             eot_probed: false,
+            eot_pending: None,
             fresh: true,
             watch: Watch::default(),
             #[cfg(test)]
@@ -593,11 +598,7 @@ impl PayloadRx {
     /// A live voice stream: speech with no frame total, so no block count that
     /// says where it ends.
     pub fn is_live(&self) -> bool {
-        self.header.total_frames == 0
-            && matches!(
-                self.header.ptype,
-                crate::framing::PayloadType::Voice | crate::framing::PayloadType::Voice450
-            )
+        self.header.total_frames == 0 && self.header.ptype.is_voice()
     }
 
     /// Moves past `n` blocks without decoding them (tests that measure the
@@ -625,19 +626,24 @@ impl PayloadRx {
         if self.work.is_some() {
             return None;
         }
-        self.probe_eot_at(buf, &self.track)
+        self.probe_eot_at(buf, &self.track, self.chip0)
+    }
+
+    /// Chips the postamble question needs after a block's start: the delay profile's
+    /// longest lag and the postamble itself.
+    fn probe_chips(&self) -> f64 {
+        DelayProfile::lag(DelayProfile::LAGS) + eot::len(self.header.profile) as f64
     }
 
     /// The postamble's place is where the block that starts at `at` would be (its
     /// scrambler position is `chip0`, the chips sent before that block).
-    fn probe_eot_at(&self, buf: &Buf, at: &Track) -> Option<f32> {
+    fn probe_eot_at(&self, buf: &Buf, at: &Track, chip0: usize) -> Option<f32> {
         let profile = self.header.profile;
-        let n = eot::len(profile);
-        let reach = DelayProfile::lag(DelayProfile::LAGS) + n as f64;
+        let reach = self.probe_chips();
         if at.pos + reach * at.step + 16.0 > buf.end() as f64 {
             return None;
         }
-        let refs = eot::chips(profile, &self.scr, self.chip0);
+        let refs = eot::chips(profile, &self.scr, chip0);
         let p = super::refine::profile_known(buf, at, &refs, eot::segment_chips(profile));
         let mut sorted = p.power.clone();
         sorted.sort_by(f32::total_cmp);
@@ -658,11 +664,17 @@ impl PayloadRx {
     /// the known-chip refinement at its end.
     pub fn oldest_needed(&self) -> i64 {
         let min_lag = self.fingers.iter().map(|f| f.lag).fold(0.0f64, f64::min);
-        let from = match &self.work {
+        let mut from = match &self.work {
             Some(Work::Csk(w)) => w.start,
             Some(Work::Ds(w)) => w.start,
             None => self.track,
         };
+        // An open question about the postamble needs the samples from its block's start.
+        if let Some((at, _)) = &self.eot_pending
+            && at.pos < from.pos
+        {
+            from = *at;
+        }
         let reach = rewind::SLIP_REACH_S * f64::from(self.header.profile.chip_rate());
         (from.pos + (min_lag - reach - 10.0) * from.step) as i64
     }
@@ -672,6 +684,17 @@ impl PayloadRx {
     pub fn step(&mut self, buf: &Buf) -> Option<BlockResult> {
         if self.done() || self.eot.is_some() {
             return None;
+        }
+        // The question a short block left open: has the postamble's second come in?
+        if let Some((at, chip0)) = self.eot_pending
+            && let Some(r) = self.probe_eot_at(buf, &at, chip0)
+        {
+            self.eot_pending = None;
+            if r >= eot::EOT_PEAK_OVER_MEDIAN {
+                self.eot = Some(r);
+                self.work = None;
+                return None;
+            }
         }
         if self.work.is_none() {
             // A block starts at once when the fingers are fresh (the display then
@@ -701,7 +724,7 @@ impl PayloadRx {
                 Some(Work::Ds(w)) => w.start,
                 None => return None,
             };
-            if let Some(r) = self.probe_eot_at(buf, &start) {
+            if let Some(r) = self.probe_eot_at(buf, &start, self.chip0) {
                 self.eot_probed = true;
                 if r >= eot::EOT_PEAK_OVER_MEDIAN {
                     self.eot = Some(r);
@@ -711,11 +734,16 @@ impl PayloadRx {
             }
         }
         let work = self.work.take()?;
+        let start = match &work {
+            Work::Csk(w) => w.start,
+            Work::Ds(w) => w.start,
+        };
+        let chip0 = self.chip0;
         match work {
             Work::Csk(mut w) => {
                 if self.advance_csk(buf, &mut w) {
                     let r = self.finish_csk(buf, *w);
-                    self.end_block();
+                    self.end_block(start, chip0);
                     Some(r)
                 } else {
                     self.work = Some(Work::Csk(w));
@@ -725,7 +753,7 @@ impl PayloadRx {
             Work::Ds(mut w) => {
                 if self.advance_ds(buf, &mut w) {
                     let r = self.finish_ds(buf, *w);
-                    self.end_block();
+                    self.end_block(start, chip0);
                     Some(r)
                 } else {
                     self.work = Some(Work::Ds(w));
@@ -735,7 +763,18 @@ impl PayloadRx {
         }
     }
 
-    fn end_block(&mut self) {
+    /// `start` and `chip0` are the block's own (they are read before it is worked on).
+    fn end_block(&mut self, start: Track, chip0: usize) {
+        // A live stream's block that ended before the postamble question could be
+        // asked of it (the block is shorter than the second the postamble takes, as
+        // DS1 and DS2 blocks are): keep the question for when the samples are in.
+        if self.is_live()
+            && self.next_block > 0
+            && !self.eot_probed
+            && (self.layout.chips() as f64) < self.probe_chips()
+        {
+            self.eot_pending = Some((start, chip0));
+        }
         self.chip0 += self.layout.chips();
         self.next_block += 1;
     }

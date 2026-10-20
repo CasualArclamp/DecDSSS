@@ -7,7 +7,7 @@
 
 use decdsss_chan::Channel;
 use decdsss_codec2::Mode as Codec;
-use decdsss_core::{Mode, Profile};
+use decdsss_core::Profile;
 use decdsss_link::Assembler;
 use decdsss_link::live::{FILLER, LiveEncoder};
 use decdsss_phy::framing::{Header, PayloadType};
@@ -47,14 +47,29 @@ fn speech(seconds: f64) -> Vec<i16> {
 
 #[test]
 fn live_speech_streams_and_plays_without_running_dry() {
-    let profile = Profile::W2400;
-    let mode = Mode::voice(profile).unwrap();
+    live_case(Profile::W2400, Codec::C450, PayloadType::Voice450, 25.0);
+}
+
+/// Codec2 1200 and 1600 live, on the fast modes DS1 and DS2: the modem carries 1.15 to 1.27
+/// times the codec's rate, so the same must hold, with a block that is a quarter as long.
+#[test]
+fn live_speech_streams_on_the_fast_modes() {
+    live_case(Profile::W2400, Codec::C1200, PayloadType::Voice1200, 25.0);
+    // 1600 on 3 kHz runs at 1.155 times the codec's rate, so the backlog of the
+    // start-up (5.3 s) takes 5.3 / 0.155 = 34 s to work off: talk for longer than
+    // that to see the fillers.
+    live_case(Profile::W3000, Codec::C1600, PayloadType::Voice1600, 50.0);
+}
+
+fn live_case(profile: Profile, codec: Codec, ptype: PayloadType, talk_s: f64) {
+    println!("live case: {profile} Codec2 {codec}");
+    let mode = decdsss_link::voice::voice_mode(profile, codec).unwrap();
     let depth = 2;
     let header = Header {
         profile,
         mode,
         depth,
-        ptype: PayloadType::Voice450,
+        ptype,
         call: "VK2ABC".into(),
         session: 7,
         frame0: 0,
@@ -62,9 +77,9 @@ fn live_speech_streams_and_plays_without_running_dry() {
         total_frames: 0,
     };
     let mut tx = LiveTx::new(header, RATE, 0.2).unwrap();
+    let (lead_s, block_s) = (tx.lead_seconds(), tx.block_seconds());
     let frame_bytes = tx.layout().frame_bytes();
-    let mut enc = LiveEncoder::new(Codec::C450, frame_bytes).unwrap();
-    let talk_s = 25.0;
+    let mut enc = LiveEncoder::new(codec, frame_bytes).unwrap();
     let input = speech(talk_s);
     let frame_s = enc.frame_seconds();
 
@@ -184,18 +199,14 @@ fn live_speech_streams_and_plays_without_running_dry() {
     }
     println!(
         "first speech heard at {:.1} s of signal (lead {:.1} s), playout slack at worst {:.2} s,          {} fillers, {} speech frames",
-        start,
-        tx_lead(&audio),
-        worst,
-        sent_fillers,
-        speech_frames
+        start, lead_s, worst, sent_fillers, speech_frames
     );
     assert!(worst > 0.0, "the playout ran dry by {:.2} s", -worst);
     // The speech reaches the listener about the lead time after it was spoken: the
     // first sound is heard at lead + a block + the playout delay.
     let first_heard = start;
     assert!(
-        first_heard < tx_lead(&audio) + 2.0 * tx_block() + 2.0,
+        first_heard < lead_s + 2.0 * block_s + 2.0,
         "first speech after {first_heard:.1} s"
     );
     // Fillers were sent once the backlog was gone.
@@ -204,13 +215,4 @@ fn live_speech_streams_and_plays_without_running_dry() {
         "the transmitter never had to send a filler"
     );
     assert_eq!(FILLER, 0xFF);
-}
-
-fn tx_lead(_audio: &[f32]) -> f64 {
-    // 14 preamble periods and a 64-code header at 1920 chip/s.
-    (7154.0 + 5504.0) / 1920.0
-}
-
-fn tx_block() -> f64 {
-    2.75
 }

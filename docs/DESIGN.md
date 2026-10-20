@@ -159,6 +159,10 @@ Voice uses the fast end, and that is the price of spreading in 2.4 kHz:
 
 - **Voice on `2k4`:** DS4 ⅔ gives 560 bit/s, enough for Codec2 450.
 - **Voice on `3k`:** DS4 ¾ gives 787 bit/s, enough for Codec2 700C.
+- **Faster codecs (2026-10-20):** Codec2 1200 on `2k4` rides DS1 ½ (1680 bit/s), 1600
+  DS1 ⅔ (2240); on `3k`, 1200 rides DS2 ¾ (1575) and 1600 DS1 ½ (2100) (derived:
+  `3k` is 1.25 times `2k4`'s rates). They need a clean, strong channel (DS2 and DS1,
+  see *DS2 and DS1* under Verification).
 - **`500`:** no voice.
 
 Processing gain against narrowband interference is then about 6 dB. Pictures
@@ -191,7 +195,12 @@ A transmission is one or more *segments*; a segment is:
    threshold. (The mode field's 3-bit spread code keeps the original ladder's
    codes, DS 4 to 64 as 0 to 4, and gives SF 2 and 1 the two that were free, 5
    and 6: a build from before DS2 and DS1 skips a header that names them, and
-   every build reads the older ones.) (16 and 32 were measured too and never chosen, see Verification, so
+   every build reads the older ones. The payload type is 3 bits, codes 0 to 7; the
+   types from code 8 up, Codec2 1600 speech the first, go in a version-1 header whose
+   type field is one bit wider and whose session is one bit narrower (5 bits, 0 to
+   31). Every type that fits in 3 bits is still sent in the version-0 header, as
+   before, and a build that predates version 1 skips a version-1 header, which is
+   all it could do with a type it does not know.) (16 and 32 were measured too and never chosen, see Verification, so
    the receiver does not try them.) The receiver tries the alphabets shortest
    first, each as soon as its chips are in, so it starts as early as the
    transmitter allows. A longer header seen in a shorter alphabet despreads to
@@ -477,7 +486,8 @@ CRC-16 (headers) and CRC-32 (payload frames).
   1576 bytes.
 - **Voice** (M4, link layer and CLI done): Codec2 450 on `2k4`, 700C on `3k`, in
   the mode `Mode::voice` names (DS4 ⅔ and DS4 ¾), as store-and-forward "overs": a
-  recording is compressed, sent, and the receiver rebuilds the speech.
+  recording is compressed, sent, and the receiver rebuilds the speech. Codec2 1200
+  and 1600 are offered too, on the fast modes (*Faster codecs* below).
   - *Codec.* The pure-Rust `codec2` crate (0.3.1) has no 700C or 450 and upstream
     removed 450 in July 2023, so `decdsss-codec2` vendors the C core of the last
     commit that had it (9f5e2de), compiled with `cc` (no CMake, MSVC and gcc),
@@ -485,7 +495,8 @@ CRC-16 (headers) and CRC-32 (payload frames).
     the codebooks pre-generated (README in the crate, `vendor_codec2.py` to
     redo it). LGPL-2.1, linked into a GPL-3.0-or-later program; relinking is
     possible since it builds from source. Modes 3200–1200 are there too.
-  - *Framing.* The payload type says the codec (`Voice` = 700C, `Voice450`). The
+  - *Framing.* The payload type says the codec (`Voice` = 700C, `Voice450`,
+    `Voice1200`, `Voice1600`). The
     codec's frames are packed back to back as bits, a whole number to a modem
     frame (92 bytes at DS4 ⅔ hold 40 frames of 450, 18 bits each; 104 bytes at
     DS4 ¾ hold 29 frames of 700C), so a modem frame that does not decode is a
@@ -528,11 +539,30 @@ CRC-16 (headers) and CRC-32 (payload frames).
     "microphone" for 12 s, the CLI received header and five blocks and saved
     12.8 s of speech at the end frame; the speech player was checked by playing a
     tone through it into one cable and recording it from the other.
-  - *Keying:* see Radio I/O. *Not yet:* a short preamble; voice at DS2 or DS1
-    (derived: DS2 ⅔ on `2k4` is 1120 bit/s, 2.5 times Codec2 450's rate against
-    the 1.17 of DS4 ⅔, so a live stream would catch up fast after the start-up;
-    DS2 ¾ at 1260 bit/s carries Codec2 1200 only barely, 1.05 times, and not 1300
-    or 1600, which want DS1 ⅔ or ¾, 2240 or 2520 bit/s, on a channel that suits DS1).
+  - *Faster codecs (2026-10-20).* Codec2 1200 (48 bits per 40 ms) and 1600 (64 bits
+    per 40 ms) for the fast modes, where a modem frame carries speech faster than
+    it is spoken, so a live stream catches up with its backlog and the speech after
+    the start-up waits less. The pairs, `link::voice::voice_mode`, with the payload's
+    rate over the codec's (measured by the plan, whole codec frames to a modem
+    frame, depth 1):
+
+    | Codec | `2k4` | rate ratio | `3k` | rate ratio |
+    |---|---|---|---|---|
+    | 1200 | DS1 ½ (11 codec frames a modem frame) | 1.27 | DS2 ¾ (17) | 1.23 |
+    | 1600 | DS1 ⅔ (11) | 1.27 | DS1 ½ (8) | 1.15 |
+
+    The other pairs that look close do not keep up: DS2 ¾ on `2k4` carries 1200 at
+    0.99 and DS1 ½ on `2k4` carries 1600 at 0.93 (whole codec frames; 1260 and 1680
+    bit/s are not enough once the modem frame is cut into 6 and 8 bytes), so the
+    link layer does not suggest them. `tx --voice --codec 1200` takes the pair's mode
+    unless `--mode` says otherwise; the GUI's Codec2 choice does the same and its
+    "Use it" button says which mode suits the codec. 1300, 1400, 2400 and 3200 are in
+    the vendored core but not offered. A modem frame lost is a silent gap of 0.44 s
+    (11 frames of 40 ms), 0.68 s or 0.32 s. Codec2 1600's type is the first over
+    code 7, hence the version-1 header (Over structure, 2); its session is 0 to 31.
+    Speech quality of these codecs against 450 and 700C was not measured here; it is
+    the codec's, not the modem's.
+  - *Keying:* see Radio I/O. *Not yet:* a short preamble.
 - **ARQ** (M5): a connected mode for files on both stations' own codes, with
   selective repeat and ACK bitmaps sent at a robust mode.
 
@@ -1072,7 +1102,7 @@ the fast mode the G-RAKE was kept for.
 
 DS1 does not survive flutter fading (it lost 35 % even with SF 4's span, so the
 longer span is not the whole of it; the cause was not looked into); DS2 does.
-Neither is measured on `3k` or `500` under fading.
+Neither is measured on `500` under fading; `3k` is below (*Faster voice*).
 
 **Not covered: a slip in the audio.** `sync_slip_curve`
 (`SLIP_MODES=ds2-1/2,ds1-1/2`) cuts or repeats 1 to 50 ms in the middle of block 2
@@ -1089,6 +1119,52 @@ slip in about half the transmissions (measured above). A coherent statistic acro
 pilots (the gain products) would see it; it was not built. Until then a glitch in
 the audio costs a DS2 or DS1 transmission the rest of its segment, so shorten
 `--resync` for them.
+
+### Faster voice: Codec2 1200 and 1600 (2026-10-20)
+
+**Speech through the whole chain** (`tests/voice.rs`, the CLI): 6 s (test) or 12 s
+(CLI) of speech, 12 to 14 dB in-band SNR on AWGN, a carrier offset of 4 Hz and a
+clock error of 10 ppm, depth 2. All four pairs arrive with no frame lost and the
+speech the length that was sent (the CLI's 12 s of speech took 28, 28, 18 and 38
+modem frames for `2k4` 1200, `2k4` 1600, `3k` 1200 and `3k` 1600; the plan's rate
+ratios at depth 2 were 1.28, 1.28, 1.24 and 1.16, a little off the depth-1 ratios in
+the table above).
+
+**The modes' thresholds**, the same method as the AWGN table (24 transmissions a
+point, 0.5 dB steps; no frame lost from): `2k4` DS1 ½ 3.0 dB Eb/N0, DS1 ⅔ 3.5 dB
+(those two are in the table above); `3k` DS2 ¾ 4.5 dB (in-band +1.7 dB) and DS1 ½
+3.0 dB (+1.4 dB). On moderate fading (128 transmissions a point, depth 4, 8 frames
+each, offset 5 Hz, clock 10 ppm; frame loss % at 6 / 10 / 14 / 18 / 22 / 26 / 30 dB
+Eb/N0):
+
+| `3k` mode | 6 | 10 | 14 | 18 | 22 | 26 | 30 |
+|---|---|---|---|---|---|---|---|
+| DS4 ¾ (700C's mode) | 81.0 | 17.0 | 1.9 | 1.9 | 1.9 | 1.9 | 1.9 |
+| DS2 ¾ (1200) | 61.8 | 16.9 | 4.6 | 4.0 | 2.7 | 2.4 | 2.4 |
+| DS1 ½ (1600) | 39.5 | 12.1 | 2.7 | 2.7 | 2.7 | 2.7 | 2.7 |
+
+(`2k4` DS1 ½ and ⅔ are in the DS2 and DS1 table: floors 3.5 to 4.6 %.) For speech a
+lost frame is a gap, not a retransmission: from 18 dB Eb/N0 up, 2.4 to 4.6 % of the
+modem frames silent on a moderate HF path for these four pairs, against 1.9 % for
+700C on DS4 ¾.
+
+**Live voice** (`tests/live.rs`, in simulated time, 12 dB AWGN, offset 5 Hz): all
+the speech arrives, the end frame and the postamble are seen (within 3 s of the
+signal's end), the playout never runs dry. `2k4` 1200 on DS1 ½, 25 s talked: first
+speech heard 8.4 s into the signal (the lead is 6.6 s), 57 speech frames, 2 fillers
+(the backlog of the start-up is worked off). `3k` 1600 on DS1 ½, 50 s talked: first
+speech at 6.9 s (lead 5.3 s), 157 speech frames, 14 fillers; at 1.155 times the
+codec's rate the 5.3 s backlog takes 5.3 / 0.155 = 34 s to work off (derived), so a
+25 s talk would send none.
+
+*A fault found on the way:* the postamble that ends a live stream is asked about a
+second into each block (Over structure, 5), and a DS1 or DS2 block at depth 2 is
+shorter than that (0.69 s at DS1 ½ on `2k4`), so the block ended before the samples
+for the question were in and the postamble was never reported: the stream still
+closed on its end frame, but not on the postamble. The question now stays open
+across such a block (`eot_pending`) and is answered when the samples are in. A block
+longer than the postamble and its lags never takes that path: the live streams that
+existed, DS4 ⅔ and DS4 ¾ from depth 1 up, have blocks of 1.1 s or more.
 
 ### Not yet measured
 

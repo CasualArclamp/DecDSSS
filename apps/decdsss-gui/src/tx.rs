@@ -11,7 +11,7 @@ use decdsss_audio::wav;
 use decdsss_codec2::Mode as Codec;
 use decdsss_core::{Family, Mode, Profile, Slot};
 use decdsss_image::Source;
-use decdsss_link::voice::{default_codec, render_speech};
+use decdsss_link::voice::{CODECS, default_codec, render_speech, voice_mode};
 use decdsss_link::{
     SendSpec, VoiceSpec, air_seconds, container, max_stream_bytes, plan_voice, segments,
 };
@@ -237,7 +237,7 @@ impl TxPanel {
     /// Switches to voice and starts recording (for `--record-for`).
     pub fn auto_record(&mut self, devices_in: &[String], hint: &str) {
         self.voice = true;
-        if let Some(vm) = Mode::voice(self.profile) {
+        if let Some(vm) = self.suggested_voice_mode() {
             self.mode = vm.name();
         }
         self.vp.record_on(devices_in, hint);
@@ -295,7 +295,7 @@ impl TxPanel {
         }
         self.voice = true;
         self.live_mode = true;
-        if let Some(vm) = Mode::voice(self.profile) {
+        if let Some(vm) = self.suggested_voice_mode() {
             self.mode = vm.name();
         }
         self.depth = 2;
@@ -357,7 +357,7 @@ impl TxPanel {
         {
             // A WAV is speech to send.
             self.voice = true;
-            if let Some(vm) = Mode::voice(self.profile) {
+            if let Some(vm) = self.suggested_voice_mode() {
                 self.mode = vm.name();
             }
             self.vp.load(&path);
@@ -375,6 +375,16 @@ impl TxPanel {
             devices_out.get(self.device - 1).map(|d| d.0.clone())
         };
         (device, self.device_rate(devices_out))
+    }
+
+    /// The mode that suits the codec in use on this profile: DS4 for the profile's own
+    /// codec, DS2 or DS1 for 1200 and 1600 ([`voice_mode`]); the profile's voice mode where
+    /// the codec has no mode of its own; none on 500 Hz.
+    fn suggested_voice_mode(&self) -> Option<Mode> {
+        self.codec
+            .or_else(|| default_codec(self.profile))
+            .and_then(|c| voice_mode(self.profile, c))
+            .or_else(|| Mode::voice(self.profile))
     }
 
     /// The transmission as speech will be sent.
@@ -637,18 +647,32 @@ impl TxPanel {
             ui.label("Codec2");
             let auto =
                 default_codec(self.profile).map_or("none".to_string(), |c| c.name().to_string());
+            let before = self.codec;
             ui.selectable_value(&mut self.codec, None, format!("automatic ({auto})"));
-            ui.selectable_value(&mut self.codec, Some(Codec::C450), "450");
-            ui.selectable_value(&mut self.codec, Some(Codec::C700C), "700C");
+            for c in CODECS {
+                ui.selectable_value(&mut self.codec, Some(c), c.name());
+            }
+            // A new codec brings the mode that carries it along (1200 and 1600 need
+            // DS2 or DS1, 450 does not); the button below still says what is suggested.
+            if self.codec != before
+                && let Some(vm) = self.suggested_voice_mode()
+            {
+                self.mode = vm.name();
+            }
         });
-        if let Some(vm) = Mode::voice(self.profile)
+        if let Some(vm) = self.suggested_voice_mode()
             && vm.name() != self.mode
         {
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "{} is the voice mode for {}",
                     vm.name(),
-                    self.profile
+                    self.codec
+                        .or_else(|| default_codec(self.profile))
+                        .map_or_else(
+                            || self.profile.to_string(),
+                            |c| { format!("Codec2 {c} on {}", self.profile) }
+                        )
                 ));
                 if ui.button("Use it").clicked() {
                     self.mode = vm.name();
@@ -1082,7 +1106,7 @@ impl TxPanel {
                 self.text = kind == 3;
                 if self.voice
                     && !was_voice
-                    && let Some(vm) = Mode::voice(self.profile)
+                    && let Some(vm) = self.suggested_voice_mode()
                 {
                     self.mode = vm.name();
                 }

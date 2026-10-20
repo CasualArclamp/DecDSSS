@@ -48,10 +48,15 @@ fn speech_arrives_as_speech_of_the_same_length() {
     for (profile, codec, ptype) in [
         (Profile::W2400, Codec::C450, PayloadType::Voice450),
         (Profile::W3000, Codec::C700C, PayloadType::Voice),
+        // The fast modes' codecs (DS1 and DS2; 1600's header is the wide one).
+        (Profile::W2400, Codec::C1200, PayloadType::Voice1200),
+        (Profile::W2400, Codec::C1600, PayloadType::Voice1600),
+        (Profile::W3000, Codec::C1200, PayloadType::Voice1200),
+        (Profile::W3000, Codec::C1600, PayloadType::Voice1600),
     ] {
         let spec = VoiceSpec {
             profile,
-            mode: decdsss_core::Mode::voice(profile).unwrap(),
+            mode: decdsss_link::voice::voice_mode(profile, codec).unwrap(),
             depth: 2,
             call: "VK2ABC".into(),
             session: 9,

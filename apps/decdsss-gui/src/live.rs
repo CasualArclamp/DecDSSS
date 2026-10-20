@@ -105,13 +105,14 @@ impl LiveTxSession {
     /// Opens the microphone and the output and starts sending. Errors (no such
     /// device, a callsign with no code) come back here.
     pub fn start(cfg: &LiveConfig) -> Result<LiveTxSession, String> {
+        let ptype = ptype_of(cfg.codec).ok_or("this codec is not a voice mode here")?;
         let header = Header {
             profile: cfg.profile,
             mode: cfg.mode,
             depth: cfg.depth,
-            ptype: ptype_of(cfg.codec).ok_or("this codec is not a voice mode here")?,
+            ptype,
             call: cfg.call.clone(),
-            session: cfg.session,
+            session: ptype.fit_session(cfg.session),
             frame0: 0,
             nblocks: 4095,
             total_frames: 0,

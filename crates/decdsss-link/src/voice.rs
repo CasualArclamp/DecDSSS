@@ -2,7 +2,8 @@
 //! Voice: Codec2 speech in modem frames.
 //!
 //! Speech (8 kHz, mono) is compressed by Codec2 — 450 bit/s on the 2.4 kHz
-//! profile, 700C on 3 kHz — and the codec frames are packed end to end into the
+//! profile, 700C on 3 kHz, or 1200 and 1600 on the fast modes (DS2 and DS1) —
+//! and the codec frames are packed end to end into the
 //! data of the modem's frames, a whole number of codec frames to a modem frame
 //! (a few bits of padding at the end of each). Each modem frame is then
 //! self-contained: one that does not decode is a gap of known length in the
@@ -24,15 +25,22 @@ pub fn ptype_of(codec: Codec) -> Option<PayloadType> {
     match codec {
         Codec::C700C => Some(PayloadType::Voice),
         Codec::C450 => Some(PayloadType::Voice450),
+        Codec::C1200 => Some(PayloadType::Voice1200),
+        Codec::C1600 => Some(PayloadType::Voice1600),
         _ => None,
     }
 }
+
+/// The codecs a voice transmission can use, slowest first.
+pub const CODECS: [Codec; 4] = [Codec::C450, Codec::C700C, Codec::C1200, Codec::C1600];
 
 /// The codec a voice payload type means.
 pub fn codec_of(ptype: PayloadType) -> Option<Codec> {
     match ptype {
         PayloadType::Voice => Some(Codec::C700C),
         PayloadType::Voice450 => Some(Codec::C450),
+        PayloadType::Voice1200 => Some(Codec::C1200),
+        PayloadType::Voice1600 => Some(Codec::C1600),
         _ => None,
     }
 }
@@ -44,6 +52,33 @@ pub fn default_codec(profile: Profile) -> Option<Codec> {
         Profile::N500 => None,
         Profile::W2400 => Some(Codec::C450),
         Profile::W3000 => Some(Codec::C700C),
+    }
+}
+
+/// The mode that carries `codec` on `profile` with the speech running ahead of
+/// the air time (see [`VoicePlan::throughput_ratio`]), or `None` where there is
+/// none to suggest. 450 on 2.4 kHz and 700C on 3 kHz are [`Mode::voice`]; the
+/// faster codecs ride DS2 and DS1, which need a clean, strong channel (DESIGN.md,
+/// *DS2 and DS1*). The ratios are at depth 1 (`modes_for_the_faster_codecs_keep_up`):
+///
+/// | codec | 2.4 kHz | ratio | 3 kHz | ratio |
+/// |---|---|---|---|---|
+/// | 1200 | DS1 1/2 | 1.27 | DS2 3/4 | 1.23 |
+/// | 1600 | DS1 2/3 | 1.27 | DS1 1/2 | 1.15 |
+///
+/// (Measured by the plan, whole codec frames to a modem frame: 11 of 48 or 64 bits in
+/// 68 or 92 bytes, 17 and 8 at 3 kHz. DS2 3/4 on 2.4 kHz would carry 1200 at 0.99 and
+/// DS1 1/2 on 2.4 kHz 1600 at 0.93, below 1, so those are not suggested.)
+pub fn voice_mode(profile: Profile, codec: Codec) -> Option<Mode> {
+    let ds = |sf, rate| Mode::new(decdsss_core::Family::DsPsk, sf, rate);
+    use decdsss_core::CodeRate::{R1_2, R2_3, R3_4};
+    match (profile, codec) {
+        (Profile::W2400, Codec::C450) | (Profile::W3000, Codec::C700C) => Mode::voice(profile),
+        (Profile::W2400, Codec::C1200) => ds(1, R1_2),
+        (Profile::W2400, Codec::C1600) => ds(1, R2_3),
+        (Profile::W3000, Codec::C1200) => ds(2, R3_4),
+        (Profile::W3000, Codec::C1600) => ds(1, R1_2),
+        _ => None,
     }
 }
 
@@ -103,7 +138,7 @@ fn per_frame(frame_bytes: usize, bits: usize) -> usize {
 pub fn plan_voice(spec: &VoiceSpec, speech: &[i16]) -> Result<VoicePlan, String> {
     let ptype = ptype_of(spec.codec).ok_or_else(|| {
         format!(
-            "Codec2 {} is not a voice mode here (use 450 or 700C)",
+            "Codec2 {} is not a voice mode here (use 450, 700C, 1200 or 1600)",
             spec.codec
         )
     })?;
@@ -143,7 +178,7 @@ pub fn plan_voice(spec: &VoiceSpec, speech: &[i16]) -> Result<VoicePlan, String>
         depth: spec.depth,
         ptype,
         call: &spec.call,
-        session: spec.session,
+        session: ptype.fit_session(spec.session),
         resync_s: spec.resync_s,
     };
     let segments = cut_segments(&frames_hdr, &frames);
@@ -234,7 +269,9 @@ mod tests {
     fn spec(profile: Profile, codec: Codec) -> VoiceSpec {
         VoiceSpec {
             profile,
-            mode: Mode::voice(profile).unwrap(),
+            mode: voice_mode(profile, codec)
+                .or_else(|| Mode::voice(profile))
+                .unwrap(),
             depth: 1,
             call: "VK2ABC".into(),
             session: 2,
@@ -259,10 +296,13 @@ mod tests {
 
     #[test]
     fn codecs_and_payload_types_go_together() {
-        for c in [Codec::C450, Codec::C700C] {
+        for c in CODECS {
             assert_eq!(codec_of(ptype_of(c).unwrap()), Some(c));
         }
-        assert_eq!(ptype_of(Codec::C1200), None);
+        // The other Codec2 rates are in the vendored core but not offered.
+        for c in [Codec::C3200, Codec::C2400, Codec::C1400, Codec::C1300] {
+            assert_eq!(ptype_of(c), None);
+        }
         assert_eq!(codec_of(PayloadType::File), None);
         assert_eq!(default_codec(Profile::W2400), Some(Codec::C450));
         assert_eq!(default_codec(Profile::W3000), Some(Codec::C700C));
@@ -274,6 +314,10 @@ mod tests {
         for (profile, codec) in [
             (Profile::W2400, Codec::C450),
             (Profile::W3000, Codec::C700C),
+            (Profile::W2400, Codec::C1200),
+            (Profile::W2400, Codec::C1600),
+            (Profile::W3000, Codec::C1200),
+            (Profile::W3000, Codec::C1600),
         ] {
             let s = speech(6.0);
             let p = plan_voice(&spec(profile, codec), &s).unwrap();
@@ -282,7 +326,7 @@ mod tests {
                 "{}",
                 p.speech_seconds
             );
-            assert!(p.per_frame >= 20, "{}", p.per_frame);
+            assert!(p.per_frame >= 8, "{}", p.per_frame);
             let frames: Vec<Option<Vec<u8>>> = p
                 .segments
                 .iter()
@@ -310,7 +354,16 @@ mod tests {
             let level = |x: &[i16]| {
                 (x.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / x.len() as f64).sqrt()
             };
-            for (a, b) in back.chunks_exact(n).zip(direct.chunks_exact(n)).skip(10) {
+            // Only the speech itself: the padding after it is silence, which the faster
+            // codecs decode to a few counts of noise drawn from the C library's rand()
+            // (shared by every test thread), so its level differs from run to run.
+            let speech_frames = s.len() / n;
+            for (a, b) in back
+                .chunks_exact(n)
+                .zip(direct.chunks_exact(n))
+                .take(speech_frames)
+                .skip(10)
+            {
                 let (la, lb) = (level(a), level(b));
                 assert!(
                     la > 0.0 && (0.8..1.25).contains(&(lb / la)),
@@ -356,7 +409,61 @@ mod tests {
             );
             assert!(p.air_seconds > p.speech_seconds / p.throughput_ratio);
         }
-        assert!(plan_voice(&spec(Profile::W2400, Codec::C1200), &speech(1.0)).is_err());
+        assert!(plan_voice(&spec(Profile::W2400, Codec::C1300), &speech(1.0)).is_err());
         assert!(plan_voice(&spec(Profile::W2400, Codec::C450), &[]).is_err());
+    }
+
+    #[test]
+    fn modes_for_the_faster_codecs_keep_up() {
+        // The table in `voice_mode`'s documentation, from the plan itself: the
+        // payload runs at least 1.15 times the codec's rate (the older pairs, 450
+        // on 2.4 kHz and 700C on 3 kHz, 1.17 and 1.05).
+        for (profile, codec, mode, ratio) in [
+            (Profile::W2400, Codec::C1200, "ds1-1/2", 1.27),
+            (Profile::W2400, Codec::C1600, "ds1-2/3", 1.27),
+            (Profile::W3000, Codec::C1200, "ds2-3/4", 1.23),
+            (Profile::W3000, Codec::C1600, "ds1-1/2", 1.155),
+        ] {
+            let m = voice_mode(profile, codec).unwrap();
+            assert_eq!(m, Mode::from_name(mode).unwrap(), "{profile} {codec}");
+            let p = plan_voice(&spec(profile, codec), &speech(10.0)).unwrap();
+            assert!(
+                (p.throughput_ratio - ratio).abs() < 0.005,
+                "{profile} {codec} {m}: {}",
+                p.throughput_ratio
+            );
+            assert!(p.throughput_ratio >= 1.15, "{}", p.throughput_ratio);
+        }
+        // The pairs that would not keep up are not suggested.
+        for (profile, codec, mode) in [
+            (Profile::W2400, Codec::C1200, "ds2-3/4"),
+            (Profile::W2400, Codec::C1600, "ds1-1/2"),
+            (Profile::W3000, Codec::C1600, "ds2-3/4"),
+        ] {
+            let mut sp = spec(profile, codec);
+            sp.mode = Mode::from_name(mode).unwrap();
+            let p = plan_voice(&sp, &speech(10.0)).unwrap();
+            assert!(
+                p.throughput_ratio < 1.0,
+                "{profile} {codec} {mode}: {}",
+                p.throughput_ratio
+            );
+            assert_ne!(voice_mode(profile, codec), Some(sp.mode));
+        }
+        assert_eq!(
+            voice_mode(Profile::W2400, Codec::C450),
+            Mode::voice(Profile::W2400)
+        );
+        assert_eq!(voice_mode(Profile::N500, Codec::C1200), None);
+    }
+
+    #[test]
+    fn a_wide_header_gets_a_session_it_can_hold() {
+        // Codec2 1600's payload type needs the wide header: sessions 0 to 31.
+        let mut sp = spec(Profile::W2400, Codec::C1600);
+        sp.session = 45;
+        let p = plan_voice(&sp, &speech(3.0)).unwrap();
+        assert_eq!(p.segments[0].header.session, 45 & 31);
+        assert!(p.segments[0].header.pack().is_some());
     }
 }

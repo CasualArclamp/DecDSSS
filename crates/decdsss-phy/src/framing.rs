@@ -15,8 +15,14 @@ use decdsss_fec::ldpc::Code;
 
 /// Header information bits before the CRC-16 (the header code's k is 128).
 pub const HEADER_INFO_BITS: usize = 112;
-/// Header version this build writes and reads.
+/// Header version this build writes for the payload types whose code fits in 3
+/// bits, and reads.
 pub const VERSION: u8 = 0;
+/// The version for the payload types whose code needs 4 bits (8 and up): the type
+/// field is one bit wider and the session one bit narrower (5 bits, 0 to 31). A
+/// build that predates it skips such a header (its version is not 0), which is all
+/// it could do with a type it does not know.
+pub const VERSION_WIDE: u8 = 1;
 
 /// Codeword depths a block can have (codewords interleaved together).
 pub const DEPTHS: [usize; 4] = [1, 2, 4, 8];
@@ -37,20 +43,65 @@ pub enum PayloadType {
     /// A CQ call: the header is the whole message (see `decdsss-link`'s cq module),
     /// so there are no payload blocks.
     Cq = 6,
+    /// Codec2 1200 speech, for the fast modes (DS2 and DS1).
+    Voice1200 = 7,
+    /// Codec2 1600 speech. The first type with a code over 7, so its header is
+    /// version 1 ([`VERSION_WIDE`]).
+    Voice1600 = 8,
 }
 
 impl PayloadType {
+    /// Every type, in code order.
+    pub const ALL: [PayloadType; 9] = [
+        PayloadType::Test,
+        PayloadType::File,
+        PayloadType::Picture,
+        PayloadType::Voice,
+        PayloadType::Voice450,
+        PayloadType::Text,
+        PayloadType::Cq,
+        PayloadType::Voice1200,
+        PayloadType::Voice1600,
+    ];
+
     fn from_u8(v: u8) -> Option<PayloadType> {
-        match v {
-            0 => Some(PayloadType::Test),
-            1 => Some(PayloadType::File),
-            2 => Some(PayloadType::Picture),
-            3 => Some(PayloadType::Voice),
-            4 => Some(PayloadType::Voice450),
-            5 => Some(PayloadType::Text),
-            6 => Some(PayloadType::Cq),
-            _ => None,
+        PayloadType::ALL.get(usize::from(v)).copied()
+    }
+
+    /// Speech, whichever codec.
+    pub fn is_voice(self) -> bool {
+        matches!(
+            self,
+            PayloadType::Voice
+                | PayloadType::Voice450
+                | PayloadType::Voice1200
+                | PayloadType::Voice1600
+        )
+    }
+
+    /// The header version that carries this type: 0, or [`VERSION_WIDE`] when its
+    /// code does not fit in 3 bits.
+    pub fn header_version(self) -> u8 {
+        if (self as u8) < 8 {
+            VERSION
+        } else {
+            VERSION_WIDE
         }
+    }
+
+    /// Bits of the header's session field next to this type: 6, or 5 in a wide header.
+    pub fn session_bits(self) -> usize {
+        if self.header_version() == VERSION {
+            6
+        } else {
+            5
+        }
+    }
+
+    /// `session` cut down to what this type's header can hold (a session number
+    /// only tells one transmission from the next, so the low bits do).
+    pub fn fit_session(self, session: u8) -> u8 {
+        session & ((1u8 << self.session_bits()) - 1)
     }
 }
 
@@ -139,11 +190,16 @@ impl Header {
     /// is out of range.
     pub fn pack(&self) -> Option<Vec<u8>> {
         let depth_idx = DEPTHS.iter().position(|&d| d == self.depth)?;
-        if self.session >= 64 || self.nblocks >= 1 << 12 || self.total_frames >= 1 << 15 {
+        let session_bits = self.ptype.session_bits();
+        if u32::from(self.session) >= 1 << session_bits
+            || self.nblocks >= 1 << 12
+            || self.total_frames >= 1 << 15
+        {
             return None;
         }
+        let version = self.ptype.header_version();
         let mut w = BitWriter(Vec::with_capacity(128));
-        w.put(u64::from(VERSION), 2);
+        w.put(u64::from(version), 2);
         w.put(profile_index(self.profile), 2);
         w.put(family_bit(self.mode.family), 1);
         w.put(spread_index(self.mode), 3);
@@ -152,9 +208,9 @@ impl Header {
             2,
         );
         w.put(depth_idx as u64, 2);
-        w.put(self.ptype as u64, 3);
+        w.put(self.ptype as u64, 3 + usize::from(version));
         w.put(pack_call(&self.call)?, CALL_BITS as usize);
-        w.put(u64::from(self.session), 6);
+        w.put(u64::from(self.session), session_bits);
         w.put(u64::from(self.frame0), 16);
         w.put(u64::from(self.nblocks), 12);
         w.put(u64::from(self.total_frames), 15);
@@ -172,7 +228,8 @@ impl Header {
         }
         let crc = crc16(&bytes_of(&bits[..HEADER_INFO_BITS]));
         let mut r = BitReader { bits, pos: 0 };
-        if r.get(2) != u64::from(VERSION) {
+        let version = r.get(2) as u8;
+        if version != VERSION && version != VERSION_WIDE {
             return None;
         }
         let profile = *Profile::ALL.get(r.get(2) as usize)?;
@@ -185,9 +242,14 @@ impl Header {
         let rate = *CodeRate::ALL.get(r.get(2) as usize)?;
         let mode = Mode::new(family, spread, rate)?;
         let depth = *DEPTHS.get(r.get(2) as usize)?;
-        let ptype = PayloadType::from_u8(r.get(3) as u8)?;
+        let ptype = PayloadType::from_u8(r.get(3 + usize::from(version)) as u8)?;
+        // One spelling per type: a wide header for a type that fits in 3 bits (or the
+        // other way round) is not something this build writes.
+        if ptype.header_version() != version {
+            return None;
+        }
         let call = unpack_call(r.get(CALL_BITS as usize))?;
-        let session = r.get(6) as u8;
+        let session = r.get(ptype.session_bits()) as u8;
         let frame0 = r.get(16) as u16;
         let nblocks = r.get(12) as u16;
         let total_frames = r.get(15) as u16;
@@ -353,6 +415,39 @@ mod tests {
                     assert_eq!(Header::unpack(&bits), Some(h));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn every_payload_type_round_trips_in_the_header_that_carries_it() {
+        for ptype in PayloadType::ALL {
+            let top = (1u8 << ptype.session_bits()) - 1;
+            for session in [0, 1, top] {
+                let h = Header {
+                    ptype,
+                    session,
+                    ..header()
+                };
+                let bits = h.pack().unwrap();
+                // The version sits in the first two bits.
+                assert_eq!(bits[0] == 0 && bits[1] == 1, ptype as u8 >= 8, "{ptype:?}");
+                assert_eq!(
+                    Header::unpack(&bits),
+                    Some(h),
+                    "{ptype:?} session {session}"
+                );
+            }
+            // One past the session the type's header can hold.
+            let h = Header {
+                ptype,
+                session: top + 1,
+                ..header()
+            };
+            assert_eq!(h.pack(), None, "{ptype:?}");
+        }
+        // The codes of the first seven are the ones older builds wrote.
+        for (code, ptype) in PayloadType::ALL.iter().take(7).enumerate() {
+            assert_eq!(*ptype as usize, code);
         }
     }
 
