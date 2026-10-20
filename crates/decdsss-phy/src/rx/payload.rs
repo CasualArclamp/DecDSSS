@@ -117,6 +117,83 @@ fn rake_only() -> bool {
     *RAKE_ONLY.get_or_init(|| std::env::var_os("DECDSSS_RAKE_ONLY").is_some())
 }
 
+/// The spreading factor whose pilot interval the gain smoothing and the carrier
+/// measurement are timed by: SF 4's pilots are 8 symbols of 4 chips apart, 16.7 ms
+/// on `2k4`, and its smoothing is the triangle [1 2 1]/4, which reaches two
+/// intervals either side before it is zero.
+const SMOOTH_REF_SF: usize = 4;
+
+/// Pilots in one of SF 4's pilot intervals: 1 at SF 4 and above, 2 at SF 2, 4 at
+/// SF 1. A pilot is one symbol in eight, so at a smaller SF the pilots come
+/// faster, and each carries less: its gain is a sum over L chips, and the thermal
+/// noise and the other paths' chips both average down as 1/L, so a raw gain is
+/// 1/L as good (derived). The pilot energy a second is the same at every SF, so
+/// smoothing over the same *time* gives an estimate as good as SF 4's, where
+/// smoothing over the same number of pilots (SF 1: 8 ms) leaves it about 6 dB
+/// worse (10·log10 4, derived).
+fn pilots_per_ref_interval(sf: usize) -> usize {
+    (SMOOTH_REF_SF / sf).max(1)
+}
+
+/// How many times SF 4's span in time the smoothing covers at SF 2 and 1. The
+/// same span would give an estimate as good as SF 4's, but at SF 2 and 1 that is
+/// not enough: a symbol is two chips or one, so the combined symbol SINR is 3 to
+/// 6 dB under SF 4's and the channel estimate's error counts for more. Measured
+/// (`decdsss sweep --fading moderate --offset 5 --clock-ppm 10`, 64 transmissions,
+/// DS1 3/4 at 30 dB Eb/N0, frames lost): 13.7 % at ×1, 6.3 % at ×2, 6.1 % at ×3,
+/// 5.7 % at ×4. A longer span follows a fast fade less well: DS1 1/2 on flutter
+/// fading at 26 dB lost 35 % at ×1, 45 % at ×2, 77 % at ×3, 96 % at ×4 (DS2 1/2:
+/// 2.3, 3.1, 18, 54 %). Two is the compromise.
+const SMOOTH_STRETCH_FAST: usize = 2;
+
+/// Pilots either side that the smoothing's triangle reaches (weights `half + 1 -
+/// |i|`): [1 2 1] for `half` 1 (SF 4 and above), and at SF 2 and 1 the span in
+/// time of `SMOOTH_STRETCH_FAST` times SF 4's (SF 2: 7, SF 1: 15).
+fn smooth_half_width(sf: usize) -> usize {
+    let stretch = if sf < SMOOTH_REF_SF {
+        SMOOTH_STRETCH_FAST
+    } else {
+        1
+    };
+    2 * pilots_per_ref_interval(sf) * stretch - 1
+}
+
+/// The noise a smoothed pilot gain carries, as a fraction of a raw gain's: the
+/// triangle's Σw² / (Σw)², 0.375 for `half` = 1 and 0.042 for SF 1's 15.
+fn smooth_noise_gain(half: usize) -> f64 {
+    let n = half as i64;
+    let (mut s, mut s2) = (0.0, 0.0);
+    for i in -n..=n {
+        let w = (n + 1 - i.abs()) as f64;
+        s += w;
+        s2 += w * w;
+    }
+    s2 / (s * s)
+}
+
+/// The pilot gains smoothed by a triangle of `half` pilots either side (weights
+/// `half + 1 - |i|`, so [1 2 1]/4 for 1), shorter at the ends where the weights
+/// that remain are scaled to one.
+fn smooth_gains(g: &[[Iq; SLOTS]], half: usize) -> Vec<[Iq; SLOTS]> {
+    (0..g.len())
+        .map(|k| {
+            let (lo, hi) = (k.saturating_sub(half), (k + half).min(g.len() - 1));
+            let mut out = [Iq::new(0.0, 0.0); SLOTS];
+            let mut wsum = 0.0f32;
+            // Rust note: `take(hi + 1).skip(lo)` is the slice `lo..=hi` as an
+            // iterator that still carries the index (`enumerate` first).
+            for (j, gj) in g.iter().enumerate().take(hi + 1).skip(lo) {
+                let w = (half + 1 - j.abs_diff(k)) as f32;
+                for (o, &z) in out.iter_mut().zip(gj) {
+                    *o += z * w;
+                }
+                wsum += w;
+            }
+            out.map(|z| z / wsum)
+        })
+        .collect()
+}
+
 /// Where a block's known-chip refinement starts: after a slip the block's
 /// timing is one line only from the slip on, so there, on the track that symbol
 /// was taken on (moved onto the end's finger lags); otherwise the block's start.
@@ -1446,14 +1523,19 @@ impl PayloadRx {
                 for fi in 0..SLOTS {
                     wk.g[wk.pilot_no][fi] = wk.y[s][fi] * p;
                 }
-                if wk.pilot_no > 0 {
-                    let (a, b) = (wk.g[wk.pilot_no][0], wk.g[wk.pilot_no - 1][0]);
+                // The carrier is measured from pilots `lag` apart, so the interval
+                // is the same (SF 4's) at every SF: adjacent pilots at SF 1 are
+                // 4 ms apart, which gives the turn between them four times less to
+                // show above the noise.
+                let lag = pilots_per_ref_interval(l);
+                if wk.pilot_no >= lag {
+                    let (a, b) = (wk.g[wk.pilot_no][0], wk.g[wk.pilot_no - lag][0]);
                     wk.freq_acc += a * b.conj();
                     wk.freq_norm += a.norm() * b.norm();
                 }
                 wk.pilot_no += 1;
                 if wk.pilot_no.is_multiple_of(freq_every) {
-                    wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, t_pilot);
+                    wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, lag as f64 * t_pilot);
                     wk.t.freq =
                         wk.t.freq
                             .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
@@ -1706,22 +1788,14 @@ impl PayloadRx {
         let (s_count, pilots) = (wk.s_count, g.len());
         debug_assert_eq!(wk.pilot_no, pilots);
 
-        // Smooth the pilot gains ([1 2 1]/4, shorter at the ends) and
-        // interpolate linearly to the data symbols.
-        let mut hs = vec![[Iq::new(0.0, 0.0); SLOTS]; pilots];
-        for k in 0..pilots {
-            for fi in 0..SLOTS {
-                hs[k][fi] = match (k.checked_sub(1), (k + 1 < pilots).then_some(k + 1)) {
-                    (Some(a), Some(b)) => (g[a][fi] + g[k][fi] * 2.0 + g[b][fi]) / 4.0,
-                    (None, Some(b)) => (g[k][fi] * 2.0 + g[b][fi]) / 3.0,
-                    (Some(a), None) => (g[a][fi] + g[k][fi] * 2.0) / 3.0,
-                    (None, None) => g[k][fi],
-                };
-            }
-        }
+        // Smooth the pilot gains (a triangle of `half` pilots either side, [1 2 1]/4
+        // at SF 4; shorter at the ends) and interpolate linearly to the data symbols.
+        let half = smooth_half_width(usize::from(self.header.mode.spread));
+        let mut hs = smooth_gains(g, half);
         // Per finger, the noise in a pilot gain from the second difference (the
         // smooth channel cancels): var(g_k − (g_{k−1}+g_{k+1})/2) = 1.5 σ². A
-        // smoothed estimate carries 0.375 σ² of it. Where a finger's estimate
+        // smoothed estimate carries `smooth_noise_gain(half)` of σ² (0.375 for
+        // SF 4's kernel). Where a finger's estimate
         // is not clearly above that (a noise peak taken for a path, a path in a
         // fade) its weight is cut by power subtraction, so it stops adding noise.
         for fi in 0..SLOTS {
@@ -1734,7 +1808,7 @@ impl PayloadRx {
             if cnt == 0 {
                 continue;
             }
-            let var = (0.375 * acc / cnt as f64) as f32;
+            let var = (smooth_noise_gain(half) * acc / cnt as f64) as f32;
             for h in hs.iter_mut() {
                 let p = h[fi].norm_sqr();
                 if p > 0.0 {
@@ -1998,7 +2072,7 @@ mod tests {
                 let mut rng = Rng::new(ch.seed);
                 let g0 = decdsss_chan::tap_process(n, 48_000.0, w.spread_hz, &mut rng);
                 let g1 = decdsss_chan::tap_process(n, 48_000.0, w.spread_hz, &mut rng);
-                let t0 = 1.0 + crate::tx::lead_chips(profile) as f64 / 1920.0;
+                let t0 = 1.0 + crate::tx::lead_chips_for(profile, m) as f64 / 1920.0;
                 let blk = seg_block_seconds(&seg);
                 let mut t = t0 - 0.5;
                 while t < t0 + 4.0 * blk {
@@ -2085,18 +2159,115 @@ mod tests {
         println!("{mode}: {lost} of {total} frames lost");
     }
 
+    /// The same hunt through the whole receiver: preamble search, header, then
+    /// the payload from what the header gave. Prints, for transmissions that lose
+    /// frames, how far the header's timing and carrier were from the truth and
+    /// what each block did. `DEBUG_MODE`, `DEBUG_EBN0` (default 30), `DEBUG_TRIALS`
+    /// (default 48), `DEBUG_DEPTH` (4), `DEBUG_BLOCKS` (2), `DEBUG_FADE` (moderate,
+    /// good, poor, none).
+    #[test]
+    #[ignore]
+    fn debug_full_floor() {
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
+        let mode = env("DEBUG_MODE", "ds1-3/4");
+        let ebn0: f64 = env("DEBUG_EBN0", "30").parse().unwrap();
+        let trials: usize = env("DEBUG_TRIALS", "48").parse().unwrap();
+        let depth: usize = env("DEBUG_DEPTH", "4").parse().unwrap();
+        let blocks: u16 = env("DEBUG_BLOCKS", "2").parse().unwrap();
+        let fading = match env("DEBUG_FADE", "moderate").as_str() {
+            "good" => Some(Watterson::GOOD),
+            "poor" => Some(Watterson::POOR),
+            "none" => None,
+            _ => Some(Watterson::MODERATE),
+        };
+        let profile = Profile::W2400;
+        let m = decdsss_core::Mode::from_name(&mode).unwrap();
+        let cr = f64::from(profile.chip_rate());
+        let (mut lost, mut total, mut no_header) = (0, 0, 0);
+        for trial in 0..trials {
+            let seg = segment(profile, &mode, depth, blocks);
+            let mut ch = channel(profile, ebn0 + m.snr_offset_db(profile));
+            ch.seed = 9000 + trial as u64;
+            ch.fading = fading;
+            ch.offset_hz = -10.0 + (trial % 7) as f64 * 3.0;
+            ch.clock_ppm = -30.0 + (trial % 5) as f64 * 15.0;
+            let audio = through(&seg, &ch);
+            let (mut rx, buf, head) = if std::env::var("DEBUG_GENIE").is_ok() {
+                let (rx, buf) = genie(&seg, &ch, &audio);
+                (rx, buf, "genie start".to_string())
+            } else {
+                let Ok(run) = to_header(&audio, profile) else {
+                    no_header += 1;
+                    continue;
+                };
+                // Where the first payload chip really is (as `genie` has it).
+                let mut fe = crate::rx::frontend::Frontend::new(profile, FS);
+                let rate = fe.out_rate();
+                let r = 1.0 + ch.clock_ppm * 1e-6;
+                let first_chip = ((1.0 + 10.0 / cr) * rate + fe.delay()) / r;
+                let lead = crate::tx::lead_chips_for(profile, seg.header.mode);
+                let truth = first_chip + lead as f64 * crate::rx::frontend::SPS as f64 / r;
+                let t = run.header.track;
+                let head = format!(
+                    "pos {:+.2} chips, carrier {:+.2} Hz, clock {:+.0} ppm, fingers {:?}",
+                    (t.pos - truth) / t.step,
+                    t.freq - ch.offset_hz,
+                    (t.step / (crate::rx::frontend::SPS as f64 / r) - 1.0) * 1e6,
+                    run.header
+                        .fingers
+                        .iter()
+                        .map(|f| (f.lag * 100.0).round() / 100.0)
+                        .collect::<Vec<_>>()
+                );
+                let rx = PayloadRx::new(&run.header, rate).unwrap();
+                let mut samples = Vec::new();
+                fe.push(&audio, &mut samples);
+                let mut buf = crate::rx::frontend::Buf::default();
+                buf.push(&samples);
+                (rx, buf, head)
+            };
+            let (mut line, mut bad) = (String::new(), 0);
+            while let Some(b) = rx.step(&buf) {
+                let ok = b
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, f)| f.as_ref() == Some(&seg.frames[b.first_frame + i]))
+                    .count();
+                total += b.frames.len();
+                lost += b.frames.len() - ok;
+                bad += b.frames.len() - ok;
+                line += &format!(" b{}:{}/{}", b.index, ok, b.frames.len());
+            }
+            if bad > 0 {
+                println!("trial {trial} seed {}: {head};{line}", ch.seed);
+            }
+        }
+        println!("{mode}: {lost} of {total} frames lost, {no_header} without a header");
+    }
+
     /// A stretch of audio cut out of (negative) or silence put into (positive)
     /// the middle of block 2, as a sound card that drops or repeats a buffer
     /// does; which blocks decode after it, on a clean channel and on moderate
     /// fading. `cargo test --release -p decdsss-phy sync_slip_curve -- --ignored
     /// --nocapture`; `SLIP_ONLY=ds4`, `SLIP_TRIAL=0` and `SLIP_MS=-50` narrow it
-    /// to one mode, trial and cut. A number in brackets is the slips followed.
+    /// to one mode, trial and cut, `SLIP_MODES` picks the modes. A number in brackets is the
+    /// slips followed.
     #[test]
     #[ignore]
     fn sync_slip_curve() {
         let profile = Profile::W2400;
         let only = std::env::var("SLIP_ONLY").ok();
-        for mode in ["ds4-2/3", "ds8-1/2", "csk64-1/2"] {
+        // `SLIP_MODES=ds2-1/2,ds1-1/2` replaces the modes tried.
+        let modes: Vec<String> = std::env::var("SLIP_MODES").map_or_else(
+            |_| {
+                ["ds4-2/3", "ds8-1/2", "csk64-1/2"]
+                    .map(String::from)
+                    .to_vec()
+            },
+            |v| v.split(',').map(String::from).collect(),
+        );
+        for mode in modes.iter().map(String::as_str) {
             if only.as_ref().is_some_and(|o| !mode.starts_with(o.as_str())) {
                 continue;
             }
@@ -2212,6 +2383,63 @@ mod tests {
             let (ok, total, note) = recover(Profile::W2400, mode, 1, 2, &ch);
             assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");
         }
+    }
+
+    #[test]
+    fn the_fast_end_decodes_with_noise_offset_and_clock_error() {
+        // SF 2 and 1, 5 dB over what the AWGN sweeps found they need (3 to 4 dB).
+        for mode in ["ds2-1/2", "ds2-3/4", "ds1-1/2", "ds1-3/4"] {
+            let m = decdsss_core::Mode::from_name(mode).unwrap();
+            let mut ch = channel(Profile::W2400, 9.0 + m.snr_offset_db(Profile::W2400));
+            ch.offset_hz = 11.0;
+            ch.clock_ppm = -40.0;
+            let (ok, total, note) = recover(Profile::W2400, mode, 2, 2, &ch);
+            assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");
+        }
+    }
+
+    #[test]
+    fn the_fast_end_holds_up_on_moderate_fading() {
+        // Before the pilot-gain smoothing was timed (three pilots at any SF, 8 ms
+        // at SF 1) DS1 1/2 lost 34 of 128 frames here, and 43 % through the whole
+        // receiver (`decdsss sweep`, 48 transmissions, 30 dB). With it, a few per
+        // cent. A wide margin: this guards the cliff, not the floor.
+        for mode in ["ds2-1/2", "ds1-1/2"] {
+            let (bad, total) = genie_fer(
+                Profile::W2400,
+                mode,
+                4,
+                2,
+                30.0,
+                16,
+                Some(Watterson::MODERATE),
+            );
+            assert!(
+                (bad as f64) < 0.2 * total as f64,
+                "{mode}: {bad} of {total} frames lost"
+            );
+        }
+    }
+
+    #[test]
+    fn pilot_smoothing_spans_the_same_time_at_every_spreading_factor() {
+        // SF 4: [1 2 1]/4, as it always was.
+        assert_eq!(smooth_half_width(4), 1);
+        assert_eq!(smooth_half_width(64), 1);
+        assert!((smooth_noise_gain(1) - 0.375).abs() < 1e-12);
+        // SF 2 and 1: twice SF 4's span in time. A pilot interval is 8 symbols, so
+        // the triangle's zero is (half + 1) pilot intervals of 8·SF chips out:
+        // 2 × 8 × 4 = 64 chips at SF 4, 128 at SF 2 and SF 1.
+        for (sf, chips) in [(4usize, 64usize), (2, 128), (1, 128)] {
+            assert_eq!((smooth_half_width(sf) + 1) * 8 * sf, chips, "SF {sf}");
+        }
+        // The carrier is measured over the same interval at every SF: 8·4 chips.
+        for sf in [1usize, 2, 4, 8, 16] {
+            let lag = pilots_per_ref_interval(sf);
+            assert!(lag * 8 * sf == 32 || sf > 4, "SF {sf}");
+        }
+        // Σw²/(Σw)² for SF 1's 15: weights 1..16..1, Σw = 256, Σw² = 2736.
+        assert!((smooth_noise_gain(15) - 2736.0 / 65536.0).abs() < 1e-12);
     }
 
     #[test]

@@ -112,12 +112,25 @@ fn profile_index(p: Profile) -> u64 {
     Profile::ALL.iter().position(|&q| q == p).unwrap() as u64
 }
 
-fn spread_index(m: Mode) -> u64 {
-    let ladder: &[u16] = match m.family {
-        Family::DsPsk => &decdsss_core::mode::DS_SPREADS,
+/// The spreading factors by their 3-bit code in the header. The first five
+/// are the original ladder's order, kept in place so a header an older build
+/// sent still reads the same; SF 2 and 1 took the two codes that were free. (The
+/// ladder in `decdsss_core::mode` is in speed order, which is not this one.)
+const DS_WIRE: [u16; 7] = [4, 8, 16, 32, 64, 2, 1];
+
+/// The spreading factors or alphabet sizes of a family, in header-code order.
+fn wire_ladder(f: Family) -> &'static [u16] {
+    match f {
+        Family::DsPsk => &DS_WIRE,
         Family::Csk => &decdsss_core::mode::CSK_SIZES,
-    };
-    ladder.iter().position(|&s| s == m.spread).unwrap() as u64
+    }
+}
+
+fn spread_index(m: Mode) -> u64 {
+    wire_ladder(m.family)
+        .iter()
+        .position(|&s| s == m.spread)
+        .unwrap() as u64
 }
 
 impl Header {
@@ -168,11 +181,7 @@ impl Header {
         } else {
             Family::Csk
         };
-        let ladder: &[u16] = match family {
-            Family::DsPsk => &decdsss_core::mode::DS_SPREADS,
-            Family::Csk => &decdsss_core::mode::CSK_SIZES,
-        };
-        let spread = *ladder.get(r.get(3) as usize)?;
+        let spread = *wire_ladder(family).get(r.get(3) as usize)?;
         let rate = *CodeRate::ALL.get(r.get(2) as usize)?;
         let mode = Mode::new(family, spread, rate)?;
         let depth = *DEPTHS.get(r.get(2) as usize)?;
@@ -310,6 +319,22 @@ mod tests {
             nblocks: 99,
             total_frames: 20_000,
         }
+    }
+
+    #[test]
+    fn spreading_factors_keep_their_header_codes() {
+        // The 3-bit codes of the original ladder are what older builds sent; SF 2
+        // and 1 took the two that were free.
+        assert_eq!(DS_WIRE[..5], [4, 8, 16, 32, 64]);
+        assert_eq!(DS_WIRE[5..], [2, 1]);
+        let mut codes: Vec<u16> = DS_WIRE.to_vec();
+        codes.sort_unstable();
+        let mut ladder = decdsss_core::mode::DS_SPREADS.to_vec();
+        ladder.sort_unstable();
+        assert_eq!(
+            codes, ladder,
+            "the header can name every mode on the ladder"
+        );
     }
 
     #[test]

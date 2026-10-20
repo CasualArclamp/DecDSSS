@@ -107,10 +107,12 @@ boundary, so a receiver that has the frame timing also has the code phase.
 
 Over the scrambler, the two families modulate differently:
 
-- **DS-PSK** — a QPSK data symbol held for SF chips, with SF in {4, 8, 16, 32,
-  64}. Coherent detection with time-multiplexed pilots: one known symbol in
+- **DS-PSK** — a QPSK data symbol held for SF chips, with SF in {1, 2, 4, 8, 16,
+  32, 64}. Coherent detection with time-multiplexed pilots: one known symbol in
   every 8 (`PILOT_INTERVAL`). The rake estimates each path's gain from the pilots
-  and combines them by maximal ratio.
+  and combines them by maximal ratio. SF 2 and 1 (added 2026-10-20, see
+  *DS2 and DS1* under Verification) have little or no processing gain left; they
+  are modes for a clean, strong channel.
 - **CSK** — M-ary orthogonal code keying, as on the IS-95 uplink: a symbol
   sends one of the L Walsh–Hadamard codes of length L, so it carries log₂L
   bits. L is in {32, 64, 128, 256}. Detection is noncoherent: one fast Walsh
@@ -136,6 +138,8 @@ The scrambler on top keeps the spectrum white whatever code is sent.
 
 | Mode | Symbols/s | Coded bit/s | Info bit/s @ r=½ |
 |---|---|---|---|
+| DS1 | 1920 | 3360 | 1680 |
+| DS2 | 960 | 1680 | 840 |
 | DS4 | 480 | 840 | 420 |
 | DS8 | 240 | 420 | 210 |
 | DS16 | 120 | 210 | 105 |
@@ -158,7 +162,10 @@ Voice uses the fast end, and that is the price of spreading in 2.4 kHz:
 - **`500`:** no voice.
 
 Processing gain against narrowband interference is then about 6 dB. Pictures
-and files can use the deep end.
+and files can use the deep end, or the fast end: DS2 and DS1 double and quadruple
+DS4's rates (derived: the symbol rate is the chip rate over SF, the pilots stay one
+in eight), 1260 and 2520 info bit/s at rate ¾ on `2k4`, at the price of the
+processing gain (3 dB and none) and of fading margin (Verification).
 
 ### Over structure
 
@@ -178,10 +185,13 @@ A transmission is one or more *segments*; a segment is:
    64, 128 or 256 codes of as many chips, 6 to 8 bits a symbol, the same
    codeword). The weak payload modes (DS32, DS64 and every CSK mode) keep CSK256,
    decodable wherever any payload mode is: 8.5 s on `2k4`, 6.8 s on `3k`, 41 s on
-   `500`. The fast modes send a shorter one so decoding starts sooner: DS4 uses
-   CSK64 (86 symbols, 2.9 s on `2k4`) and DS8 and DS16, at every rate, CSK128
+   `500`. The fast modes send a shorter one so decoding starts sooner: DS4 (and
+   DS2 and DS1) use CSK64 (86 symbols, 2.9 s on `2k4`) and DS8 and DS16, at every rate, CSK128
    (74 symbols, 4.9 s), where the header still decodes below the payload's own
-   threshold. (16 and 32 were measured too and never chosen, see Verification, so
+   threshold. (The mode field's 3-bit spread code keeps the original ladder's
+   codes, DS 4 to 64 as 0 to 4, and gives SF 2 and 1 the two that were free, 5
+   and 6: a build from before DS2 and DS1 skips a header that names them, and
+   every build reads the older ones.) (16 and 32 were measured too and never chosen, see Verification, so
    the receiver does not try them.) The receiver tries the alphabets shortest
    first, each as soon as its chips are in, so it starts as early as the
    transmitter allows. A longer header seen in a shorter alphabet despreads to
@@ -295,8 +305,9 @@ of ±100 and ±300 ppm change nothing at 4 dB.
    step and excursion; and, every six seconds, a conservative searcher that moves
    the reference only to a path a third of a chip away and 1.8 dB stronger.
    At the end of the block: DS-PSK combines with smoothed, interpolated pilot
-   gains shrunk by power subtraction where a finger is not clearly above its
-   estimation noise; CSK sums a log-Bessel metric over fingers; then
+   gains (a triangle of the same length in time at every SF: [1 2 1]/4 at SF 4 and
+   above, twice that length at SF 2 and 1; see *DS2 and DS1*) shrunk by power
+   subtraction where a finger is not clearly above its estimation noise; CSK sums a log-Bessel metric over fingers; then
    de-interleave and LDPC. DS-PSK is combined twice: by a G-RAKE first (below),
    and by the rake for any codeword the G-RAKE's LLRs do not decode.
 
@@ -314,7 +325,8 @@ paths a whole chip apart the rake's chip SIR stops at
 (|a₀|²+|a₁|²)²/(2|a₀|²|a₁|²), 3 dB for equal paths, at any SNR; the G-RAKE
 reaches 10.7 dB there (equal paths leave a null in the band) and 27.9 dB with the
 second path at half amplitude, at 30 dB. What it does on the simulator is under
-Verification: nothing measurable yet. A block whose codewords all decode is re-modulated and
+Verification: nothing measurable at SF 4 and above, a good deal at SF 2 and 1
+(*DS2 and DS1*). A block whose codewords all decode is re-modulated and
    the refinement above runs on it, so the clock and carrier are re-learned
    every block.
 
@@ -516,7 +528,11 @@ CRC-16 (headers) and CRC-32 (payload frames).
     "microphone" for 12 s, the CLI received header and five blocks and saved
     12.8 s of speech at the end frame; the speech player was checked by playing a
     tone through it into one cable and recording it from the other.
-  - *Keying:* see Radio I/O. *Not yet:* a short preamble.
+  - *Keying:* see Radio I/O. *Not yet:* a short preamble; voice at DS2 or DS1
+    (derived: DS2 ⅔ on `2k4` is 1120 bit/s, 2.5 times Codec2 450's rate against
+    the 1.17 of DS4 ⅔, so a live stream would catch up fast after the start-up;
+    DS2 ¾ at 1260 bit/s carries Codec2 1200 only barely, 1.05 times, and not 1300
+    or 1600, which want DS1 ⅔ or ¾, 2240 or 2520 bit/s, on a channel that suits DS1).
 - **ARQ** (M5): a connected mode for files on both stations' own codes, with
   selective repeat and ACK bitmaps sent at a robust mode.
 
@@ -762,6 +778,12 @@ modem is about 2 dB above its code.
 | | DS32 ½ | 4.5 dB | −12.1 dB |
 | | DS64 ½ | 4.0 dB | −15.6 dB |
 | | DS4 ¾ | 5.0 dB | −0.8 dB |
+| | DS2 ½ | 3.0 dB | −1.6 dB |
+| | DS2 ⅔ | 3.5 dB | +0.2 dB |
+| | DS2 ¾ | 4.0 dB | +1.2 dB |
+| | DS1 ½ | 3.0 dB | +1.4 dB |
+| | DS1 ⅔ | 3.5 dB | +3.2 dB |
+| | DS1 ¾ | 4.0 dB | +4.2 dB |
 | | DS16 ¾ | 4.5 dB | −7.3 dB |
 | | CSK32 ½ | 4.0 dB | −8.0 dB |
 | | CSK64 ½ | 4.0 dB | −10.3 dB |
@@ -945,9 +967,133 @@ its CSK256 symbols are long), one larger than 60 ms, and one in the last
 quarter second or so of a block, which costs that block (a block cannot be
 rewound once decoded).
 
+### DS2 and DS1 (2026-10-20)
+
+SF 2 and 1 extend the DS-PSK ladder: on `2k4`, DS2 is 840 / 1120 / 1260 bit/s and
+DS1 1680 / 2240 / 2520 bit/s at rates ½ / ⅔ / ¾ (derived: twice and four times
+DS4's; `decdsss modes`). The air interface is otherwise as it was: the same header
+(CSK64, which `header_alphabet_for` already gave every SF up to 4), the same codes,
+the same G-RAKE. DS1 ¾ is 2520 bit/s in 2400 Hz, +0.2 dB between its in-band SNR and
+its Eb/N0 (derived, `snr_offset_db`).
+
+**AWGN** (table above; `decdsss sweep --mode ds1-3/4 --ebn0 1 8 0.5 --trials 24`,
+192 frames a point, the carrier and the clock spread as for the other rows): both
+decode with no change to the receiver, and need no more Eb/N0 than DS4 does (DS4 ½
+re-measured with the same command: 4.0 dB, as before). On `3k` and `500`, DS2 ½ and
+DS1 ½ delivered all 96 frames of 12 transmissions at 7 dB Eb/N0 — a check, not a
+threshold.
+
+**Moderate fading broke them, and the cause was the channel estimate.** First run
+(moderate fading, 30 dB Eb/N0, the whole receiver, 32 transmissions, 8 frames each):
+DS4 ¾ lost 0 %, DS2 ¾ 28 %, DS1 ¾ 89 %, with every header decoded (DS1 ½, 48
+transmissions: 43 % with or without the rewind and the G-RAKE); a genie start (true
+timing, carrier and paths, `debug_genie_floor`) lost 654 of 960 DS1 ¾ frames, so the
+fault was in combining, not in acquisition. The pilot gains were smoothed over three
+pilots ([1 2 1]/4) at every SF. A pilot gain is a sum over L chips, and the thermal
+noise and the other paths' chips both average down as 1/L, so a raw gain is 1/L as
+good (derived); pilots are one symbol in eight, so at SF 1 they come four times as
+often as at SF 4 and three of them span 8 ms, not 33 ms: the estimate was 6 dB worse
+than SF 4's (10·log₁₀ 4, derived) and, with the other path's unknown data chips in
+it, sat at an error that more signal does not lessen. Now the triangle spans the
+same time at every SF (SF 2: 7 pilots either side, SF 1: 15; SF 4 and above are as
+they were), and the carrier is measured from pilots the same interval apart (SF 1:
+four pilots, not one). DS4 was checked frame for frame against the old build
+(moderate fading, 6 to 30 dB, 32 transmissions a point: identical). DS1 ¾ then lost
+15 % at 30 dB, DS2 ¾ 12 %.
+
+*A longer span helps the slow fades and hurts the fast ones.* Triangle span as a
+multiple of SF 4's, 64 transmissions, DS1 ¾ at 30 dB on moderate fading and DS1 ½
+and DS2 ½ at 26 dB on flutter fading (frames lost):
+
+| Span | DS1 ¾ moderate | DS1 ½ flutter | DS2 ½ flutter |
+|---|---|---|---|
+| ×1 | 13.7 % | 35 % | 2.3 % |
+| ×2 (kept) | 6.3 % | 45 % | 3.1 % |
+| ×3 | 6.1 % | 77 % | 18 % |
+| ×4 | 5.7 % | 96 % | 54 % |
+
+×2 is the compromise (`SMOOTH_STRETCH_FAST`). An estimator that picked the span from
+the pilots themselves (leave-one-out) would get the best of both; it was not built,
+because it gains under a point on moderate fading over ×2.
+
+**Moderate fading, frame loss (%)**, 2.4 kHz, depth 4, two blocks (8 frames), 128
+transmissions a point (1024 frames), carrier offset 5 Hz and clock 10 ppm around
+which the trials are spread (the settings of the G-RAKE study above); `decdsss sweep
+--mode ds1-3/4 --ebn0 6 30 4 --trials 128 --fading moderate --offset 5 --clock-ppm
+10`:
+
+| Mode | 6 dB | 10 | 14 | 18 | 22 | 26 | 30 |
+|---|---|---|---|---|---|---|---|
+| DS4 ½ | 48.4 | 2.7 | 1.1 | 0 | 0 | 0.8 | 1.6 |
+| DS2 ½ | 35.2 | 3.6 | 1.7 | 1.6 | 1.6 | 3.0 | 3.7 |
+| DS1 ½ | 46.5 | 13.5 | 5.4 | 4.6 | 4.4 | 3.9 | 3.7 |
+| DS4 ⅔ | 75.1 | 7.5 | 3.2 | 3.1 | 3.0 | 3.0 | 3.9 |
+| DS2 ⅔ | 58.6 | 11.5 | 3.8 | 1.8 | 1.8 | 1.7 | 1.7 |
+| DS1 ⅔ | 68.6 | 25.3 | 8.5 | 4.2 | 3.9 | 3.9 | 3.5 |
+| DS4 ¾ | 89.0 | 16.2 | 3.1 | 3.1 | 3.1 | 3.1 | 2.3 |
+| DS2 ¾ | 75.5 | 23.0 | 9.2 | 7.2 | 6.9 | 7.0 | 6.6 |
+| DS1 ¾ | 81.2 | 40.7 | 14.6 | 6.9 | 5.7 | 5.5 | 5.1 |
+
+DS4's floor (0 to 3.9 % from 18 dB up; the 3 % found earlier) is about the height
+of the new modes' at ½ and ⅔: DS2 1.6 to 3.7 %, DS1 3.5 to 4.6 % from 18 dB up. At ¾
+they are higher, DS2 6.6 to 7.2 % and DS1 5.1 to 5.7 % from 22 dB up, against DS4's
+2.3 to 3.1 %. The loss does not come down with a deeper interleaver: at depth 8 (one block
+is then 2.7 s at DS1, derived) DS2 ½ is 2.1 to 3.7 % from 14 dB up, DS1 ½ 3.7 to 4.7
+%, DS2 ¾ 4.7 to 6.3 %, DS1 ¾ 8.1 to 8.3 % from 18 dB up (the same sweep with
+`--depth 8`, 2048 frames a point), so it is not the outage of a short block but the
+equaliser's limit: the symbol SINR at SF 1 is the chip SINR, and the channel
+estimate is the pilots' (derived: no despreading gain to average the estimate's
+error).
+
+**The G-RAKE matters here.** The same sweeps with `DECDSSS_RAKE_ONLY=1` (the rake
+alone, maximal-ratio combining), frame loss at 10 / 18 / 30 dB:
+
+| Mode | rake, 10 dB | 18 | 30 | G-RAKE, 10 dB | 18 | 30 |
+|---|---|---|---|---|---|---|
+| DS4 ¾ | 16.2 % | 3.1 | 2.3 | 16.2 % | 3.1 | 2.3 |
+| DS2 ½ | 4.3 % | 1.6 | 3.7 | 3.6 % | 1.6 | 3.7 |
+| DS1 ½ | 24.0 % | 6.7 | 5.5 | 13.5 % | 4.6 | 3.7 |
+| DS2 ¾ | 37.3 % | 7.9 | 6.9 | 23.0 % | 7.2 | 6.6 |
+| DS1 ¾ | 83.4 % | 58.8 | 53.4 | 40.7 % | 6.9 | 5.1 |
+
+DS4 does not care, as measured before. At SF 1 the rake's chip SIR stops at 3 dB for
+two equal paths a chip apart (derived, `grake.rs`), which is the symbol SINR there,
+and DS1 ¾ loses half its frames at any SNR; the G-RAKE removes the ceiling. This is
+the fast mode the G-RAKE was kept for.
+
+**Other channels** (½ rate, 26 dB Eb/N0, 64 transmissions, depth 4; frames lost):
+
+| Channel | DS4 ½ | DS2 ½ | DS1 ½ |
+|---|---|---|---|
+| good | 0.6 % | 6.1 % | 3.5 % |
+| moderate | 0 | 3.9 % | 3.3 % |
+| poor | 3.1 % (2 headers missed) | 0 | 0 |
+| flutter | 3.9 % (1 header missed) | 3.1 % | 44.5 % |
+
+DS1 does not survive flutter fading (it lost 35 % even with SF 4's span, so the
+longer span is not the whole of it; the cause was not looked into); DS2 does.
+Neither is measured on `3k` or `500` under fading.
+
+**Not covered: a slip in the audio.** `sync_slip_curve`
+(`SLIP_MODES=ds2-1/2,ds1-1/2`) cuts or repeats 1 to 50 ms in the middle of block 2
+on AWGN at 10 dB Eb/N0: DS4 and DS8 get every frame (Dropped and repeated audio,
+above); DS2 ½ gets 16 to 32 of 48 frames at most sizes (46 at +5 ms): the blocks
+before the cut and none after, except in about half the transmissions, where the
+rewind followed it. DS1 ½ gets 16 of 48 at every size, every block after the cut
+lost. (On moderate fading at 20 dB the same, except a 1 ms cut or repeat: DS2 ½ 48
+and 41 of 48, DS1 ½ 40 and 27.) The rewind's watch judges the energy a symbol
+collects, and at SF 1 that is |r|² whatever the scrambler's alignment (derived: the
+scrambler chips have unit modulus), so a lost signal looks like a present one; at SF
+2 the aligned sum is 3 dB over the misaligned one (derived) and the test caught the
+slip in about half the transmissions (measured above). A coherent statistic across
+pilots (the gain products) would see it; it was not built. Until then a glitch in
+the audio costs a DS2 or DS1 transmission the rest of its segment, so shorten
+`--resync` for them.
+
 ### Not yet measured
 
-The 3 kHz and 500 Hz profiles on fading; flutter fading; voice modes (no
+The 3 kHz and 500 Hz profiles on fading (DS2 and DS1 included); flutter fading
+beyond the one point above; voice modes (no
 Codec2 yet); the effect of in-band interference; two stations at once beyond
 the functional test in `rx::tests` (equal levels, different codes, 12 s
 apart).

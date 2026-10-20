@@ -8,8 +8,11 @@ use std::fmt;
 /// DS-PSK carries one known pilot symbol in every `PILOT_INTERVAL`.
 pub const PILOT_INTERVAL: u32 = 8;
 
-/// Spreading factors offered for DS-PSK.
-pub const DS_SPREADS: [u16; 5] = [4, 8, 16, 32, 64];
+/// Spreading factors offered for DS-PSK, fastest first. SF 2 and 1 are the
+/// fast end added on 2026-10-20: the symbol rate is the chip rate over SF, so
+/// they double and quadruple DS4's, and there is little or no processing gain
+/// left, so they want a clean channel (DESIGN.md, Verification).
+pub const DS_SPREADS: [u16; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 /// Alphabet sizes (= chips a symbol) offered for CSK.
 pub const CSK_SIZES: [u16; 4] = [32, 64, 128, 256];
@@ -177,6 +180,10 @@ impl Mode {
         use CodeRate::*;
         use Family::*;
         let db = match (p, self.family, self.spread, self.rate) {
+            // SF 2 and 1, measured 2026-10-20 (24 transmissions a point, 0.5 dB steps).
+            (Profile::W2400, DsPsk, 1 | 2, R1_2) => 3.0,
+            (Profile::W2400, DsPsk, 1 | 2, R2_3) => 3.5,
+            (Profile::W2400, DsPsk, 1 | 2, R3_4) => 4.0,
             (Profile::W2400, DsPsk, 4, R1_2) => 4.0,
             (Profile::W2400, DsPsk, 8, R1_2) => 4.5,
             (Profile::W2400, DsPsk, 16, R1_2) => 4.0,
@@ -257,6 +264,29 @@ mod tests {
     }
 
     #[test]
+    fn the_fast_end_doubles_and_quadruples_ds4() {
+        // Halving SF doubles the symbol rate; the pilots stay one in eight.
+        for rate in ["1/2", "2/3", "3/4"] {
+            let r4 = m(&format!("ds4-{rate}")).info_bit_rate(Profile::W2400);
+            assert_eq!(
+                m(&format!("ds2-{rate}")).info_bit_rate(Profile::W2400),
+                2.0 * r4
+            );
+            assert_eq!(
+                m(&format!("ds1-{rate}")).info_bit_rate(Profile::W2400),
+                4.0 * r4
+            );
+        }
+        // DS1 3/4: 1920 sym/s × 2 bits × 7/8 × 3/4 = 2520 bit/s, a little over the
+        // 2400 Hz the signal occupies (+0.2 dB).
+        let ds1 = m("ds1-3/4");
+        assert_eq!(ds1.info_bit_rate(Profile::W2400), 2520.0);
+        assert!((ds1.snr_offset_db(Profile::W2400) - 0.212).abs() < 1e-3);
+        // Fastest first.
+        assert_eq!(Mode::all()[0], ds1);
+    }
+
+    #[test]
     fn csk_rates_on_2k4() {
         // 1920 / L × log2 L.
         assert_eq!(m("csk32").coded_bit_rate(Profile::W2400), 300.0);
@@ -299,6 +329,9 @@ mod tests {
     fn thresholds_where_measured() {
         assert_eq!(m("ds8-1/2").ebn0_measured_db(Profile::W2400), Some(4.5));
         assert_eq!(m("csk64-1/2").ebn0_measured_db(Profile::N500), Some(6.0));
+        assert_eq!(m("ds2-1/2").ebn0_measured_db(Profile::W2400), Some(3.0));
+        assert_eq!(m("ds1-3/4").ebn0_measured_db(Profile::W2400), Some(4.0));
+        assert_eq!(m("ds1-3/4").ebn0_measured_db(Profile::W3000), None);
         assert_eq!(m("ds4-2/3").ebn0_measured_db(Profile::W2400), None);
         assert_eq!(m("ds4-2/3").ebn0_needed_db(Profile::W2400), (4.0, false));
     }
