@@ -25,7 +25,9 @@
 //! before it and the symbols are despread again from there on the moved track
 //! ([`rewind`]).
 
-use super::despread::{Track, csk_bit_llrs, despread, ln_i0, sum, walsh_correlate, walsh_one};
+use super::despread::{
+    Track, csk_bit_llrs, despread, ln_i0, sign_llr, sum, walsh_correlate, walsh_one,
+};
 use super::frontend::Buf;
 use super::grake;
 use super::header::{Finger, HeaderResult};
@@ -797,7 +799,7 @@ impl PayloadRx {
         self.live.symbols_in_block = s_count;
         let blank = || vec![Iq::new(0.0, 0.0); l];
         match self.layout.mode.family {
-            Family::Csk => {
+            Family::Csk | Family::BiCsk => {
                 if prepass {
                     self.csk_prepass(buf, &scr);
                 }
@@ -1222,6 +1224,7 @@ impl PayloadRx {
         let max_windows = ((rewind::LOST_MAX_S / (win as f64 * t_sym)).ceil() as usize).max(2);
         let reach = rewind::SLIP_REACH_S * f64::from(self.header.profile.chip_rate());
         let h_l = harmonic(l);
+        let bicsk = self.header.mode.family == Family::BiCsk;
         while wk.s < wk.s_count {
             if wk.t.pos + (l as f64 + AHEAD_CHIPS) * wk.t.step + 16.0 > buf.end() as f64 {
                 return false;
@@ -1289,13 +1292,37 @@ impl PayloadRx {
                     (self.dll.last.1 as f32 / p).min(2.0),
                 ];
             }
-            // The main finger's peak carries the carrier measurement.
-            let peak = wk.w[at + m];
-            if let Some(p) = wk.peak_prev {
-                wk.freq_acc += peak * p.conj();
-                wk.freq_norm += peak.norm() * p.norm();
+            if bicsk {
+                // Bi-orthogonal CSK: the sign turns about half the steps by pi, so
+                // the products are taken with the sign wiped, by squaring (the
+                // phase of z² is twice the step, and a sign cannot change it). The
+                // product is summed over the fingers: a finger's own channel phase
+                // cancels in y[n]·conj(y[n-1]), so the fingers add coherently. A
+                // wrong code in either symbol makes z noise, whose square has a
+                // random phase, so the coherence test in `freq_correction` (which
+                // would pass a sum of sign-decided noise products, all turned into
+                // the right half-plane) turns such a run away.
+                if s > 0 && !debug_frozen("bicsk_loop") {
+                    let (pat, pnf) = wk.index[s - 1];
+                    let pm = wk.decisions[s - 1];
+                    let z: Iq = (0..nf.min(pnf))
+                        .map(|f| wk.w[at + f * l + m] * wk.w[pat + f * l + pm].conj())
+                        .sum();
+                    let mag = z.norm();
+                    if mag > 0.0 {
+                        wk.freq_acc += z * z / mag;
+                        wk.freq_norm += mag;
+                    }
+                }
+            } else {
+                // The main finger's peak carries the carrier measurement.
+                let peak = wk.w[at + m];
+                if let Some(p) = wk.peak_prev {
+                    wk.freq_acc += peak * p.conj();
+                    wk.freq_norm += peak.norm() * p.norm();
+                }
+                wk.peak_prev = Some(peak);
             }
-            wk.peak_prev = Some(peak);
             // Live: the correlator bank row, the chips, the SNR strip.
             let row: Vec<f32> = wk.w[at..at + l].iter().map(|z| z.norm_sqr()).collect();
             let mx = row.iter().copied().fold(1e-30f32, f32::max);
@@ -1320,7 +1347,13 @@ impl PayloadRx {
             }
             wk.t.advance(l);
             if (s + 1).is_multiple_of(freq_every) {
-                wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, t_sym);
+                // Bi-orthogonal: the sum is of squares; half its angle is the step.
+                let acc = if bicsk {
+                    Iq::from_polar(wk.freq_acc.norm(), 0.5 * wk.freq_acc.arg())
+                } else {
+                    wk.freq_acc
+                };
+                wk.t.freq += freq_correction(acc, wk.freq_norm, t_sym);
                 wk.t.freq =
                     wk.t.freq
                         .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
@@ -1478,15 +1511,34 @@ impl PayloadRx {
                 kappa[f] = 2.0 * amp2[f].sqrt() / sigma2[f].max(1e-30);
             }
         }
-        let mut llrs = Vec::with_capacity(wk.s_count * bits);
+        let bicsk = self.header.mode.family == Family::BiCsk;
+        let mut llrs = Vec::with_capacity(wk.s_count * (bits + usize::from(bicsk)));
         let mut metric = vec![0.0f64; l];
-        for &(off, nf) in &wk.index {
+        let mut prev_metric = vec![0.0f64; l];
+        for (s, &(off, nf)) in wk.index.iter().enumerate() {
             for (m, v) in metric.iter_mut().enumerate() {
                 *v = (0..nf)
                     .map(|f| ln_i0(kappa[f] * f64::from(wk.w[off + f * l + m].norm())))
                     .sum();
             }
             csk_bit_llrs(&metric, bits, &mut llrs);
+            if bicsk {
+                // The sign bit: the change from the symbol before (the first symbol
+                // is the reference and carries none).
+                if s > 0 {
+                    let (poff, pnf) = wk.index[s - 1];
+                    let nf = nf.min(pnf);
+                    llrs.push(sign_llr(
+                        &wk.w[poff..poff + nf * l],
+                        &wk.w[off..off + nf * l],
+                        &prev_metric,
+                        &metric,
+                        l,
+                        &kappa,
+                    ));
+                }
+                std::mem::swap(&mut prev_metric, &mut metric);
+            }
         }
         let snr = 10.0 * (amp2[0] / sigma2[0].max(1e-30)).log10();
         let (start, from) = refine_from(&wk.ts, wk.shifted, wk.slipped_at, wk.start);
@@ -2409,6 +2461,188 @@ mod tests {
     #[test]
     fn csk_blocks_decode_on_a_clean_channel() {
         for mode in ["csk32-1/2", "csk64-2/3", "csk128-1/2", "csk256-3/4"] {
+            let ch = channel(Profile::W2400, 0.0);
+            let (ok, total, note) = recover(Profile::W2400, mode, 1, 2, &ch);
+            assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");
+        }
+    }
+
+    /// Frame loss of bi-orthogonal CSK against plain CSK through the payload
+    /// demodulator alone (a genie start), AWGN and fading. `cargo test --release -p
+    /// decdsss-phy bicsk_genie_curve -- --ignored --nocapture`; `BICSK_MODES`
+    /// (comma-separated), `BICSK_EBN0` (from,to,step), `BICSK_TRIALS`, `BICSK_FADING`
+    /// (good, moderate or poor), `BICSK_DEPTH` and `BICSK_BLOCKS` change the run.
+    #[test]
+    #[ignore]
+    fn bicsk_genie_curve() {
+        let env = |k: &str| std::env::var(k).ok();
+        let modes: Vec<String> = env("BICSK_MODES").map_or_else(
+            || {
+                ["csk64-1/2", "bcsk64-1/2", "csk128-1/2"]
+                    .map(String::from)
+                    .to_vec()
+            },
+            |v| v.split(',').map(String::from).collect(),
+        );
+        let [from, to, step]: [f64; 3] = env("BICSK_EBN0")
+            .map(|v| {
+                v.split(',')
+                    .map(|x| x.parse().unwrap())
+                    .collect::<Vec<f64>>()
+            })
+            .map_or([2.0, 8.0, 1.0], |v| [v[0], v[1], v[2]]);
+        let trials = env("BICSK_TRIALS").map_or(24, |v| v.parse().unwrap());
+        let depth = env("BICSK_DEPTH").map_or(4, |v| v.parse().unwrap());
+        let blocks = env("BICSK_BLOCKS").map_or(1, |v| v.parse().unwrap());
+        let fading = env("BICSK_FADING").map(|n| Watterson::from_name(&n).unwrap());
+        for mode in &modes {
+            let mut line = format!("{mode:11}");
+            let mut x = from;
+            while x <= to + 1e-9 {
+                let (bad, total) =
+                    genie_fer(Profile::W2400, mode, depth, blocks, x, trials, fading);
+                line += &format!("  {x:.1}dB:{:5.1}%", 100.0 * bad as f64 / total as f64);
+                x += step;
+            }
+            println!("{line}");
+        }
+    }
+
+    /// What a wrong code does to the sign bit: a bi-orthogonal block's hard bit errors
+    /// (the LLR's sign against the bit sent) split by whether the symbol's code and the
+    /// one before it were right. `cargo test --release -p decdsss-phy
+    /// bicsk_sign_diagnostics -- --ignored --nocapture`; `BICSK_MODES` (first one),
+    /// `BICSK_EBN0` (from,to,step), `BICSK_TRIALS`, `BICSK_FADING` as for the curve.
+    #[test]
+    #[ignore]
+    fn bicsk_sign_diagnostics() {
+        let env = |k: &str| std::env::var(k).ok();
+        let mode = env("BICSK_MODES")
+            .and_then(|v| v.split(',').next().map(String::from))
+            .unwrap_or_else(|| "bcsk64-1/2".into());
+        let [from, to, step]: [f64; 3] = env("BICSK_EBN0")
+            .map(|v| {
+                v.split(',')
+                    .map(|x| x.parse().unwrap())
+                    .collect::<Vec<f64>>()
+            })
+            .map_or([2.0, 8.0, 2.0], |v| [v[0], v[1], v[2]]);
+        let trials: usize = env("BICSK_TRIALS").map_or(8, |v| v.parse().unwrap());
+        let fading = env("BICSK_FADING").map(|n| Watterson::from_name(&n).unwrap());
+        let profile = Profile::W2400;
+        let m = decdsss_core::Mode::from_name(&mode).unwrap();
+        let bits_idx = m.spread.trailing_zeros() as usize;
+        let mut x = from;
+        while x <= to + 1e-9 {
+            // [prev ok, cur ok] -> (sign bits, sign errors, sum |llr|); all symbols' codes.
+            let mut cls = [(0usize, 0usize, 0.0f64); 4];
+            let (mut syms, mut idx_ok_n) = (0usize, 0usize);
+            for trial in 0..trials {
+                let seg = segment(profile, &mode, 4, 1);
+                let mut ch = channel(profile, x + m.snr_offset_db(profile));
+                ch.seed = 7000 + trial as u64;
+                ch.fading = fading;
+                ch.offset_hz = -10.0 + (trial % 7) as f64 * 3.0;
+                ch.clock_ppm = -30.0 + (trial % 5) as f64 * 15.0;
+                let audio = through(&seg, &ch);
+                let (mut rx, buf) = genie(&seg, &ch, &audio);
+                let layout = *rx.layout();
+                while let Some(r) = rx.step(&buf) {
+                    let frames = &seg.frames[r.first_frame..r.first_frame + layout.depth];
+                    let bits = crate::tx::block_bits(&layout, frames);
+                    let llrs = &rx.last_llrs;
+                    let (mut pos, mut prev_ok) = (0usize, true);
+                    for n in 0..layout.symbols() {
+                        let ok = (0..bits_idx).all(|j| {
+                            pos + j >= bits.len() || u8::from(llrs[pos + j] < 0.0) == bits[pos + j]
+                        });
+                        pos += bits_idx;
+                        if n > 0 {
+                            if pos < bits.len() {
+                                let err = u8::from(llrs[pos] < 0.0) != bits[pos];
+                                let c = &mut cls[usize::from(prev_ok) * 2 + usize::from(ok)];
+                                c.0 += 1;
+                                c.1 += usize::from(err);
+                                c.2 += f64::from(llrs[pos].abs());
+                            }
+                            pos += 1;
+                        }
+                        syms += 1;
+                        idx_ok_n += usize::from(ok);
+                        prev_ok = ok;
+                    }
+                }
+            }
+            let mut line = format!(
+                "{mode} {x:4.1} dB: codes right {:5.1}%",
+                100.0 * idx_ok_n as f64 / syms as f64
+            );
+            for (name, i) in [
+                ("both ok", 3),
+                ("prev wrong", 1),
+                ("cur wrong", 2),
+                ("both wrong", 0),
+            ] {
+                let (n, e, a) = cls[i];
+                line += &format!(
+                    " | {name}: n {n} err {:5.1}% |llr| {:.1}",
+                    100.0 * e as f64 / n.max(1) as f64,
+                    a / n.max(1) as f64
+                );
+            }
+            println!("{line}");
+            x += step;
+        }
+    }
+
+    /// How far off the carrier the demodulator may start and still decode: the
+    /// block's first frames start `BICSK_ERR` Hz off (the loop has to pull it in),
+    /// AWGN at `BICSK_EBN0` dB, two blocks. `BICSK_MODES`, `BICSK_TRIALS`, `BICSK_ERRS`
+    /// (comma-separated Hz) as for the curves.
+    #[test]
+    #[ignore]
+    fn bicsk_carrier_error_curve() {
+        let env = |k: &str| std::env::var(k).ok();
+        let modes: Vec<String> = env("BICSK_MODES").map_or_else(
+            || ["csk256-1/2", "bcsk256-1/2"].map(String::from).to_vec(),
+            |v| v.split(',').map(String::from).collect(),
+        );
+        let errs: Vec<f64> = env("BICSK_ERRS").map_or_else(
+            || vec![0.0, 0.5, 1.0, 1.5, 2.0, 3.0],
+            |v| v.split(',').map(|x| x.parse().unwrap()).collect(),
+        );
+        let trials: usize = env("BICSK_TRIALS").map_or(6, |v| v.parse().unwrap());
+        let ebn0: f64 = env("BICSK_EBN0").map_or(8.0, |v| v.parse().unwrap());
+        let profile = Profile::W2400;
+        for mode in &modes {
+            let m = decdsss_core::Mode::from_name(mode).unwrap();
+            let mut line = format!("{mode:11} {ebn0:.0} dB");
+            for &err in &errs {
+                let (mut lost, mut total) = (0, 0);
+                for trial in 0..trials {
+                    let seg = segment(profile, mode, 2, 2);
+                    let mut ch = channel(profile, ebn0 + m.snr_offset_db(profile));
+                    ch.seed = 4000 + trial as u64;
+                    ch.offset_hz = -4.0 + trial as f64;
+                    let audio = through(&seg, &ch);
+                    let (mut rx, buf) = genie(&seg, &ch, &audio);
+                    rx.track.freq += if trial % 2 == 0 { err } else { -err };
+                    while let Some(r) = rx.step(&buf) {
+                        for (i, f) in r.frames.iter().enumerate() {
+                            total += 1;
+                            lost += usize::from(f.as_ref() != Some(&seg.frames[r.first_frame + i]));
+                        }
+                    }
+                }
+                line += &format!("  {err:.1}Hz:{:5.1}%", 100.0 * lost as f64 / total as f64);
+            }
+            println!("{line}");
+        }
+    }
+
+    #[test]
+    fn bi_orthogonal_csk_blocks_decode_on_a_clean_channel() {
+        for mode in ["bcsk32-1/2", "bcsk64-2/3", "bcsk128-1/2", "bcsk256-3/4"] {
             let ch = channel(Profile::W2400, 0.0);
             let (ok, total, note) = recover(Profile::W2400, mode, 1, 2, &ch);
             assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");

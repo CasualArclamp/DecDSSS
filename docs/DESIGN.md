@@ -121,6 +121,11 @@ Over the scrambler, the two families modulate differently:
   rake adds the powers across paths, each descrambled at its own delay. No
   pilots are needed, and the phase only has to hold for one symbol, which suits
   HF fading at the robust end.
+- **Bi-orthogonal CSK** (`bcsk`, a prototype added 2026-10-20, see *Bi-orthogonal CSK*
+  under Verification) — CSK with the code's sign as one more bit: log₂L + 1 bits a
+  symbol at CSK's symbol rate. The code is found noncoherently as above; the sign is
+  the change from the symbol before (differential BPSK), so there are still no pilots,
+  and the phase has to hold from one symbol to the next. Not decided to ship.
 
 Walsh codes are exactly orthogonal, binary, and cost only adds to detect. Two
 other choices were rejected:

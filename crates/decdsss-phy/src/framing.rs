@@ -152,12 +152,20 @@ impl BitReader<'_> {
     }
 }
 
+/// The header's one family bit: 0 DS-PSK, 1 the Walsh families. Bi-orthogonal CSK
+/// shares the bit with plain CSK and takes the spread codes 4 to 7 that CSK left
+/// free (see [`spread_index`]), so a build from before it reads a header that names
+/// one as a CSK size it does not have, and skips it, as a header of an unknown mode
+/// should be.
 fn family_bit(f: Family) -> u64 {
     match f {
         Family::DsPsk => 0,
-        Family::Csk => 1,
+        Family::Csk | Family::BiCsk => 1,
     }
 }
+
+/// Where bi-orthogonal CSK's sizes start in the 3-bit spread code: after CSK's four.
+const BICSK_WIRE_BASE: usize = 4;
 
 fn profile_index(p: Profile) -> u64 {
     Profile::ALL.iter().position(|&q| q == p).unwrap() as u64
@@ -173,15 +181,37 @@ const DS_WIRE: [u16; 7] = [4, 8, 16, 32, 64, 2, 1];
 fn wire_ladder(f: Family) -> &'static [u16] {
     match f {
         Family::DsPsk => &DS_WIRE,
-        Family::Csk => &decdsss_core::mode::CSK_SIZES,
+        Family::Csk | Family::BiCsk => &decdsss_core::mode::CSK_SIZES,
     }
 }
 
 fn spread_index(m: Mode) -> u64 {
-    wire_ladder(m.family)
+    let at = wire_ladder(m.family)
         .iter()
         .position(|&s| s == m.spread)
-        .unwrap() as u64
+        .unwrap();
+    (at + if m.family == Family::BiCsk {
+        BICSK_WIRE_BASE
+    } else {
+        0
+    }) as u64
+}
+
+/// The mode a header's family bit, 3-bit spread code and rate code name; `None` for
+/// a code with no mode.
+fn wire_mode(csk: bool, code: usize, rate: CodeRate) -> Option<Mode> {
+    let (family, ladder, at) = if !csk {
+        (Family::DsPsk, &DS_WIRE[..], code)
+    } else if code < BICSK_WIRE_BASE {
+        (Family::Csk, &decdsss_core::mode::CSK_SIZES[..], code)
+    } else {
+        (
+            Family::BiCsk,
+            &decdsss_core::mode::CSK_SIZES[..],
+            code - BICSK_WIRE_BASE,
+        )
+    };
+    Mode::new(family, *ladder.get(at)?, rate)
 }
 
 impl Header {
@@ -233,14 +263,10 @@ impl Header {
             return None;
         }
         let profile = *Profile::ALL.get(r.get(2) as usize)?;
-        let family = if r.get(1) == 0 {
-            Family::DsPsk
-        } else {
-            Family::Csk
-        };
-        let spread = *wire_ladder(family).get(r.get(3) as usize)?;
+        let csk = r.get(1) != 0;
+        let code = r.get(3) as usize;
         let rate = *CodeRate::ALL.get(r.get(2) as usize)?;
-        let mode = Mode::new(family, spread, rate)?;
+        let mode = wire_mode(csk, code, rate)?;
         let depth = *DEPTHS.get(r.get(2) as usize)?;
         let ptype = PayloadType::from_u8(r.get(3 + usize::from(version)) as u8)?;
         // One spelling per type: a wide header for a type that fits in 3 bits (or the
@@ -305,21 +331,25 @@ impl Layout {
         self.code().k() / 8 - 4
     }
 
-    /// Coded bits one data symbol carries: 2 for DS-PSK (QPSK), log2 L for CSK.
+    /// Coded bits one data symbol carries: 2 for DS-PSK (QPSK), log2 L for CSK,
+    /// log2 L + 1 for bi-orthogonal CSK (the code's number, then its sign).
     pub fn bits_per_data_symbol(&self) -> usize {
         match self.mode.family {
             Family::DsPsk => 2,
             Family::Csk => self.mode.spread.trailing_zeros() as usize,
+            Family::BiCsk => self.mode.spread.trailing_zeros() as usize + 1,
         }
     }
 
     /// Data symbols in a block, padded up so that DS-PSK fills whole pilot
-    /// groups.
+    /// groups. A bi-orthogonal CSK block's first symbol is the sign reference and
+    /// has no sign bit, so the block holds one bit fewer than whole symbols.
     pub fn data_symbols(&self) -> usize {
         let per_group = (PILOT_INTERVAL as usize - 1) * self.bits_per_data_symbol();
         match self.mode.family {
             Family::DsPsk => self.coded_bits().div_ceil(per_group) * (PILOT_INTERVAL as usize - 1),
             Family::Csk => self.coded_bits().div_ceil(self.bits_per_data_symbol()),
+            Family::BiCsk => (self.coded_bits() + 1).div_ceil(self.bits_per_data_symbol()),
         }
     }
 
@@ -331,7 +361,7 @@ impl Layout {
                 let groups = self.data_symbols() / (PILOT_INTERVAL as usize - 1);
                 groups * PILOT_INTERVAL as usize + 1
             }
-            Family::Csk => self.data_symbols(),
+            Family::Csk | Family::BiCsk => self.data_symbols(),
         }
     }
 
@@ -503,6 +533,47 @@ mod tests {
         assert_eq!(csk.chips(), 288 * 256);
         // 288 symbols at 7.5/s.
         assert!((csk.seconds() - 38.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bi_orthogonal_block_geometry() {
+        // 7 bits a symbol at L = 64: 4 × 1152 coded bits and one reference symbol's
+        // missing sign bit = 4609 bits, 659 symbols (658.4 up).
+        let bi = Layout::new(Profile::W2400, Mode::from_name("bcsk64-1/2").unwrap(), 4);
+        assert_eq!(bi.bits_per_data_symbol(), 7);
+        assert_eq!(bi.symbols(), 659);
+        assert_eq!(bi.chips(), 659 * 64);
+        // Never fewer bits than the codewords need, never a whole symbol too many.
+        for name in ["bcsk32-1/2", "bcsk64-2/3", "bcsk128-3/4", "bcsk256-1/2"] {
+            for depth in DEPTHS {
+                let l = Layout::new(Profile::W2400, Mode::from_name(name).unwrap(), depth);
+                let room = l.symbols() * l.bits_per_data_symbol() - 1;
+                assert!(
+                    room >= l.coded_bits() && room < l.coded_bits() + l.bits_per_data_symbol(),
+                    "{name} depth {depth}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bi_orthogonal_modes_take_the_spread_codes_csk_left_free() {
+        // Family bit 1, then the 3-bit code: CSK 0 to 3, bi-orthogonal CSK 4 to 7.
+        let code_of = |name: &str| {
+            let bits = Header {
+                mode: Mode::from_name(name).unwrap(),
+                ..header()
+            }
+            .pack()
+            .unwrap();
+            (bits[4], bits[5] * 4 + bits[6] * 2 + bits[7])
+        };
+        assert_eq!(code_of("csk32-1/2"), (1, 0));
+        assert_eq!(code_of("csk256-1/2"), (1, 3));
+        assert_eq!(code_of("bcsk32-1/2"), (1, 4));
+        assert_eq!(code_of("bcsk256-1/2"), (1, 7));
+        // What an older build did with such a code: CSK's ladder has no entry for it.
+        assert_eq!(decdsss_core::mode::CSK_SIZES.get(4), None);
     }
 
     #[test]
