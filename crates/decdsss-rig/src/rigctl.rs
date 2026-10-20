@@ -11,8 +11,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::Cat;
 use crate::link::{Line, Link};
+use crate::{Cat, Tuning};
 
 /// How long rigctld has to answer, and how often a command is sent. It answers
 /// after the rig has, which on a slow serial rate can be most of a second.
@@ -41,20 +41,45 @@ impl Rigctld {
 
     /// Send `command` and take the line that answers it.
     fn ask(&mut self, command: &str) -> Result<String, String> {
+        Ok(self.ask_lines(command, 1)?.swap_remove(0))
+    }
+
+    /// Send `command` and take the `count` lines that answer it (a command that
+    /// gets a value back answers one line to a value; `m` answers two). An
+    /// `RPRT` first line is the whole answer: the command failed.
+    fn ask_lines(&mut self, command: &str, count: usize) -> Result<Vec<String>, String> {
         for _ in 0..TRIES {
             self.link.discard();
             self.buffer.clear();
             self.link.send(format!("{command}\n").as_bytes())?;
+            let mut lines: Vec<String> = Vec::new();
             let deadline = Instant::now() + ANSWER;
             while Instant::now() < deadline {
                 self.link.receive(&mut self.buffer)?;
-                if let Some(end) = self.buffer.iter().position(|&b| b == b'\n') {
+                while let Some(end) = self.buffer.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = self.buffer.drain(..=end).collect();
-                    return Ok(String::from_utf8_lossy(&line).trim().to_string());
+                    lines.push(String::from_utf8_lossy(&line).trim().to_string());
+                }
+                if lines.len() >= count || lines.first().is_some_and(|l| l.starts_with("RPRT")) {
+                    return Ok(lines);
                 }
             }
         }
         Err(format!("no answer from rigctld to \"{command}\""))
+    }
+}
+
+/// Hamlib's mode names as a panel would write them: its `PKT` modes are the
+/// data modes.
+fn mode_name(hamlib: &str) -> String {
+    match hamlib {
+        "PKTUSB" => "USB-D".into(),
+        "PKTLSB" => "LSB-D".into(),
+        "PKTFM" => "FM-D".into(),
+        "PKTAM" => "AM-D".into(),
+        "CWR" => "CW-R".into(),
+        "RTTYR" => "RTTY-R".into(),
+        other => other.to_string(),
     }
 }
 
@@ -69,6 +94,27 @@ impl Cat for Rigctld {
             other if other.starts_with("RPRT") => Ok(format!("answered {other} to a PTT read")),
             other => Err(format!("answered \"{other}\", which is not rigctld")),
         }
+    }
+
+    /// `f` is the frequency in hertz, one line; `m` is the mode and then the
+    /// passband, two (the passband is not used).
+    fn tuning(&mut self) -> Result<Tuning, String> {
+        let said = self.ask("f")?;
+        // Hamlib's frequency is a double; later versions print it whole.
+        let hz = said
+            .parse::<f64>()
+            .ok()
+            .filter(|hz| *hz >= 0.0)
+            .ok_or_else(|| format!("rigctld answered \"{said}\" to f"))?
+            .round() as u64;
+        let said = self.ask_lines("m", 2)?;
+        if said[0].starts_with("RPRT") {
+            return Err(format!("rigctld answered \"{}\" to m", said[0]));
+        }
+        Ok(Tuning {
+            hz,
+            mode: mode_name(&said[0]),
+        })
     }
 
     fn key(&mut self, on: bool) -> Result<(), String> {
@@ -91,7 +137,7 @@ impl Cat for Rigctld {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeRig, Model};
+    use crate::testing::{FakeRig, Mode, Model};
 
     #[test]
     fn it_keys_and_lets_go() {
@@ -110,6 +156,38 @@ mod tests {
         rigctld.key(false).unwrap();
         assert!(!rig.transmitting());
         assert_eq!(rig.heard(), "t\nT 1\nt\nT 0\n");
+    }
+
+    #[test]
+    fn it_reads_the_dial_and_the_mode() {
+        let rig = FakeRig::new(Model::Rigctld);
+        let mut rigctld = Rigctld::new(Box::new(rig.clone()));
+        assert_eq!(
+            rigctld.tuning(),
+            Ok(Tuning {
+                hz: 14_097_000,
+                mode: "USB-D".into()
+            })
+        );
+        rig.tune(7_074_000, Mode::Lsb);
+        let t = rigctld.tuning().unwrap();
+        assert_eq!((t.hz, t.mode.as_str()), (7_074_000, "LSB"));
+        assert_eq!(rig.heard(), "f\nm\nf\nm\n");
+        assert!(rig.keyings().is_empty());
+        assert_eq!(mode_name("PKTLSB"), "LSB-D");
+        assert_eq!(mode_name("CWR"), "CW-R");
+    }
+
+    #[test]
+    fn a_rig_hamlib_cannot_read_is_an_error_not_a_wait() {
+        let rig = FakeRig::new(Model::Rigctld).unreadable(true);
+        let mut rigctld = Rigctld::new(Box::new(rig));
+        let started = Instant::now();
+        assert_eq!(
+            rigctld.tuning(),
+            Err("rigctld answered \"RPRT -11\" to f".into())
+        );
+        assert!(started.elapsed() < ANSWER);
     }
 
     /// A rigctld stand-in on a real socket: keys on `T 1`, lets go on `T 0`.

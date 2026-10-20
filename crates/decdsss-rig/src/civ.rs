@@ -16,8 +16,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::Cat;
 use crate::link::{Line, Link};
+use crate::{Cat, Tuning};
 
 /// A computer's address, by custom.
 pub const CONTROLLER: u8 = 0xE0;
@@ -32,6 +32,11 @@ const NG: u8 = 0xFA;
 /// Read the transceiver's ID; switch the transmitter.
 const READ_ID: [u8; 2] = [0x19, 0x00];
 const PTT: [u8; 2] = [0x1C, 0x00];
+/// Read the operating frequency, the operating mode, and whether DATA mode is
+/// on (and which filter).
+const READ_FREQ: [u8; 1] = [0x03];
+const READ_MODE: [u8; 1] = [0x04];
+const READ_DATA: [u8; 2] = [0x1A, 0x06];
 
 /// How long the rig has to answer a command, and how often it is sent.
 const ANSWER: Duration = Duration::from_millis(250);
@@ -86,6 +91,44 @@ pub fn next_frame(buffer: &mut Vec<u8>) -> Option<Frame> {
         if frame.is_some() {
             return frame;
         }
+    }
+}
+
+/// A frequency from CI-V's five bytes of BCD, the least significant pair
+/// first: 14.097.000 Hz is `00 70 09 14 00`. None if a nibble is not a digit.
+pub fn bcd_hz(bytes: &[u8]) -> Option<u64> {
+    bytes.iter().rev().try_fold(0u64, |hz, &b| {
+        let (tens, ones) = (b >> 4, b & 0x0F);
+        (tens < 10 && ones < 10).then(|| hz * 100 + u64::from(tens * 10 + ones))
+    })
+}
+
+/// A frequency as CI-V's five bytes of BCD (the stand-in rig answers with it).
+pub fn hz_bcd(hz: u64) -> [u8; 5] {
+    let mut bytes = [0; 5];
+    let mut rest = hz;
+    for b in &mut bytes {
+        let pair = (rest % 100) as u8;
+        *b = ((pair / 10) << 4) | (pair % 10);
+        rest /= 100;
+    }
+    bytes
+}
+
+/// What an Icom's mode byte names. The IC-7300 has these eight (06, WFM, is
+/// on its relatives).
+fn mode_name(code: u8) -> String {
+    match code {
+        0x00 => "LSB".into(),
+        0x01 => "USB".into(),
+        0x02 => "AM".into(),
+        0x03 => "CW".into(),
+        0x04 => "RTTY".into(),
+        0x05 => "FM".into(),
+        0x06 => "WFM".into(),
+        0x07 => "CW-R".into(),
+        0x08 => "RTTY-R".into(),
+        other => format!("mode {other:02X}"),
     }
 }
 
@@ -144,6 +187,28 @@ impl Cat for Icom {
         }
     }
 
+    fn tuning(&mut self) -> Result<Tuning, String> {
+        let hz = match self.ask(&READ_FREQ)?.as_slice() {
+            [0x03, digits @ ..] => bcd_hz(digits)
+                .ok_or_else(|| format!("gave a frequency that is not BCD: {digits:02X?}"))?,
+            [NG] => return Err("refused to say its frequency".into()),
+            other => return Err(format!("answered {other:02X?}, which is not a frequency")),
+        };
+        let mut mode = match self.ask(&READ_MODE)?.as_slice() {
+            [0x04, code, ..] => mode_name(*code),
+            [NG] => return Err("refused to say its mode".into()),
+            other => return Err(format!("answered {other:02X?}, which is not a mode")),
+        };
+        // DATA mode is a setting of its own on top of the mode. A rig that will
+        // not say (an older one) leaves the mode as it was, without the -D.
+        if let Ok(body) = self.ask(&READ_DATA)
+            && matches!(body.as_slice(), [0x1A, 0x06, 0x01, ..])
+        {
+            mode.push_str("-D");
+        }
+        Ok(Tuning { hz, mode })
+    }
+
     fn key(&mut self, on: bool) -> Result<(), String> {
         let mut body = PTT.to_vec();
         body.push(u8::from(on));
@@ -166,7 +231,7 @@ impl Cat for Icom {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeRig, Model};
+    use crate::testing::{FakeRig, Mode, Model};
 
     #[test]
     fn frames_are_as_the_manual_gives_them() {
@@ -231,6 +296,57 @@ mod tests {
             icom.key(false).unwrap();
             assert!(!rig.transmitting(), "echo {echo}");
         }
+    }
+
+    #[test]
+    fn a_frequency_is_bcd_with_the_least_significant_pair_first() {
+        assert_eq!(bcd_hz(&[0x00, 0x70, 0x09, 0x14, 0x00]), Some(14_097_000));
+        assert_eq!(hz_bcd(14_097_000), [0x00, 0x70, 0x09, 0x14, 0x00]);
+        for hz in [0, 1_840_000, 7_074_500, 145_500_000, 470_000_000] {
+            assert_eq!(bcd_hz(&hz_bcd(hz)), Some(hz));
+        }
+        assert_eq!(bcd_hz(&[0x0A, 0x00, 0x00, 0x00, 0x00]), None);
+    }
+
+    #[test]
+    fn it_reads_the_dial_and_the_mode_past_echoes_and_reports() {
+        for echo in [false, true] {
+            let rig = FakeRig::new(Model::Ic7300).echo(echo).chatter(true);
+            let mut icom = Icom::new(Box::new(rig.clone()), IC7300);
+            let said = |t: Tuning| (t.hz, t.mode);
+            assert_eq!(
+                icom.tuning().map(said),
+                Ok((14_097_000, "USB-D".to_string()))
+            );
+            rig.tune(7_074_500, Mode::Lsb);
+            assert_eq!(icom.tuning().map(said), Ok((7_074_500, "LSB".to_string())));
+            rig.tune(145_500_000, Mode::Fm);
+            assert_eq!(icom.tuning().map(said), Ok((145_500_000, "FM".to_string())));
+            // Reading changes nothing and keys nothing.
+            assert!(!rig.transmitting() && rig.keyings().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_rig_with_no_data_mode_to_read_is_still_read() {
+        let rig = FakeRig::new(Model::Ic7300).without_data_mode(true);
+        let mut icom = Icom::new(Box::new(rig), IC7300);
+        assert_eq!(
+            icom.tuning(),
+            Ok(Tuning {
+                hz: 14_097_000,
+                mode: "USB".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_rig_that_will_not_say_where_it_is_tuned_says_so() {
+        let rig = FakeRig::new(Model::Ic7300).unreadable(true);
+        let mut icom = Icom::new(Box::new(rig), IC7300);
+        assert_eq!(icom.tuning(), Err("refused to say its frequency".into()));
+        let mut icom = Icom::new(Box::new(FakeRig::new(Model::Ic7300)), 0x88);
+        assert_eq!(icom.tuning(), Err("no answer at CI-V address 88h".into()));
     }
 
     #[test]

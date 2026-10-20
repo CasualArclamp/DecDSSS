@@ -46,7 +46,7 @@ enum Command {
     /// List the sound cards (inputs and outputs) with their rates.
     Devices,
     /// List the serial ports, or check that a rig answers on one. Never keys
-    /// the transmitter: it only asks the rig what it is.
+    /// the transmitter: it only asks the rig what it is and where its dial is.
     Rig {
         /// The rig: ic7300, ft710 or rigctld (Hamlib's, over TCP).
         #[arg(long, requires = "port")]
@@ -1240,13 +1240,21 @@ fn rig(model: Option<&str>, port: Option<&str>, baud: Option<u32>, civ: Option<u
     if let Some(c) = civ {
         settings.civ = c;
     }
-    let found = decdsss_rig::connect(&settings).map_err(anyhow::Error::msg)?;
+    let mut found = decdsss_rig::connect(&settings).map_err(anyhow::Error::msg)?;
     let rate = if found.baud > 0 {
         format!(" at {} baud", found.baud)
     } else {
         String::new()
     };
     println!("{} on {port}{rate}: {}", parsed.name(), found.answer);
+    // Another question, to see what the window's rig strip will show.
+    match found.cat.tuning() {
+        Ok(t) => {
+            let (head, tail) = t.split();
+            println!("dial {head}{tail} MHz, {}", t.mode);
+        }
+        Err(e) => println!("frequency and mode: {e}"),
+    }
     Ok(())
 }
 

@@ -21,7 +21,9 @@ pub mod testing;
 mod yaesu;
 
 pub use link::{Line, Link, Port, RIGCTLD_PORT, Serial, Tcp, ports, with_default_port};
-pub use ptt::{Config, Hold, KEY_WAIT, Links, MAX_DELAY_MS, Method, Phase, Ptt, Status, UNKEY_WAIT};
+pub use ptt::{
+    Config, Hold, KEY_WAIT, Links, MAX_DELAY_MS, Method, Phase, Ptt, Status, UNKEY_WAIT,
+};
 
 /// A rig this crate can key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -137,10 +139,37 @@ impl Settings {
 /// The IC-7300's CI-V address as it comes.
 pub const IC7300_ADDRESS: u8 = civ::IC7300;
 
+/// Where a rig's dial is and what mode it is in, as it last said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tuning {
+    /// The dial, in hertz.
+    pub hz: u64,
+    /// The mode as the rig's panel names it, with `-D` after it for a data
+    /// mode: `USB`, `LSB`, `FM`, `USB-D`. A mode the rig has that this does not
+    /// know is its code, `mode 0E`.
+    pub mode: String,
+}
+
+impl Tuning {
+    /// The dial as `14.097.000`, split where the kilohertz end: the megahertz
+    /// and kilohertz (`14.097`), then the hertz (`.000`), so a display can
+    /// set the two apart.
+    pub fn split(&self) -> (String, String) {
+        (
+            format!("{}.{:03}", self.hz / 1_000_000, self.hz / 1000 % 1000),
+            format!(".{:03}", self.hz % 1000),
+        )
+    }
+}
+
 /// A rig's CAT, on a link.
 pub trait Cat: Send {
     /// Ask the rig what it is; what it said.
     fn identify(&mut self) -> Result<String, String>;
+
+    /// Ask the rig where its dial is and what mode it is in. Only asks: it
+    /// never changes the rig, and never keys it.
+    fn tuning(&mut self) -> Result<Tuning, String>;
 
     /// Key the transmitter, or let it go, and see that the rig has.
     fn key(&mut self, on: bool) -> Result<(), String>;
@@ -236,6 +265,24 @@ pub fn connect(settings: &Settings) -> Result<Found, String> {
 mod tests {
     use super::*;
     use crate::testing::FakeRig;
+
+    #[test]
+    fn a_dial_splits_where_the_kilohertz_end() {
+        for (hz, head, tail) in [
+            (14_097_000, "14.097", ".000"),
+            (7_074_500, "7.074", ".500"),
+            (145_500_000, "145.500", ".000"),
+            (1_840_005, "1.840", ".005"),
+            (0, "0.000", ".000"),
+        ] {
+            let split = Tuning {
+                hz,
+                mode: String::new(),
+            }
+            .split();
+            assert_eq!(split, (head.to_string(), tail.to_string()), "{hz}");
+        }
+    }
 
     #[test]
     fn rigs_are_known_by_any_of_their_names() {

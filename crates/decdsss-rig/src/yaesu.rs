@@ -8,8 +8,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::Cat;
 use crate::link::{Line, Link};
+use crate::{Cat, Tuning};
 
 /// What an FT-710 answers to "ID;".
 pub const FT710_ID: &str = "0800";
@@ -22,6 +22,27 @@ const TRIES: usize = 2;
 /// often, since the command that keys it is not answered.
 const SETTLE: Duration = Duration::from_millis(400);
 const RECHECK: Duration = Duration::from_millis(20);
+
+/// What the mode digit of an "MD0;" answer names (the FT-710's CAT manual lists
+/// more, which are shown by their digit).
+fn mode_name(code: char) -> String {
+    match code {
+        '1' => "LSB".into(),
+        '2' => "USB".into(),
+        '3' => "CW".into(),
+        '4' => "FM".into(),
+        '5' => "AM".into(),
+        '6' => "RTTY".into(),
+        '7' => "CW-R".into(),
+        '8' => "LSB-D".into(),
+        '9' => "RTTY-R".into(),
+        'A' => "FM-D".into(),
+        'B' => "FM-N".into(),
+        'C' => "USB-D".into(),
+        'D' => "AM-N".into(),
+        other => format!("mode {other}"),
+    }
+}
 
 /// An FT-710, or any Yaesu that speaks the same.
 pub struct Yaesu {
@@ -86,6 +107,22 @@ impl Cat for Yaesu {
         })
     }
 
+    /// "FA;" is the main VFO's frequency, in hertz, as digits; "MD0;" is the
+    /// main receiver's mode: a 0 for the receiver and a digit for the mode.
+    fn tuning(&mut self) -> Result<Tuning, String> {
+        let digits = self.ask("FA;")?;
+        let hz = digits
+            .parse::<u64>()
+            .map_err(|_| format!("answered FA{digits}, which is not a frequency"))?;
+        let mode = self.ask("MD0;")?;
+        let mode = mode
+            .chars()
+            .nth(1)
+            .map(mode_name)
+            .ok_or_else(|| format!("answered MD{mode}, which is not a mode"))?;
+        Ok(Tuning { hz, mode })
+    }
+
     /// TX1 keys the rig by CAT and TX0 lets it go. Neither is answered, so
     /// the rig is asked with TX where it has got to: 0 receiving, 1 keyed by
     /// CAT, 2 keyed by its own PTT.
@@ -116,7 +153,34 @@ impl Cat for Yaesu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeRig, Model};
+    use crate::testing::{FakeRig, Mode, Model};
+
+    #[test]
+    fn it_reads_the_dial_and_the_mode() {
+        let rig = FakeRig::new(Model::Ft710);
+        let mut yaesu = Yaesu::new(Box::new(rig.clone()));
+        assert_eq!(
+            yaesu.tuning(),
+            Ok(Tuning {
+                hz: 14_097_000,
+                mode: "USB-D".into()
+            })
+        );
+        rig.tune(3_573_000, Mode::Lsb);
+        let t = yaesu.tuning().unwrap();
+        assert_eq!((t.hz, t.mode.as_str()), (3_573_000, "LSB"));
+        // Only questions: nothing set, nothing keyed.
+        assert_eq!(rig.heard(), "FA;MD0;FA;MD0;");
+        assert!(rig.keyings().is_empty());
+        assert_eq!(mode_name('E'), "mode E");
+    }
+
+    #[test]
+    fn a_rig_that_will_not_say_where_it_is_tuned_says_so() {
+        let rig = FakeRig::new(Model::Ft710).unreadable(true);
+        let mut yaesu = Yaesu::new(Box::new(rig));
+        assert_eq!(yaesu.tuning(), Err("would not take FA;".into()));
+    }
 
     #[test]
     fn it_keys_and_lets_go_past_auto_information() {

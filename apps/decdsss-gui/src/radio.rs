@@ -8,7 +8,7 @@
 //! left on when a thread ends any way at all. Audio played to the speakers
 //! (the RF monitor, received speech) never comes here.
 
-use decdsss_rig::{Config, Hold, Phase, Ptt};
+use decdsss_rig::{Config, Hold, Phase, Ptt, Tuning};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,10 @@ pub struct RadioStatus {
     pub testing: bool,
     /// What the last Test PTT came to, if it did not go as asked.
     pub test_note: Option<String>,
+    /// Where the rig's dial is and its mode, as it last said (CAT only).
+    pub tuning: Option<Tuning>,
+    /// Why the rig is not saying, when it is found but cannot be read.
+    pub tuning_problem: Option<String>,
 }
 
 impl Radio {
@@ -80,6 +84,16 @@ impl Radio {
     /// FT-710, and PTT by CAT.
     #[cfg(test)]
     pub fn with_fake_rig(rig: &decdsss_rig::testing::FakeRig, lead_ms: u32, tail_ms: u32) -> Radio {
+        let radio = Radio::default();
+        radio.use_fake_rig(rig, lead_ms, tail_ms);
+        radio
+    }
+
+    /// Put a stand-in rig in force in place of whatever is set: the program's
+    /// `--fake-rig`, for trying the window and taking pictures of it with no
+    /// radio. It is an FT-710 on a port that is not there, keyed by CAT, and
+    /// keys nothing real.
+    pub fn use_fake_rig(&self, rig: &decdsss_rig::testing::FakeRig, lead_ms: u32, tail_ms: u32) {
         use decdsss_rig::{Links, Model, Settings};
         let config = Config {
             cat: true,
@@ -89,19 +103,17 @@ impl Radio {
             tail_ms,
             ..Config::default()
         };
-        let radio = Radio::default();
-        {
-            let mut g = radio.lock();
-            g.ptt = Some(Arc::new(Ptt::with_links(
-                config.clone(),
-                Links {
-                    cat: Some(Box::new(rig.clone())),
-                    lines: None,
-                },
-            )));
-            g.config = config;
-        }
-        radio
+        let mut g = self.lock();
+        g.test_gen += 1;
+        g.problem = None;
+        g.ptt = Some(Arc::new(Ptt::with_links(
+            config.clone(),
+            Links {
+                cat: Some(Box::new(rig.clone())),
+                lines: None,
+            },
+        )));
+        g.config = config;
     }
 
     /// Put `config` in force: the old connection is let go (off this thread,
@@ -213,8 +225,8 @@ impl Radio {
 
     pub fn status(&self) -> RadioStatus {
         let g = self.lock();
-        let (lamp, text, keyed) = match (&g.problem, &g.ptt) {
-            (Some(e), _) => (Lamp::Bad, e.clone(), false),
+        let (lamp, text, keyed, tuning, tuning_problem) = match (&g.problem, &g.ptt) {
+            (Some(e), _) => (Lamp::Bad, e.clone(), false, None, None),
             (None, Some(p)) => {
                 let s = p.status();
                 let lamp = match s.phase {
@@ -222,12 +234,14 @@ impl Radio {
                     Phase::Ready => Lamp::Ok,
                     Phase::Failed => Lamp::Bad,
                 };
-                (lamp, s.said, s.keyed)
+                (lamp, s.said, s.keyed, s.tuning, s.tuning_problem)
             }
             (None, None) => (
                 Lamp::Off,
                 "no CAT, and the radio is not keyed by this program".into(),
                 false,
+                None,
+                None,
             ),
         };
         RadioStatus {
@@ -236,6 +250,8 @@ impl Radio {
             keyed,
             testing: g.testing,
             test_note: g.test_note.clone(),
+            tuning,
+            tuning_problem,
         }
     }
 

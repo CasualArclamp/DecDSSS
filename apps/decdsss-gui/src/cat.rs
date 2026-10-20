@@ -6,9 +6,10 @@
 //!
 //! Differences from WSJT-X: there is no Hamlib (a C library) here; the IC-7300
 //! and FT-710 are driven directly, and any other rig through Hamlib's `rigctld`
-//! over TCP. DecDSSS keys the transmitter and nothing else (no frequency, no
-//! mode), so there is no OmniRig, no PTT input and no left-channel VOX tone
-//! (the Transmit panel's VOX box sends one).
+//! over TCP. DecDSSS keys the transmitter and reads the rig's frequency and
+//! mode for the strip across the top of the window, but never sets them, so
+//! there is no OmniRig, no PTT input and no left-channel VOX tone (the
+//! Transmit panel's VOX box sends one).
 
 use crate::prefs::Prefs;
 use crate::radio::{Lamp, Radio};
@@ -163,8 +164,9 @@ impl CatDialog {
         let cat = self.edit.cat;
         ui.label(RichText::new("Rig control").strong());
         ui.checkbox(&mut self.edit.cat, "Enable CAT control").on_hover_text(
-            "Find the rig on its port and ask it what it is. DecDSSS only keys the transmitter: set the \
-             frequency and the mode (USB, or data) on the radio.",
+            "Find the rig on its port, ask it what it is and show its frequency and mode across the top \
+             of the window. DecDSSS only reads them and keys the transmitter: set the frequency and \
+             the mode (USB, or data) on the radio.",
         );
         ui.add_enabled_ui(cat, |ui| {
             egui::Grid::new("cat_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {

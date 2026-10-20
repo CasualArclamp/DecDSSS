@@ -7,13 +7,13 @@
 //! the answer, so audio is not started before the rig has keyed, and that the
 //! key can be a control line as well as CAT.
 
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::link::{Line, Link, Serial};
-use crate::{Found, Model, Settings, find, open_link};
+use crate::{Found, Model, Settings, Tuning, find, open_link};
 
 /// How long the port is tried when it will not open at first: a rig just let
 /// go of by the program holds its port until its thread has finished, which may
@@ -33,6 +33,13 @@ pub const UNKEY_WAIT: Duration = Duration::from_secs(2);
 
 /// The rate a control-line port is opened at: it carries no data.
 const LINES_BAUD: u32 = 9600;
+
+/// How often an idle rig is asked where its dial is: the rig's thread waits
+/// this long for a job before it asks.
+const POLL: Duration = Duration::from_millis(500);
+/// How many times in a row the rig may fail to say before the last frequency
+/// and mode are let go of, so one dropped answer does not blank the display.
+const MISSES: u32 = 3;
 
 /// What keys the transmitter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -314,6 +321,11 @@ pub struct Status {
     pub said: String,
     /// The transmitter is keyed, as far as the rig has said.
     pub keyed: bool,
+    /// Where the rig's dial is and its mode, as last read; None before the
+    /// first answer, with no CAT, or once the rig has stopped saying.
+    pub tuning: Option<Tuning>,
+    /// Why the rig could not be read, when the last try failed.
+    pub tuning_problem: Option<String>,
 }
 
 #[derive(Debug)]
@@ -321,6 +333,8 @@ struct State {
     phase: Phase,
     said: String,
     keyed: bool,
+    tuning: Option<Tuning>,
+    tuning_problem: Option<String>,
     /// The last job finished, and how it went.
     done: u64,
     result: Result<(), String>,
@@ -394,6 +408,8 @@ impl Ptt {
                 phase: Phase::Connecting,
                 said: format!("looking for the rig: {}", config.summary()),
                 keyed: false,
+                tuning: None,
+                tuning_problem: None,
                 done: 0,
                 result: Ok(()),
             }),
@@ -423,6 +439,8 @@ impl Ptt {
             phase: state.phase,
             said: state.said.clone(),
             keyed: state.keyed,
+            tuning: state.tuning.clone(),
+            tuning_problem: state.tuning_problem.clone(),
         }
     }
 
@@ -598,6 +616,32 @@ fn connect(config: &Config, links: Links) -> Result<(Rig, String), String> {
     ))
 }
 
+/// Ask the rig where its dial is and say what it said. The last answer is
+/// kept through a few that do not come ([`MISSES`]); the reason is kept until
+/// one does.
+fn read_tuning(rig: &mut Rig, shared: &Shared, misses: &mut u32) {
+    let Some(cat) = rig.cat.as_mut() else {
+        return;
+    };
+    // Not asked with the state locked: a rig that does not answer takes its time.
+    let answer = cat.tuning();
+    let mut state = shared.lock();
+    match answer {
+        Ok(tuning) => {
+            *misses = 0;
+            state.tuning = Some(tuning);
+            state.tuning_problem = None;
+        }
+        Err(e) => {
+            *misses += 1;
+            if *misses >= MISSES {
+                state.tuning = None;
+            }
+            state.tuning_problem = Some(e);
+        }
+    }
+}
+
 fn run(
     config: &Config,
     open: impl FnOnce() -> Result<Links, String>,
@@ -615,7 +659,21 @@ fn run(
     // Whether the rig may be transmitting: keyed, or told to be and not
     // certainly let go since.
     let mut maybe_on = false;
-    while let Ok(job) = inbox.recv() {
+    let mut misses = 0;
+    read_tuning(&mut rig, shared, &mut misses);
+    loop {
+        let job = match inbox.recv_timeout(POLL) {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => {
+                // Idle: look where the dial is, unless the rig is on the air,
+                // when the line is left to the key.
+                if !maybe_on {
+                    read_tuning(&mut rig, shared, &mut misses);
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         maybe_on |= job.on;
         let result = rig.key(job.on);
         if result.is_ok() {
@@ -648,7 +706,7 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::FakeRig;
+    use crate::testing::{FakeRig, Mode};
 
     fn with_cat(model: Model, method: Method) -> Config {
         Config {
@@ -700,6 +758,78 @@ mod tests {
                 model.name()
             );
         }
+    }
+
+    /// Wait for `what` to hold, up to five seconds.
+    fn until(what: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !what() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(what());
+    }
+
+    #[test]
+    fn an_idle_rig_is_read_for_its_dial_and_a_keyed_one_is_left_alone() {
+        let rig = FakeRig::new(Model::Ft710);
+        let ptt = Ptt::with_links(with_cat(Model::Ft710, Method::Cat), links(&rig));
+        assert_eq!(found(&ptt).phase, Phase::Ready);
+        let dial = || ptt.status().tuning.map(|t| (t.hz, t.mode));
+        until(|| dial().is_some());
+        assert_eq!(dial(), Some((14_097_000, "USB-D".to_string())));
+        // Turned on the rig: seen within a poll or two.
+        rig.tune(7_074_000, Mode::Lsb);
+        until(|| dial() == Some((7_074_000, "LSB".to_string())));
+        // On the air nothing is asked, so the line is the key's.
+        ptt.key(true, KEY_WAIT).unwrap();
+        let heard = rig.heard();
+        std::thread::sleep(POLL + Duration::from_millis(200));
+        assert_eq!(rig.heard(), heard);
+        ptt.key(false, KEY_WAIT).unwrap();
+        until(|| rig.heard().len() > heard.len() + "TX0;TX;".len());
+        assert!(rig.keyings() == [true, false]);
+    }
+
+    #[test]
+    fn the_dial_is_kept_through_a_missed_answer_and_let_go_of_after_several() {
+        let rig = FakeRig::new(Model::Ft710);
+        let shared = Shared {
+            state: Mutex::new(State {
+                phase: Phase::Ready,
+                said: String::new(),
+                keyed: false,
+                tuning: None,
+                tuning_problem: None,
+                done: 0,
+                result: Ok(()),
+            }),
+            changed: Condvar::new(),
+        };
+        let mut found = Rig {
+            cat: Some(Box::new(crate::yaesu::Yaesu::new(Box::new(rig.clone())))),
+            lines: None,
+            method: Method::Cat,
+        };
+        let mut misses = 0;
+        read_tuning(&mut found, &shared, &mut misses);
+        assert_eq!(
+            shared.lock().tuning.as_ref().map(|t| t.hz),
+            Some(14_097_000)
+        );
+        rig.clone().unreadable(true);
+        for miss in 1..=MISSES {
+            read_tuning(&mut found, &shared, &mut misses);
+            let state = shared.lock();
+            // The reason shows at once; the dial goes only after MISSES.
+            assert!(state.tuning_problem.is_some());
+            assert_eq!(state.tuning.is_some(), miss < MISSES, "miss {miss}");
+        }
+        // And back when the rig says again.
+        rig.clone().unreadable(false);
+        read_tuning(&mut found, &shared, &mut misses);
+        let state = shared.lock();
+        assert_eq!(state.tuning.as_ref().map(|t| t.hz), Some(14_097_000));
+        assert_eq!(state.tuning_problem, None);
     }
 
     #[test]

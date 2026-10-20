@@ -710,9 +710,9 @@ ALSA-only build. A saved device name from one host will not match the other's
 machine: CI builds and tests it, nothing has opened a stream.
 
 **Keying** (`decdsss-rig`, the GUI's *CAT / PTT…* button in the bar; a dialog laid
-out as WSJT-X's "CAT and PTT Config"). The program only keys the transmitter: the
-operator sets the frequency and the mode (USB, or data) on the radio, as with any
-sound-card interface. What keys it (*PTT uses*):
+out as WSJT-X's "CAT and PTT Config"). The program keys the transmitter and reads
+the rig's frequency and mode, and sets neither: the operator sets them (USB, or
+data) on the radio, as with any sound-card interface. What keys it (*PTT uses*):
 
 - **VOX** (the default): nothing is keyed; the radio is on VOX or keyed by hand.
 - **CAT**: a command to the rig, found on its port first. The IC-7300 by CI-V
@@ -728,6 +728,21 @@ sound-card interface. What keys it (*PTT uses*):
   lines are held low when a port is opened, so opening one never keys the rig.
   *Force RTS / DTR* hold a line of the CAT port high, for an interface that takes
   its power from it.
+
+**Rig strip** (`rig_strip.rs`, across the top of the window, only with CAT on): the
+rig's lamp and name, its dial as `14.097.000 MHz`, its mode (`USB-D` is upper
+sideband with the radio's data mode on) and RX or TX. The rig's thread asks for
+the dial and the mode every 500 ms while it is idle, and not at all while the rig
+is keyed, so the line is the key's then. One answer that does not come leaves the
+last reading up; three in a row blank it and the reason goes in the strip and its
+tooltip. Read-only: IC-7300 `03` (frequency, five bytes of BCD, least significant
+pair first) and `04` (mode), and `1A 06` for DATA mode (an Icom that refuses it
+shows the plain mode); FT-710 `FA;` and `MD0;` (the mode digit: 1 LSB, 2 USB,
+3 CW, 4 FM, 5 AM, 6 RTTY, 7 CW-R, 8 LSB data, 9 RTTY-R, A FM data, B FM-N, C USB
+data, D AM-N; any other digit is shown as `mode E`); `rigctld` `f` and `m` (its
+`PKTUSB` is `USB-D`). `decdsss rig --model … --port …` prints the same after the
+rig's ID, and `decdsss-gui --fake-rig` puts a stand-in FT-710 in force to see the
+strip with no radio (`--demo --fake-rig --screenshot`). The filter is not read.
 
 A transmission to the radio (files, pictures, text, voice overs, live voice) keys
 the transmitter before its first sample and lets go after its last: the rig's
@@ -746,11 +761,15 @@ and, with `--model` and `--port`, checks that a rig answers (it asks "ID;" or it
 equivalent and never keys).
 
 *Checked:* the CAT, line and `rigctld` code against stand-in rigs (`cargo test -p
-decdsss-rig`, including `rigctld` over a real local TCP socket); the keying around
+decdsss-rig`, including `rigctld` over a real local TCP socket, and the dial and
+mode reads of all three); the keying around
 audio through VB-Audio cable A with a stand-in rig (`cargo test -p decdsss-gui --
 --ignored keyed_around`); and, without keying, the real FT-710 on this PC answering
 `ID;` with 0800 on both of its COM ports (the Standard one at 4800 baud, the
 Enhanced one at 38400). *Not checked:* keying a real transmitter (Rory's to do),
+reading the dial and mode from any real rig (the IC-7300's `1A 06` and the FT-710's
+mode digits are from memory of the manuals and a search, not from the manuals
+themselves),
 the IC-7300 against a real one, CI-V and `rigctld` against real rigs, and DTR/RTS
 on a real interface. `tx --play` keys the same way, with the same settings: it reads the `rig_*` lines of the GUI's
 preferences file, and `--ptt vox|cat|dtr|rts`, `--rig`, `--rig-port`, `--rig-baud`

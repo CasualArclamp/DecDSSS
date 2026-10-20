@@ -9,8 +9,18 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use crate::Model;
-use crate::civ::{CONTROLLER, frame, next_frame};
+use crate::civ::{CONTROLLER, frame, hz_bcd, next_frame};
 use crate::link::{Line, Link};
+
+/// A mode a stand-in rig can be in; each model answers with its own code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Lsb,
+    Usb,
+    /// Upper sideband with DATA mode on.
+    UsbData,
+    Fm,
+}
 
 /// A rig that answers what it is sent. Clones share one rig, so a test can
 /// keep one to look at while a keyer owns another.
@@ -35,6 +45,13 @@ struct State {
     refuse: bool,
     silent: bool,
     transmitting: bool,
+    /// Where the dial is, hertz, and the mode.
+    hz: u64,
+    mode: Mode,
+    /// Will not say where the dial is or what mode it is in; an Icom that has
+    /// no DATA mode to ask about.
+    unreadable: bool,
+    no_data_mode: bool,
     /// Every change of a control line, in order.
     lines: Vec<(Line, bool)>,
     /// Every change of transmitting, in order, and every byte it was sent.
@@ -57,6 +74,10 @@ impl FakeRig {
             refuse: false,
             silent: false,
             transmitting: false,
+            hz: 14_097_000,
+            mode: Mode::UsbData,
+            unreadable: false,
+            no_data_mode: false,
             lines: Vec::new(),
             keyings: Vec::new(),
             heard: Vec::new(),
@@ -91,6 +112,19 @@ impl FakeRig {
         self
     }
 
+    /// Refuse to say where the dial is or what mode it is in.
+    pub fn unreadable(self, on: bool) -> Self {
+        self.state().unreadable = on;
+        self
+    }
+
+    /// An Icom that has no DATA mode to read (an older one): the mode is all
+    /// it says.
+    pub fn without_data_mode(self, on: bool) -> Self {
+        self.state().no_data_mode = on;
+        self
+    }
+
     pub fn id(self, id: &str) -> Self {
         self.state().id = id.to_string();
         self
@@ -103,6 +137,14 @@ impl FakeRig {
 
     pub fn transmitting(&self) -> bool {
         self.state().transmitting
+    }
+
+    /// Turn the dial: the rig's frequency and mode are these from now on. (It
+    /// starts at 14.097.000 in USB with DATA mode on.)
+    pub fn tune(&self, hz: u64, mode: Mode) {
+        let mut s = self.state();
+        s.hz = hz;
+        s.mode = mode;
     }
 
     /// Every change of transmitting, in order.
@@ -153,6 +195,19 @@ impl State {
                     vec![0xFB]
                 }
                 [0x1C, 0x00] => vec![0x1C, 0x00, u8::from(self.transmitting)],
+                [0x03 | 0x04] if self.unreadable => vec![0xFA],
+                [0x1A, 0x06] if self.unreadable || self.no_data_mode => vec![0xFA],
+                [0x03] => [&[0x03][..], &hz_bcd(self.hz)].concat(),
+                [0x04] => vec![
+                    0x04,
+                    match self.mode {
+                        Mode::Lsb => 0x00,
+                        Mode::Usb | Mode::UsbData => 0x01,
+                        Mode::Fm => 0x05,
+                    },
+                    0x01,
+                ],
+                [0x1A, 0x06] => vec![0x1A, 0x06, u8::from(self.mode == Mode::UsbData), 0x01],
                 _ => vec![0xFA],
             };
             self.said.extend(frame(CONTROLLER, self.address, &answer));
@@ -168,6 +223,17 @@ impl State {
                     "{}
 ",
                     u8::from(self.transmitting)
+                ),
+                "f" | "m" if self.unreadable => "RPRT -11\n".to_string(),
+                "f" => format!("{}\n", self.hz),
+                "m" => format!(
+                    "{}\n2400\n",
+                    match self.mode {
+                        Mode::Lsb => "LSB",
+                        Mode::Usb => "USB",
+                        Mode::UsbData => "PKTUSB",
+                        Mode::Fm => "FM",
+                    }
                 ),
                 "T 1" | "T 0" if self.refuse => "RPRT -8
 "
@@ -201,6 +267,17 @@ impl State {
                     continue;
                 }
                 "TX;" => format!("TX{};", u8::from(self.transmitting)),
+                "FA;" | "MD0;" if self.unreadable => "?;".into(),
+                "FA;" => format!("FA{:09};", self.hz),
+                "MD0;" => format!(
+                    "MD0{};",
+                    match self.mode {
+                        Mode::Lsb => '1',
+                        Mode::Usb => '2',
+                        Mode::UsbData => 'C',
+                        Mode::Fm => '4',
+                    }
+                ),
                 _ => "?;".into(),
             };
             self.said.extend(answer.as_bytes());

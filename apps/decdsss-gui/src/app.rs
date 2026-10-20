@@ -6,7 +6,7 @@ use crate::engine::{
     Cmd, Config, Engine, PictureView, Shared, Source, SpectrumView, Transfer, VoiceView,
 };
 use crate::prefs::Prefs;
-use crate::radio::{Lamp, Radio};
+use crate::radio::Radio;
 use crate::scope::{self, HeatTexture, col};
 use crate::tx::TxPanel;
 use decdsss_audio::{list_input_devices, list_output_devices};
@@ -67,6 +67,9 @@ pub struct Automation {
     pub open_tx: bool,
     /// Open the CAT and PTT dialog at launch.
     pub open_cat: bool,
+    /// Use a stand-in rig as the CAT, in place of the one set: for trying the
+    /// window and taking pictures of it with no radio.
+    pub fake_rig: bool,
     /// Open the transmit window with this file chosen.
     pub tx_file: Option<PathBuf>,
     /// Open the transmit window set to send this text (a message; `cq` for a CQ call).
@@ -211,6 +214,10 @@ impl App {
         let radio = tx.radio.clone();
         let cat_config = cat::restore(&prefs);
         radio.apply(cat_config.clone());
+        if auto.fake_rig {
+            let rig = decdsss_rig::testing::FakeRig::new(decdsss_rig::Model::Ft710);
+            radio.use_fake_rig(&rig, 100, 100);
+        }
         let mut view = prefs
             .get("view")
             .and_then(View::from_name)
@@ -602,6 +609,8 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut Ui, sh: &Shared) {
         ui.add_space(2.0);
+        crate::rig_strip::show(ui, &self.radio);
+        ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             self.brand(ui);
             ui.separator();
@@ -657,13 +666,7 @@ impl App {
     /// transmitter is keyed or the rig is not working.
     fn cat_button(&mut self, ui: &mut Ui) {
         let s = self.radio.status();
-        let colour = match (s.keyed, &s.lamp) {
-            (true, _) | (_, Lamp::Bad) => col::BAD,
-            (_, Lamp::Wait) => col::MARK,
-            (_, Lamp::Ok) => col::LOCK,
-            (_, Lamp::Off) => Color32::GRAY,
-        };
-        ui.label(RichText::new("●").color(colour));
+        ui.label(RichText::new("●").color(crate::rig_strip::lamp_colour(&s)));
         let label = if s.keyed {
             "CAT / PTT — TX"
         } else {
