@@ -118,9 +118,147 @@ pub fn csk_bit_llrs(metric: &[f64], bits: usize, out: &mut Vec<f32>) {
     }
 }
 
+/// ln Σ exp(x) without overflow.
+fn log_sum_exp(x: impl Iterator<Item = f64> + Clone) -> f64 {
+    let top = x.clone().fold(f64::NEG_INFINITY, f64::max);
+    if !top.is_finite() {
+        return top;
+    }
+    top + x.map(|v| (v - top).exp()).sum::<f64>().ln()
+}
+
+/// Test-only switch (environment `DECDSSS_BICSK_SIGN`) for measuring what the sign
+/// change metric gains from summing over the codes: `naive` judges it on the two
+/// decided codes alone, as a decision-directed receiver would, with no allowance for
+/// either being wrong; `top1` sums the decided pair and the closed-form rest.
+fn sign_ablation() -> Option<&'static str> {
+    if !cfg!(test) {
+        return None;
+    }
+    match std::env::var("DECDSSS_BICSK_SIGN").as_deref() {
+        Ok("naive") => Some("naive"),
+        Ok("top1") => Some("top1"),
+        _ => None,
+    }
+}
+
+/// Codes of each side that the sign-change metric sums over exactly; the rest of
+/// the L² pairs are summed in closed form (see [`sign_llr`]).
+const SIGN_TOP: usize = 6;
+
+/// The `k` largest entries of `metric`, by index.
+fn top_codes(metric: &[f64], k: usize) -> Vec<usize> {
+    let k = k.min(metric.len());
+    let mut idx: Vec<usize> = (0..metric.len()).collect();
+    // Rust note: `select_nth_unstable_by` moves the k largest to the front, in no
+    // particular order, without sorting the rest.
+    idx.select_nth_unstable_by(k - 1, |&a, &b| metric[b].total_cmp(&metric[a]));
+    idx.truncate(k);
+    idx
+}
+
+/// LLR (positive: the sign is the same, bit 0) of the sign change between two
+/// successive bi-orthogonal CSK symbols, from everything the two symbols' Walsh
+/// correlations say, without deciding either code first.
+///
+/// `prev` and `cur` hold each symbol's correlations, finger after finger (`l` each);
+/// `prev_metric` and `metric` are their per-code noncoherent metrics Λ[m] =
+/// Σ_f ln I0(κ_f |y_f[m]|), the ones the code bits are taken from; `kappa` is κ_f =
+/// 2A_f/σ_f² per finger.
+///
+/// *Derived.* Take codes a (before) and b (now) and a sign change d = ±1. At finger
+/// f the two correlations are y₁ = h + n₁ and y₂ = d·h + n₂ with the same complex
+/// channel gain h (the channel holds for one symbol), so with the phase of h unknown,
+/// the likelihood against noise alone is exp(−κA) I0(κ|y₁ + d·y₂|); fingers multiply.
+/// The sign change's posterior is the sum of that over all L² pairs (a, b), the same
+/// for either d except at the pairs where the correlations are the signal. The pairs of
+/// the `SIGN_TOP` largest codes on each side are summed with the phase; for the rest,
+/// the relative phase of the two correlations averages the Bessel function to the
+/// product of the two single-symbol terms (Graf's addition theorem,
+/// avg_θ I0(κ|u + v·e^{jθ}|) = I0(κ|u|) I0(κ|v|)), which is exp(Λ₁[a] + Λ₂[b]) whatever
+/// d is, and the sum of those over every pair is the product of the two sums of
+/// exp(Λ) less the top pairs' share. Where either symbol's code is uncertain the
+/// rest carries the weight, and the sign's LLR comes out small; where both are clear
+/// it is the decision-directed statistic Re(Σ_f κ_f y₂ y₁*) up to its Bessel tail.
+pub fn sign_llr(
+    prev: &[Iq],
+    cur: &[Iq],
+    prev_metric: &[f64],
+    metric: &[f64],
+    l: usize,
+    kappa: &[f64],
+) -> f32 {
+    let nf = prev.len() / l;
+    let ablation = sign_ablation();
+    let k = if ablation.is_some() { 1 } else { SIGN_TOP };
+    let (ta, tb) = (top_codes(prev_metric, k), top_codes(metric, k));
+    let (mut plus, mut minus, mut indep) = (Vec::new(), Vec::new(), Vec::new());
+    for &a in &ta {
+        for &b in &tb {
+            let (mut p, mut m) = (0.0f64, 0.0f64);
+            for f in 0..nf {
+                let (u, v) = (prev[f * l + a], cur[f * l + b]);
+                p += ln_i0(kappa[f] * f64::from((u + v).norm()));
+                m += ln_i0(kappa[f] * f64::from((u - v).norm()));
+            }
+            plus.push(p);
+            minus.push(m);
+            indep.push(prev_metric[a] + metric[b]);
+        }
+    }
+    if ablation == Some("naive") {
+        // The decided codes taken as right, the rest of the pairs left out.
+        return (plus[0] - minus[0]) as f32;
+    }
+    let all = log_sum_exp(prev_metric.iter().copied()) + log_sum_exp(metric.iter().copied());
+    let top = log_sum_exp(indep.iter().copied());
+    // The rest of the pairs: all less the top ones (the top ones are a part of all,
+    // so the ratio is below one; held off one so a sum that is all top gives a
+    // finite, tiny rest).
+    let rest = all + (-(top - all).exp().min(1.0 - 1e-12)).ln_1p();
+    let num = log_sum_exp([log_sum_exp(plus.iter().copied()), rest].into_iter());
+    let den = log_sum_exp([log_sum_exp(minus.iter().copied()), rest].into_iter());
+    (num - den) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clear_sign_change_is_a_confident_llr_and_an_unclear_code_is_not() {
+        let l = 16;
+        let kappa = [2.0 * 8.0 / 4.0];
+        // Correlations: noise-level everywhere but the code, h = 8 at a phase.
+        let h = Iq::from_polar(8.0, 0.7);
+        let row = |code: usize, sign: f32, jitter: f32| -> Vec<Iq> {
+            (0..l)
+                .map(|m| {
+                    if m == code {
+                        h * sign
+                    } else {
+                        Iq::from_polar(0.8, 1.9 * m as f32 + jitter)
+                    }
+                })
+                .collect()
+        };
+        let metric = |y: &[Iq]| -> Vec<f64> {
+            y.iter()
+                .map(|z| ln_i0(kappa[0] * f64::from(z.norm())))
+                .collect()
+        };
+        let (y1, y2, y2n) = (row(3, 1.0, 0.0), row(9, 1.0, 0.4), row(9, -1.0, 0.4));
+        let (m1, m2, m2n) = (metric(&y1), metric(&y2), metric(&y2n));
+        let same = sign_llr(&y1, &y2, &m1, &m2, l, &kappa);
+        let flip = sign_llr(&y1, &y2n, &m1, &m2n, l, &kappa);
+        assert!(same > 3.0 && flip < -3.0, "{same} {flip}");
+        // The same two symbols with the code of the second hidden in noise: no
+        // opinion about the sign.
+        let hidden = row(9, 1.0, 0.4).iter().map(|z| z * 0.1).collect::<Vec<_>>();
+        let mh = metric(&hidden);
+        let unsure = sign_llr(&y1, &hidden, &m1, &mh, l, &kappa);
+        assert!(unsure.abs() < 0.1 * same, "{unsure} against {same}");
+    }
 
     #[test]
     fn ln_i0_matches_the_series_across_the_switch() {

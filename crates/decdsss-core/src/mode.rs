@@ -20,6 +20,11 @@ pub const DS_SPREADS: [u16; 7] = [1, 2, 4, 8, 16, 32, 64];
 /// built and measured and is not offered: DESIGN.md, *CSK16 and CSK8*.)
 pub const CSK_SIZES: [u16; 6] = [8, 16, 32, 64, 128, 256];
 
+/// Alphabet sizes offered for bi-orthogonal CSK: the four that were measured
+/// against CSK (DESIGN.md, *Bi-orthogonal CSK*). 16 and 8 were not, so a
+/// `bcsk16` is not a mode.
+pub const BICSK_SIZES: [u16; 4] = [32, 64, 128, 256];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Family {
     /// Direct sequence: a QPSK symbol held for SF chips, coherent, pilot-aided.
@@ -27,6 +32,19 @@ pub enum Family {
     /// Code-shift keying: one of L orthogonal Walsh codes of L chips, log2(L)
     /// bits a symbol, noncoherent.
     Csk,
+    /// Bi-orthogonal CSK: the same L Walsh codes, and the code's sign (BPSK) as
+    /// one more bit a symbol, log2(L) + 1 in all. The code is found noncoherently
+    /// as in CSK; the sign is the change from the symbol before (differential),
+    /// so no pilots are needed and the first symbol of a block is the sign
+    /// reference.
+    BiCsk,
+}
+
+impl Family {
+    /// Does a symbol pick a Walsh code (CSK and bi-orthogonal CSK)?
+    pub const fn is_walsh(self) -> bool {
+        matches!(self, Family::Csk | Family::BiCsk)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -86,6 +104,7 @@ impl Mode {
         let ladder: &[u16] = match family {
             Family::DsPsk => &DS_SPREADS,
             Family::Csk => &CSK_SIZES,
+            Family::BiCsk => &BICSK_SIZES,
         };
         ladder.contains(&spread).then_some(Mode {
             family,
@@ -100,6 +119,7 @@ impl Mode {
         for (family, ladder) in [
             (Family::DsPsk, &DS_SPREADS[..]),
             (Family::Csk, &CSK_SIZES[..]),
+            (Family::BiCsk, &BICSK_SIZES[..]),
         ] {
             for &spread in ladder {
                 for rate in CodeRate::ALL.into_iter().rev() {
@@ -130,11 +150,14 @@ impl Mode {
     }
 
     /// Coded bits a modulation symbol, averaged over the pilots: QPSK less one
-    /// pilot in `PILOT_INTERVAL` for DS-PSK, log2(L) for CSK.
+    /// pilot in `PILOT_INTERVAL` for DS-PSK, log2(L) for CSK, log2(L) + 1 for
+    /// bi-orthogonal CSK (the block's first symbol has no sign bit to send, a
+    /// share of 1 in a few hundred that this leaves out).
     pub fn coded_bits_per_symbol(self) -> f64 {
         match self.family {
             Family::DsPsk => 2.0 * f64::from(PILOT_INTERVAL - 1) / f64::from(PILOT_INTERVAL),
             Family::Csk => f64::from(self.spread.trailing_zeros()),
+            Family::BiCsk => f64::from(self.spread.trailing_zeros()) + 1.0,
         }
     }
 
@@ -199,6 +222,8 @@ impl Mode {
             (Profile::W2400, Csk, 16, R1_2 | R2_3 | R3_4) => 4.5,
             (Profile::W2400, Csk, 8, R1_2 | R3_4) => 5.0,
             (Profile::W2400, Csk, 8, R2_3) => 5.5,
+            // Bi-orthogonal CSK, measured 2026-10-20 (14 transmissions a point).
+            (Profile::W2400, BiCsk, 32 | 64 | 128 | 256, R1_2) => 3.5,
             (Profile::W2400, Csk, 32, R3_4) => 4.0,
             (Profile::W2400, Csk, 64, R3_4) => 3.5,
             (Profile::W3000, DsPsk, 8, R1_2) => 4.0,
@@ -220,7 +245,7 @@ impl Mode {
         }
     }
 
-    /// Parses `ds4-2/3`, `DS16 1/2`, `csk64-1/2`. The rate defaults to 1/2.
+    /// Parses `ds4-2/3`, `DS16 1/2`, `csk64-1/2`, `bcsk64-1/2`. The rate defaults to 1/2.
     pub fn from_name(s: &str) -> Option<Mode> {
         let s = s.trim().to_ascii_lowercase();
         let (head, rate) = match s.split_once(['-', ' ', '@']) {
@@ -228,9 +253,12 @@ impl Mode {
             None => (s.clone(), CodeRate::R1_2),
         };
         // `?` on an Option returns None from the function when it is None.
-        let (family, digits) = match head.strip_prefix("csk") {
-            Some(d) => (Family::Csk, d),
-            None => (Family::DsPsk, head.strip_prefix("ds")?),
+        let (family, digits) = if let Some(d) = head.strip_prefix("bcsk") {
+            (Family::BiCsk, d)
+        } else if let Some(d) = head.strip_prefix("csk") {
+            (Family::Csk, d)
+        } else {
+            (Family::DsPsk, head.strip_prefix("ds")?)
         };
         Mode::new(family, digits.parse().ok()?, rate)
     }
@@ -240,6 +268,7 @@ impl Mode {
         let f = match self.family {
             Family::DsPsk => "ds",
             Family::Csk => "csk",
+            Family::BiCsk => "bcsk",
         };
         format!("{f}{}-{}", self.spread, self.rate)
     }
@@ -250,6 +279,7 @@ impl fmt::Display for Mode {
         let fam = match self.family {
             Family::DsPsk => "DS",
             Family::Csk => "CSK",
+            Family::BiCsk => "BCSK",
         };
         write!(f, "{fam}{} {}", self.spread, self.rate)
     }
@@ -323,6 +353,35 @@ mod tests {
     }
 
     #[test]
+    fn bi_orthogonal_csk_adds_a_bit_a_symbol_at_the_same_symbol_rate() {
+        // 1920 / L symbols/s × (log2 L + 1) bits × 1/2.
+        for (name, plain, bi) in [
+            ("32", 150.0, 180.0),
+            ("64", 90.0, 105.0),
+            ("128", 52.5, 60.0),
+            ("256", 30.0, 33.75),
+        ] {
+            let p = m(&format!("csk{name}-1/2"));
+            let b = m(&format!("bcsk{name}-1/2"));
+            assert_eq!(p.info_bit_rate(Profile::W2400), plain);
+            assert_eq!(b.info_bit_rate(Profile::W2400), bi, "bcsk{name}");
+            assert_eq!(b.symbol_rate(Profile::W2400), p.symbol_rate(Profile::W2400));
+        }
+        // Same bits a symbol as the next larger plain alphabet, twice its rate.
+        assert_eq!(
+            m("bcsk64-1/2").coded_bits_per_symbol(),
+            m("csk128-1/2").coded_bits_per_symbol()
+        );
+        assert_eq!(
+            m("bcsk64-1/2").info_bit_rate(Profile::W2400),
+            2.0 * m("csk128-1/2").info_bit_rate(Profile::W2400)
+        );
+        assert_eq!(m("bcsk64-2/3").name(), "bcsk64-2/3");
+        assert_eq!(m("BCSK128 3/4").family, Family::BiCsk);
+        assert_eq!(Mode::from_name("bcsk16"), None);
+    }
+
+    #[test]
     fn voice_modes_fit_their_codecs() {
         let v24 = Mode::voice(Profile::W2400).unwrap();
         let v30 = Mode::voice(Profile::W3000).unwrap();
@@ -362,6 +421,8 @@ mod tests {
         assert_eq!(m("csk8-2/3").ebn0_measured_db(Profile::W2400), Some(5.5));
         assert_eq!(m("csk8-1/2").ebn0_measured_db(Profile::W3000), None);
         assert_eq!(m("ds1-3/4").ebn0_measured_db(Profile::W2400), Some(4.0));
+        assert_eq!(m("bcsk64-1/2").ebn0_measured_db(Profile::W2400), Some(3.5));
+        assert_eq!(m("bcsk64-2/3").ebn0_measured_db(Profile::W2400), None);
         assert_eq!(m("ds1-3/4").ebn0_measured_db(Profile::W3000), None);
         assert_eq!(m("ds4-2/3").ebn0_measured_db(Profile::W2400), None);
         assert_eq!(m("ds4-2/3").ebn0_needed_db(Profile::W2400), (4.0, false));

@@ -23,6 +23,39 @@ pub const VERSION: u8 = 0;
 /// build that predates it skips such a header (its version is not 0), which is all
 /// it could do with a type it does not know.
 pub const VERSION_WIDE: u8 = 1;
+/// The version for the modes whose family does not fit the one family bit:
+/// bi-orthogonal CSK. Its family field is 2 bits (0 DS-PSK, 1 CSK, 2 bi-orthogonal
+/// CSK, 3 unused), its type field 4 bits as in version 1, and its session field 4
+/// bits (0 to 15) to pay for them. Every DS-PSK and CSK header is still version 0
+/// or 1, bit for bit as before, and a build that predates version 2 skips such a
+/// header, as it skips any version it does not know.
+pub const VERSION_FAMILY: u8 = 2;
+
+/// The version a header for this mode and payload type is written in: 2 for
+/// bi-orthogonal CSK, otherwise the type's (0, or 1 for a type from code 8 up).
+pub fn header_version(family: Family, ptype: PayloadType) -> u8 {
+    if family == Family::BiCsk {
+        VERSION_FAMILY
+    } else {
+        ptype.header_version()
+    }
+}
+
+/// Bits of the session field in a header of this version: 6, 5 or 4. Each wider
+/// field a later version added was paid for with one bit of the session.
+pub fn session_bits(version: u8) -> usize {
+    6 - usize::from(version)
+}
+
+/// Bits of the payload-type field: 3 in version 0, 4 after.
+fn type_bits(version: u8) -> usize {
+    if version == VERSION { 3 } else { 4 }
+}
+
+/// Bits of the family field: 1 up to version 1, 2 in version 2.
+fn family_bits(version: u8) -> usize {
+    if version == VERSION_FAMILY { 2 } else { 1 }
+}
 
 /// Codeword depths a block can have (codewords interleaved together).
 pub const DEPTHS: [usize; 4] = [1, 2, 4, 8];
@@ -89,19 +122,10 @@ impl PayloadType {
         }
     }
 
-    /// Bits of the header's session field next to this type: 6, or 5 in a wide header.
-    pub fn session_bits(self) -> usize {
-        if self.header_version() == VERSION {
-            6
-        } else {
-            5
-        }
-    }
-
-    /// `session` cut down to what this type's header can hold (a session number
-    /// only tells one transmission from the next, so the low bits do).
-    pub fn fit_session(self, session: u8) -> u8 {
-        session & ((1u8 << self.session_bits()) - 1)
+    /// `session` cut down to what the header for this type and family can hold (a
+    /// session number only tells one transmission from the next, so the low bits do).
+    pub fn fit_session(self, family: Family, session: u8) -> u8 {
+        session & ((1u8 << session_bits(header_version(family, self))) - 1)
     }
 }
 
@@ -152,10 +176,22 @@ impl BitReader<'_> {
     }
 }
 
-fn family_bit(f: Family) -> u64 {
+/// The family's code in the header: one bit up to version 1 (0 DS-PSK, 1 CSK),
+/// two in version 2, where bi-orthogonal CSK is 2 and 3 is unused.
+fn family_code(f: Family) -> u64 {
     match f {
         Family::DsPsk => 0,
         Family::Csk => 1,
+        Family::BiCsk => 2,
+    }
+}
+
+fn family_of(code: u64) -> Option<Family> {
+    match code {
+        0 => Some(Family::DsPsk),
+        1 => Some(Family::Csk),
+        2 => Some(Family::BiCsk),
+        _ => None,
     }
 }
 
@@ -174,11 +210,17 @@ const DS_WIRE: [u16; 7] = [4, 8, 16, 32, 64, 2, 1];
 /// (codes 6 and 7 are still free).
 const CSK_WIRE: [u16; 6] = [32, 64, 128, 256, 16, 8];
 
+/// Bi-orthogonal CSK's alphabet sizes by their 3-bit code, in its own family of
+/// the version-2 header (codes 4 to 7 free). It was first prototyped as CSK's
+/// codes 4 to 7, which CSK16 and CSK8 then took; no build shipped that.
+const BICSK_WIRE: [u16; 4] = [32, 64, 128, 256];
+
 /// The spreading factors or alphabet sizes of a family, in header-code order.
 fn wire_ladder(f: Family) -> &'static [u16] {
     match f {
         Family::DsPsk => &DS_WIRE,
         Family::Csk => &CSK_WIRE,
+        Family::BiCsk => &BICSK_WIRE,
     }
 }
 
@@ -190,30 +232,35 @@ fn spread_index(m: Mode) -> u64 {
 }
 
 impl Header {
+    /// The version this header is written in (see [`header_version`]).
+    pub fn version(&self) -> u8 {
+        header_version(self.mode.family, self.ptype)
+    }
+
     /// The 128 information bits of the header codeword: 112 fields then
     /// CRC-16 over them. `None` if the callsign cannot be packed or a field
     /// is out of range.
     pub fn pack(&self) -> Option<Vec<u8>> {
         let depth_idx = DEPTHS.iter().position(|&d| d == self.depth)?;
-        let session_bits = self.ptype.session_bits();
+        let version = self.version();
+        let session_bits = session_bits(version);
         if u32::from(self.session) >= 1 << session_bits
             || self.nblocks >= 1 << 12
             || self.total_frames >= 1 << 15
         {
             return None;
         }
-        let version = self.ptype.header_version();
         let mut w = BitWriter(Vec::with_capacity(128));
         w.put(u64::from(version), 2);
         w.put(profile_index(self.profile), 2);
-        w.put(family_bit(self.mode.family), 1);
+        w.put(family_code(self.mode.family), family_bits(version));
         w.put(spread_index(self.mode), 3);
         w.put(
             CodeRate::ALL.iter().position(|&r| r == self.mode.rate)? as u64,
             2,
         );
         w.put(depth_idx as u64, 2);
-        w.put(self.ptype as u64, 3 + usize::from(version));
+        w.put(self.ptype as u64, type_bits(version));
         w.put(pack_call(&self.call)?, CALL_BITS as usize);
         w.put(u64::from(self.session), session_bits);
         w.put(u64::from(self.frame0), 16);
@@ -234,27 +281,24 @@ impl Header {
         let crc = crc16(&bytes_of(&bits[..HEADER_INFO_BITS]));
         let mut r = BitReader { bits, pos: 0 };
         let version = r.get(2) as u8;
-        if version != VERSION && version != VERSION_WIDE {
+        if version > VERSION_FAMILY {
             return None;
         }
         let profile = *Profile::ALL.get(r.get(2) as usize)?;
-        let family = if r.get(1) == 0 {
-            Family::DsPsk
-        } else {
-            Family::Csk
-        };
+        let family = family_of(r.get(family_bits(version)))?;
         let spread = *wire_ladder(family).get(r.get(3) as usize)?;
         let rate = *CodeRate::ALL.get(r.get(2) as usize)?;
         let mode = Mode::new(family, spread, rate)?;
         let depth = *DEPTHS.get(r.get(2) as usize)?;
-        let ptype = PayloadType::from_u8(r.get(3 + usize::from(version)) as u8)?;
-        // One spelling per type: a wide header for a type that fits in 3 bits (or the
-        // other way round) is not something this build writes.
-        if ptype.header_version() != version {
+        let ptype = PayloadType::from_u8(r.get(type_bits(version)) as u8)?;
+        // One spelling per header: a mode and type sent in a version this build would
+        // not write them in (a wide header for a type that fits in 3 bits, a CSK mode
+        // in the version-2 header) is not read.
+        if header_version(family, ptype) != version {
             return None;
         }
         let call = unpack_call(r.get(CALL_BITS as usize))?;
-        let session = r.get(ptype.session_bits()) as u8;
+        let session = r.get(session_bits(version)) as u8;
         let frame0 = r.get(16) as u16;
         let nblocks = r.get(12) as u16;
         let total_frames = r.get(15) as u16;
@@ -310,21 +354,25 @@ impl Layout {
         self.code().k() / 8 - 4
     }
 
-    /// Coded bits one data symbol carries: 2 for DS-PSK (QPSK), log2 L for CSK.
+    /// Coded bits one data symbol carries: 2 for DS-PSK (QPSK), log2 L for CSK,
+    /// log2 L + 1 for bi-orthogonal CSK (the code's number, then its sign).
     pub fn bits_per_data_symbol(&self) -> usize {
         match self.mode.family {
             Family::DsPsk => 2,
             Family::Csk => self.mode.spread.trailing_zeros() as usize,
+            Family::BiCsk => self.mode.spread.trailing_zeros() as usize + 1,
         }
     }
 
     /// Data symbols in a block, padded up so that DS-PSK fills whole pilot
-    /// groups.
+    /// groups. A bi-orthogonal CSK block's first symbol is the sign reference and
+    /// has no sign bit, so the block holds one bit fewer than whole symbols.
     pub fn data_symbols(&self) -> usize {
         let per_group = (PILOT_INTERVAL as usize - 1) * self.bits_per_data_symbol();
         match self.mode.family {
             Family::DsPsk => self.coded_bits().div_ceil(per_group) * (PILOT_INTERVAL as usize - 1),
             Family::Csk => self.coded_bits().div_ceil(self.bits_per_data_symbol()),
+            Family::BiCsk => (self.coded_bits() + 1).div_ceil(self.bits_per_data_symbol()),
         }
     }
 
@@ -336,7 +384,7 @@ impl Layout {
                 let groups = self.data_symbols() / (PILOT_INTERVAL as usize - 1);
                 groups * PILOT_INTERVAL as usize + 1
             }
-            Family::Csk => self.data_symbols(),
+            Family::Csk | Family::BiCsk => self.data_symbols(),
         }
     }
 
@@ -439,7 +487,7 @@ mod tests {
     #[test]
     fn every_payload_type_round_trips_in_the_header_that_carries_it() {
         for ptype in PayloadType::ALL {
-            let top = (1u8 << ptype.session_bits()) - 1;
+            let top = (1u8 << session_bits(header_version(header().mode.family, ptype))) - 1;
             for session in [0, 1, top] {
                 let h = Header {
                     ptype,
@@ -521,6 +569,103 @@ mod tests {
         assert_eq!(csk.chips(), 288 * 256);
         // 288 symbols at 7.5/s.
         assert!((csk.seconds() - 38.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bi_orthogonal_block_geometry() {
+        // 7 bits a symbol at L = 64: 4 × 1152 coded bits and one reference symbol's
+        // missing sign bit = 4609 bits, 659 symbols (658.4 up).
+        let bi = Layout::new(Profile::W2400, Mode::from_name("bcsk64-1/2").unwrap(), 4);
+        assert_eq!(bi.bits_per_data_symbol(), 7);
+        assert_eq!(bi.symbols(), 659);
+        assert_eq!(bi.chips(), 659 * 64);
+        // Never fewer bits than the codewords need, never a whole symbol too many.
+        for name in ["bcsk32-1/2", "bcsk64-2/3", "bcsk128-3/4", "bcsk256-1/2"] {
+            for depth in DEPTHS {
+                let l = Layout::new(Profile::W2400, Mode::from_name(name).unwrap(), depth);
+                let room = l.symbols() * l.bits_per_data_symbol() - 1;
+                assert!(
+                    room >= l.coded_bits() && room < l.coded_bits() + l.bits_per_data_symbol(),
+                    "{name} depth {depth}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bi_orthogonal_modes_go_in_the_version_2_header() {
+        // Bits 0-1 the version, 2-3 the profile, then the family (1 bit, or 2 in
+        // version 2) and the 3-bit spread code.
+        let field = |bits: &[u8], from: usize, n: usize| {
+            bits[from..from + n].iter().fold(0u8, |v, &b| v * 2 + b)
+        };
+        let bits_of = |name: &str| {
+            Header {
+                mode: Mode::from_name(name).unwrap(),
+                ..header()
+            }
+            .pack()
+            .unwrap()
+        };
+        // DS-PSK and CSK as they always were: version 0, one family bit.
+        let csk = bits_of("csk256-1/2");
+        assert_eq!(
+            (field(&csk, 0, 2), field(&csk, 4, 1), field(&csk, 5, 3)),
+            (0, 1, 3)
+        );
+        let csk8 = bits_of("csk8-1/2");
+        assert_eq!(
+            (field(&csk8, 0, 2), field(&csk8, 4, 1), field(&csk8, 5, 3)),
+            (0, 1, 5)
+        );
+        let ds = bits_of("ds4-1/2");
+        assert_eq!(
+            (field(&ds, 0, 2), field(&ds, 4, 1), field(&ds, 5, 3)),
+            (0, 0, 0)
+        );
+        // Bi-orthogonal CSK: version 2, family code 2 in two bits, its own ladder.
+        let b32 = bits_of("bcsk32-1/2");
+        assert_eq!(
+            (field(&b32, 0, 2), field(&b32, 4, 2), field(&b32, 6, 3)),
+            (2, 2, 0)
+        );
+        let b256 = bits_of("bcsk256-1/2");
+        assert_eq!(
+            (field(&b256, 0, 2), field(&b256, 4, 2), field(&b256, 6, 3)),
+            (2, 2, 3)
+        );
+        // Whatever the payload type, with 4 session bits (0 to 15).
+        for ptype in PayloadType::ALL {
+            let h = Header {
+                mode: Mode::from_name("bcsk64-2/3").unwrap(),
+                ptype,
+                session: 15,
+                ..header()
+            };
+            assert_eq!(h.version(), VERSION_FAMILY, "{ptype:?}");
+            assert_eq!(
+                Header::unpack(&h.pack().unwrap()),
+                Some(h.clone()),
+                "{ptype:?}"
+            );
+            assert_eq!(Header { session: 16, ..h }.pack(), None, "{ptype:?}");
+            assert_eq!(ptype.fit_session(Family::BiCsk, 0b0011_0101), 0b0101);
+            assert_eq!(
+                ptype.fit_session(Family::Csk, 0b0011_0101),
+                0b0011_0101 & ((1 << session_bits(ptype.header_version())) - 1)
+            );
+        }
+        // A CSK mode written in the version-2 header is a spelling this build does not
+        // make, so it is not read either: flip the version of a CSK header to 2 and
+        // re-sign it.
+        let mut forged = csk.clone();
+        forged[0] = 1;
+        forged[1] = 0;
+        let crc = crc16(&bytes_of(&forged[..HEADER_INFO_BITS]));
+        for (i, b) in forged[HEADER_INFO_BITS..].iter_mut().enumerate() {
+            *b = ((crc >> (15 - i)) & 1) as u8;
+        }
+        assert_eq!(Header::unpack(&forged), None);
     }
 
     #[test]

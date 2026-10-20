@@ -115,7 +115,7 @@ impl LiveTxSession {
             depth: cfg.depth,
             ptype,
             call: cfg.call.clone(),
-            session: ptype.fit_session(cfg.session),
+            session: ptype.fit_session(cfg.mode.family, cfg.session),
             frame0: 0,
             nblocks: 4095,
             total_frames: 0,

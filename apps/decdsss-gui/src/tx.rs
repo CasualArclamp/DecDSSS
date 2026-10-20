@@ -39,7 +39,7 @@ const VOX_TONE_S: f64 = 0.4;
 const VOX_GAP_S: f64 = 0.3;
 
 /// The families the Spreading buttons offer, and what each is.
-const FAMILIES: [(Family, &str, &str); 2] = [
+const FAMILIES: [(Family, &str, &str); 3] = [
     (
         Family::DsPsk,
         "DS-PSK",
@@ -50,6 +50,11 @@ const FAMILIES: [(Family, &str, &str); 2] = [
         "CSK",
         "Code-shift keying: one of L Walsh codes of L chips, log2(L) bits a symbol, \
          noncoherent",
+    ),
+    (
+        Family::BiCsk,
+        "BCSK",
+        "Bi-orthogonal CSK: CSK plus the code's sign as one more bit a symbol, read against the symbol before; 12 to 20 % more rate for the same signal",
     ),
 ];
 

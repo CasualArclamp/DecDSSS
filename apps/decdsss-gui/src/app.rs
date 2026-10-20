@@ -1510,9 +1510,9 @@ impl Plot {
     /// The tab's name.
     fn label(self, family: Family) -> &'static str {
         match (self, family) {
-            (Plot::Symbols, Family::Csk) => "Walsh",
+            (Plot::Symbols, Family::Csk | Family::BiCsk) => "Walsh",
             (Plot::Symbols, Family::DsPsk) => "Const",
-            (Plot::Detail, Family::Csk) => "Bars",
+            (Plot::Detail, Family::Csk | Family::BiCsk) => "Bars",
             (Plot::Detail, Family::DsPsk) => "Sym×prev",
             (Plot::Timing, _) => "Timing",
             (Plot::Delay, _) => "Delay",

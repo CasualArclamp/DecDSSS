@@ -175,6 +175,28 @@ pub fn block_walsh(layout: &Layout, bits: &[u8]) -> Vec<usize> {
         .collect()
 }
 
+/// A bi-orthogonal CSK block's symbols as (Walsh code number, sign of the code,
+/// +1 or -1). Each symbol takes log2 L bits for the code number, most significant
+/// first, then one bit for the sign: 0 leaves the sign as the symbol before had it,
+/// 1 turns it over (differential, so the receiver needs no phase reference but the
+/// symbol before). The first symbol takes no sign bit and is sent positive: it is
+/// the reference the second is judged against.
+pub fn block_codes(layout: &Layout, bits: &[u8]) -> Vec<(usize, f32)> {
+    assert_eq!(layout.mode.family, Family::BiCsk);
+    let m = layout.mode.spread.trailing_zeros() as usize;
+    let mut it = bits.iter().copied().chain(std::iter::repeat(0));
+    let mut sign = 1.0f32;
+    (0..layout.symbols())
+        .map(|n| {
+            let code = (0..m).fold(0usize, |a, _| (a << 1) | usize::from(it.next().unwrap()));
+            if n > 0 && it.next().unwrap() == 1 {
+                sign = -sign;
+            }
+            (code, sign)
+        })
+        .collect()
+}
+
 /// Chips of a block starting at scrambler chip `chip0`.
 pub fn block_chips(layout: &Layout, frames: &[Vec<u8>], scr: &Scrambler, chip0: usize) -> Vec<Iq> {
     let bits = block_bits(layout, frames);
@@ -192,6 +214,13 @@ pub fn block_chips(layout: &Layout, frames: &[Vec<u8>], scr: &Scrambler, chip0: 
             for (n, m) in block_walsh(layout, &bits).into_iter().enumerate() {
                 for i in 0..l {
                     chips.push(scr.chip(chip0 + n * l + i) * walsh_chip(m, i));
+                }
+            }
+        }
+        Family::BiCsk => {
+            for (n, (m, sign)) in block_codes(layout, &bits).into_iter().enumerate() {
+                for i in 0..l {
+                    chips.push(scr.chip(chip0 + n * l + i) * (sign * walsh_chip(m, i)));
                 }
             }
         }
@@ -491,7 +520,14 @@ mod tests {
 
     #[test]
     fn segment_length_follows_the_layout() {
-        for mode in ["ds4-1/2", "ds64-3/4", "csk32-2/3", "csk256-1/2"] {
+        for mode in [
+            "ds4-1/2",
+            "ds64-3/4",
+            "csk32-2/3",
+            "csk256-1/2",
+            "bcsk32-2/3",
+            "bcsk256-1/2",
+        ] {
             let s = seg(mode, 2, 3);
             let layout = Layout::new(s.header.profile, s.header.mode, 2);
             let chips = segment_chips(&s).unwrap();
@@ -525,6 +561,42 @@ mod tests {
         let chips = segment_chips(&seg("csk64-1/2", 1, 2)).unwrap();
         let p = chips.iter().map(|c| c.norm_sqr()).sum::<f32>() / chips.len() as f32;
         assert!((p - 1.0).abs() < 1e-3, "{p}");
+    }
+
+    #[test]
+    fn bi_orthogonal_signs_are_changes_after_a_positive_reference() {
+        let layout = Layout::new(Profile::W2400, Mode::from_name("bcsk32-1/2").unwrap(), 1);
+        // 5 code bits then the sign bit, per symbol: all-ones code with "turn over",
+        // then code 0 with "keep", and so on.
+        let mut bits = Vec::new();
+        bits.extend([1, 1, 1, 1, 1]); // symbol 0: code 31, no sign bit (the reference)
+        bits.extend([0, 0, 0, 0, 1, 1]); // symbol 1: code 1, turned over
+        bits.extend([0, 0, 0, 1, 0, 0]); // symbol 2: code 2, kept
+        bits.extend([0, 0, 0, 1, 1, 1]); // symbol 3: code 3, turned over again
+        let codes = block_codes(&layout, &bits);
+        assert_eq!(&codes[..4], &[(31, 1.0), (1, -1.0), (2, -1.0), (3, 1.0)]);
+        // The padding after the last bit is zeros: code 0, kept.
+        assert_eq!(codes[4], (0, 1.0));
+        assert_eq!(codes.len(), layout.symbols());
+        // And the chips carry it: despreading the second symbol by its code gives -L.
+        let scr = Scrambler::new(own_code("VK2ABC").unwrap());
+        let chips = block_chips(&layout, &[vec![0u8; layout.frame_bytes()]], &scr, 0);
+        let (codes, l) = (
+            block_codes(
+                &layout,
+                &block_bits(&layout, &[vec![0u8; layout.frame_bytes()]]),
+            ),
+            32usize,
+        );
+        for (n, &(m, sign)) in codes.iter().enumerate().take(8) {
+            let y: Iq = (0..l)
+                .map(|i| chips[n * l + i] * scr.chip(n * l + i).conj() * walsh_chip(m, i))
+                .sum();
+            assert!(
+                (y.re - sign * l as f32).abs() < 1e-3 && y.im.abs() < 1e-3,
+                "symbol {n}"
+            );
+        }
     }
 
     #[test]

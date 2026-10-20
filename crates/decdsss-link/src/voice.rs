@@ -178,7 +178,7 @@ pub fn plan_voice(spec: &VoiceSpec, speech: &[i16]) -> Result<VoicePlan, String>
         depth: spec.depth,
         ptype,
         call: &spec.call,
-        session: ptype.fit_session(spec.session),
+        session: ptype.fit_session(spec.mode.family, spec.session),
         resync_s: spec.resync_s,
     };
     let segments = cut_segments(&frames_hdr, &frames);
