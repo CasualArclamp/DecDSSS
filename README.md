@@ -50,6 +50,9 @@ side by side. Two ways of spreading, as a ladder of modes (`decdsss modes`):
 - **CSK**: one of L orthogonal Walsh codes (8 … 256) per symbol, noncoherent,
   rake-combined on power: the robust end, and at CSK16 and CSK8 a fast end with a
   lower frame-loss floor on fading than DS4 at the same rate.
+- **Bi-orthogonal CSK** (BCSK32 … 256): CSK with the code's sign as one more bit a
+  symbol, read against the symbol before, so still no pilots: 12 to 20 % more
+  rate for the same signal.
 
 LDPC (rate ½, ⅔ or ¾, 1152-bit codewords, designed in this repository) and a
 time interleaver sit under both. The 500 Hz profile has three slots, 500 Hz apart
