@@ -489,8 +489,11 @@ impl PreambleTracker {
     /// Why not a per-period ratio, as before (`z = (p_B − p_A)/(p_B + p_A)`, the
     /// mean over the B pair less the mean over three A before it, over 0.7): the
     /// ratio of a period lost in a fade is noise, uniform on ±1, so two faded A
-    /// periods after strong ones passed for the B pair about 70 % of the time
-    /// (derived); that ended the preamble a whole number of periods early on the
+    /// periods after strong ones passed for the B pair three times in four
+    /// (derived: p_B/(p_A + p_B) of two equal exponentials is uniform, so z is
+    /// uniform on ±1; with z ≈ −1 on the A periods the pair's mean z need only
+    /// exceed −0.3, and the sum of two uniforms on ±1 exceeds −0.6 with
+    /// probability 1 − 1.4²/8 = 0.755); that ended the preamble a whole number of periods early on the
     /// 500 Hz profile, whose fading is flat (no second path to fill a fade in).
     /// Here a faded period adds about nothing to any candidate, and a wrong one
     /// is short of what the A or B periods it mislabels would have given.

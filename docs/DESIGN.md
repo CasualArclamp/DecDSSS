@@ -328,11 +328,21 @@ of ±100 and ±300 ppm change nothing at 4 dB.
    alarm dies on its own and cannot block a real preamble. Each period of the
    preamble is correlated coherently with A and B at early, prompt and late
    timing; a loop follows the boundary, periods with no signal in them are
-   ignored (the search window starts early), the pattern A…A B B is found from a
-   per-period score that needs no noise estimate, and a line through the period
-   boundaries gives the clock and the header start.
+   ignored (the search window starts early), and the end of the preamble is the
+   period that best fits the whole pattern, twelve A then two B, weighed by each
+   period's correlation power over the noise (a generalized likelihood with each
+   period's fading gain unknown), so a period lost in a fade counts for nothing
+   rather than for a random answer. The B pair must show (2 nats of its own
+   evidence, B over A), the fit must beat the period before and the two after;
+   if no B pair ever stands out, the best-fitting period is taken anyway when the
+   pattern fits by 20 nats or more. A line through the period boundaries gives the
+   clock and the header start. (See *The 500 Hz header on fading* under
+   Verification for why, and the per-period ratio test it replaced.)
 3. **Header** — CSK symbols on the call code (alphabets above), the rake fingers from the
    preamble's delay profile, a log-Bessel noncoherent metric, de-interleave, LDPC.
+   If no alphabet decodes where the preamble put the header, each is tried again a
+   preamble period earlier, then a period later (`header::HEADER_SHIFTS`): a faded B
+   pair leaves the preamble's end a period out more often than any other way.
    Once decoded, its chips are known exactly, and they are used to refine timing,
    clock and carrier (a quarter second at a time over a fine lag grid, following
    the timing from segment to segment) and to place the fingers from the profile
@@ -1903,10 +1913,10 @@ not need the help there, its pilots come 30 a second.)
   says it cannot (above). DSC64 delivers, and from 15 dB every transmission whose
   header decoded was delivered whole (17 of 32 headers and 60 of 128 frames at 15 dB;
   19 and 76 at 18): what is left is the header. DSC32 the same from 15 dB (28 and 112,
-  27 and 108). The long CSK256 header's symbols are 0.64 s on `500`, longer than a
-  0.5 Hz channel holds still, and it decodes in 15 to 24 of 32 transmissions here
-  whichever the payload family. That is the next thing to fix on `500`, not the
-  payload.
+  27 and 108). The header decoded in 15 to 24 of 32 transmissions here whichever
+  the payload family. That was the next thing to fix on `500`, and it turned out to
+  be the preamble's end, not the header's alphabet: *The 500 Hz header on fading*
+  below has the cause, the fix and these sweeps again.
 - **Chunks.** The pilot chunks were 64 chips at first. On a genie start (AWGN,
   `2k4`, depth 2, two blocks, 24 transmissions, `debug_cdm_floor`), DSC64 ½ at 4.5 dB
   lost 22 of 96 frames with them, none with the carrier loop frozen
@@ -1989,10 +1999,9 @@ lost all eight frames after the fade).
 ### Not yet measured
 
 The 3 kHz profile for `dsc`, `dsc` at rates ⅔ and ¾, and the reacquisition on fading
-channels (only silence, slips and carrier steps on AWGN were measured); the 500 Hz
-header on fading (the long CSK256 header decodes in about half to three quarters of
-moderate-fading transmissions on `500`, see *A code-multiplexed pilot*);
-the 3 kHz and 500 Hz profiles on fading (DS2, DS1, CSK16, CSK8 and bi-orthogonal
+channels (only silence, slips and carrier steps on AWGN were measured); the new end
+of the preamble on poor and flutter fading and on the 3 kHz profile (only AWGN and
+the moderate channel were measured, *The 500 Hz header on fading*); the 3 kHz and 500 Hz profiles on fading (DS2, DS1, CSK16, CSK8 and bi-orthogonal
 CSK included); bi-orthogonal CSK at rates ⅔ and ¾; flutter fading beyond the
 points above; the voice modes on fading beyond the Codec2 1200 and 1600 points
 under *Faster voice*; the effect of in-band interference; two stations at once
