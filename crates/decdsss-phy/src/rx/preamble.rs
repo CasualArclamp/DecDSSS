@@ -9,6 +9,16 @@
 //! A…A B B is found from `z = (|c_B|² − |c_A|²) / (|c_B|² + |c_A|²)` per
 //! period, which needs no noise estimate. The header starts where the last B
 //! period ends.
+//!
+//! **Slips.** A live stream through a browser and a virtual cable drops or
+//! repeats whole blocks of audio, which moves everything after by that much:
+//! the loop, a quarter chip a period at most, cannot follow. When a strong
+//! preamble drops out, the next period is searched over ±[`SLIP_S`] for the
+//! sequences; a lag that holds at least half the strongest period's power, with
+//! the old lag empty after it and the new lag empty in the period before (a
+//! fade of one path onto another fails this), is a slip. The track moves by it,
+//! the period it happened in is left out of the clock line and the delay
+//! profile, and the line is fitted to the boundaries with the slips taken off.
 
 use super::frontend::{Buf, SPS};
 use crate::codes::{PRE_A_PERIODS, PRE_B_PERIODS, preamble_a, preamble_b, preamble_len};
@@ -24,6 +34,19 @@ const LOOKBACK_A: usize = 3;
 const STRONG: f64 = 0.3;
 /// Pattern score needed to declare the end of the preamble.
 const SCORE_THRESHOLD: f64 = 0.7;
+/// How far the slip search looks either way, seconds (the payload's rewind
+/// searches ±60 ms too).
+pub const SLIP_S: f64 = 0.06;
+/// A slip must move the signal at least this many samples (half a chip);
+/// anything smaller the loop follows.
+const SLIP_MIN: f64 = 2.0;
+
+/// Measurement switch (environment `DECDSSS_NO_PREAMBLE_SLIP`): no slip
+/// search in the preamble. Read once.
+fn no_preamble_slip() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("DECDSSS_NO_PREAMBLE_SLIP").is_some())
+}
 
 /// Power against delay: `power[i]` at lag `LAG0 + i·LAG_STEP` chips from the
 /// main path.
@@ -142,6 +165,15 @@ pub struct PreambleTracker {
     dom: Vec<f64>,
     pmax: f64,
     fresh: bool,
+    /// Per period: the slips before its boundary, summed, and whether a slip
+    /// fell inside it (then it is in neither the line nor the profile, nor a
+    /// carrier step).
+    shift: Vec<f64>,
+    split: Vec<bool>,
+    /// All the slips so far, samples.
+    total_shift: f64,
+    /// Slips followed.
+    pub slips: usize,
 }
 
 impl PreambleTracker {
@@ -171,12 +203,65 @@ impl PreambleTracker {
             dom: Vec::new(),
             pmax: 0.0,
             fresh: true,
+            shift: Vec::new(),
+            split: Vec::new(),
+            total_shift: 0.0,
+            slips: 0,
         }
     }
 
-    /// Earliest sample the tracker still needs.
+    /// Earliest sample the tracker still needs (the slip search looks a little
+    /// before the oldest period).
     pub fn oldest_needed(&self) -> i64 {
-        (self.bounds.first().copied().unwrap_or(self.pos) - 16.0) as i64
+        (self.bounds.first().copied().unwrap_or(self.pos) - 16.0 - SLIP_S * self.rate) as i64
+    }
+
+    /// The larger of the A and B prompt powers of the period at `pos`.
+    fn power_at(&self, buf: &Buf, pos: f64, chip: f64) -> f64 {
+        let (a, b) = (preamble_a(self.profile), preamble_b(self.profile));
+        let pa = self.correlate(buf, a, pos, chip).norm_sqr();
+        let pb = self.correlate(buf, b, pos, chip).norm_sqr();
+        f64::from(pa.max(pb))
+    }
+
+    /// After a period came up weak: did the signal slip? Searches the period
+    /// at `next` (the weak one or the one after it) over ±[`SLIP_S`] and returns
+    /// the move, in samples.
+    fn find_slip(&self, buf: &Buf, next: f64, chip: f64) -> Option<f64> {
+        let prev = *self.bounds.last()?;
+        let reach = (SLIP_S * self.rate).round() as i64;
+        let p: Vec<f64> = (-reach..=reach)
+            .map(|d| self.power_at(buf, next + d as f64, chip))
+            .collect();
+        let at = |d: i64| p[(d + reach) as usize];
+        let (best, pk) = (-reach..=reach)
+            .filter(|d| (*d as f64).abs() >= SLIP_MIN)
+            .map(|d| (d, at(d)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        // Strong enough to be the preamble, and gone from where it was.
+        let old = (-1..=1).map(at).fold(0.0, f64::max);
+        if pk < 0.5 * self.pmax || old > 0.25 * pk {
+            return None;
+        }
+        // Not a path that was there all along.
+        let before = self.power_at(buf, prev + best as f64, chip);
+        let before0 = self.power_at(buf, prev, chip);
+        if before > 0.25 * before0 {
+            return None;
+        }
+        // Quadratic through the peak: better than a sample.
+        let frac = if best > -reach && best < reach {
+            let (a, c) = (at(best - 1), at(best + 1));
+            let den = a - 2.0 * pk + c;
+            if den.abs() > 1e-30 {
+                (0.5 * (a - c) / den).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        Some(best as f64 + frac)
     }
 
     fn correlate(&self, buf: &Buf, seq: &[f32], pos: f64, step: f64) -> Iq {
@@ -205,8 +290,42 @@ impl PreambleTracker {
             }
             let chip = self.period / self.p as f64;
             let t = self.pos;
-            let ca = [-1.0, 0.0, 1.0].map(|d| self.correlate(buf, a, t + d, chip));
-            let cb = [-1.0, 0.0, 1.0].map(|d| self.correlate(buf, b, t + d, chip));
+            let mut ca = [-1.0, 0.0, 1.0].map(|d| self.correlate(buf, a, t + d, chip));
+            let mut cb = [-1.0, 0.0, 1.0].map(|d| self.correlate(buf, b, t + d, chip));
+            // A strong preamble that drops out: a fade, or a slip of the audio.
+            // The search needs the next period and its reach in.
+            // `slip`: the signal moved inside this period; `whole`: it had moved
+            // by this period's start, so all of it is at the new lag.
+            let mut slip = None;
+            let weak = f64::from(ca[1].norm_sqr().max(cb[1].norm_sqr())) < STRONG * self.pmax;
+            if weak && !self.fresh && !self.bounds.is_empty() && !no_preamble_slip() {
+                let reach = SLIP_S * self.rate;
+                if t + 2.0 * self.period + reach + 8.0 > buf.end() as f64 {
+                    return State::Working;
+                }
+                let whole = self.find_slip(buf, t, chip);
+                if whole.is_none() {
+                    slip = self.find_slip(buf, t + self.period, chip);
+                }
+                if let Some(d) = whole.or(slip) {
+                    // Judge the period at whichever lag holds more of it.
+                    let na = [-1.0, 0.0, 1.0].map(|e| self.correlate(buf, a, t + d + e, chip));
+                    let nb = [-1.0, 0.0, 1.0].map(|e| self.correlate(buf, b, t + d + e, chip));
+                    if na[1].norm_sqr().max(nb[1].norm_sqr())
+                        > ca[1].norm_sqr().max(cb[1].norm_sqr())
+                    {
+                        (ca, cb) = (na, nb);
+                    }
+                }
+                if let Some(d) = whole {
+                    // The period is whole at its new place: an ordinary period
+                    // from there.
+                    self.pos += d;
+                    self.total_shift += d;
+                    self.slips += 1;
+                }
+            }
+
             let (pa, pb) = (ca[1].norm_sqr(), cb[1].norm_sqr());
             let a_dom = pa >= pb;
             let c = if a_dom { ca } else { cb };
@@ -216,7 +335,11 @@ impl PreambleTracker {
             // is about 1.33 times the error in chips.
             let (e, l) = (c[0].norm(), c[2].norm());
             let d = if e + l > 0.0 { (l - e) / (e + l) } else { 0.0 };
-            let err = f64::from(d) * SPS as f64 / 1.33;
+            let err = if slip.is_some() {
+                0.0
+            } else {
+                f64::from(d) * SPS as f64 / 1.33
+            };
             // Periods before the preamble began (the search window starts a
             // little early) hold only noise: leave the loop alone for them.
             let dom = f64::from(pa.max(pb));
@@ -231,6 +354,16 @@ impl PreambleTracker {
                 self.fresh = false;
             }
             self.bounds.push(self.pos);
+            self.shift.push(self.total_shift);
+            self.split.push(slip.is_some());
+            // Rust note: `if let` runs its block only when the Option holds a
+            // value, bound to `d`.
+            if let Some(d) = slip {
+                // This boundary is before the slip, the next one after it.
+                self.pos += d;
+                self.total_shift += d;
+                self.slips += 1;
+            }
             self.errs.push(err);
             self.prompt.push((c[1], a_dom));
             self.powers.push((pa, pb));
@@ -241,6 +374,7 @@ impl PreambleTracker {
             // learns the clock error as a change of the period length.
             self.period += ki * err;
             self.pos += self.period + kp * err;
+
             self.count += 1;
 
             // Pattern: B at m−1, m; A at m−2 … m−1−LOOKBACK_A.
@@ -274,10 +408,18 @@ impl PreambleTracker {
         // measured boundary (tracked boundary plus the loop's error estimate):
         // steadier than the loop's own running estimate.
         let pmax = self.dom[..=k].iter().copied().fold(0.0, f64::max);
-        let used: Vec<usize> = (0..=k).filter(|&m| self.dom[m] >= STRONG * pmax).collect();
+        let good = |m: usize| self.dom[m] >= STRONG * pmax && !self.split[m];
+        let used: Vec<usize> = (0..=k).filter(|&m| good(m)).collect();
+        // The boundaries with the slips before them taken off lie on one line.
         let pts: Vec<(f64, f64, f64)> = used
             .iter()
-            .map(|&m| (m as f64, self.bounds[m] + self.errs[m], self.dom[m]))
+            .map(|&m| {
+                (
+                    m as f64,
+                    self.bounds[m] + self.errs[m] - self.shift[m],
+                    self.dom[m],
+                )
+            })
             .collect();
         let wsum: f64 = pts.iter().map(|p| p.2).sum();
         let mbar = pts.iter().map(|p| p.2 * p.0).sum::<f64>() / wsum;
@@ -296,13 +438,16 @@ impl PreambleTracker {
             self.period
         };
         let chip = period / self.p as f64;
-        let header_start = bbar + period * (k as f64 + 1.0 - mbar);
+        // The header comes after every slip so far.
+        let header_start = bbar + period * (k as f64 + 1.0 - mbar) + self.total_shift;
         // Carrier: the phase step between consecutive same-template periods.
         let mut s = Iq::new(0.0, 0.0);
         for m in 1..=k {
             let (c1, d1) = self.prompt[m - 1];
             let (c2, d2) = self.prompt[m];
-            if d1 == d2 {
+            // A slip between them turns the carrier phase too.
+            let slipped = self.split[m - 1] || self.split[m];
+            if d1 == d2 && !slipped {
                 s += c2 * c1.conj();
             }
         }
@@ -312,7 +457,7 @@ impl PreambleTracker {
         let a = preamble_a(self.profile);
         let mut power = vec![0.0f32; DelayProfile::LAGS];
         let first_b = k + 1 - PRE_B_PERIODS;
-        for m in (0..first_b).filter(|&m| self.dom[m] >= STRONG * pmax) {
+        for m in (0..first_b).filter(|&m| good(m)) {
             for (i, pw) in power.iter_mut().enumerate() {
                 let lag = DelayProfile::lag(i) * chip;
                 *pw += self

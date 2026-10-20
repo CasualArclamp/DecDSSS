@@ -1,0 +1,12 @@
+# made by CasualArclamp
+[package]
+name = "decdsss-kiwi"
+description = "A KiwiSDR as a DecDSSS audio source: its demodulated audio straight off the network, no browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

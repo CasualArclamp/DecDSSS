@@ -24,6 +24,7 @@ decdsss-audio = { path = "../../crates/decdsss-audio" }
 decdsss-codec2 = { path = "../../crates/decdsss-codec2" }
 decdsss-core = { path = "../../crates/decdsss-core" }
 decdsss-chan = { path = "../../crates/decdsss-chan" }
+decdsss-kiwi = { path = "../../crates/decdsss-kiwi" }
 decdsss-image = { path = "../../crates/decdsss-image" }
 decdsss-link = { path = "../../crates/decdsss-link" }
 decdsss-phy = { path = "../../crates/decdsss-phy" }

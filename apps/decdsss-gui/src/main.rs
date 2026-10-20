@@ -28,7 +28,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: decdsss-gui [--demo | --wav FILE] [--speed X] [--profile 500,2k4,3k] \
-[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--tx-text MSG|cq] [--tx-band 500@+500] [--tx-wfid] [--record-for SECS [--mic NAME]] [--view rx|tx|both] [--monitor OUTPUT] [--open-cat] [--fake-rig] | --write-demo OUT.wav";
+[--device NAME | --kiwi HOST[:PORT] --kiwi-freq KHZ] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--tx-text MSG|cq] [--tx-band 500@+500] [--tx-wfid] [--record-for SECS [--mic NAME]] [--view rx|tx|both] [--monitor OUTPUT] [--open-cat] [--fake-rig] | --write-demo OUT.wav";
 
 /// Attaches to the console of the process that started this one (a terminal), if
 /// there is one; harmless when output is redirected or there is no terminal.
@@ -99,6 +99,11 @@ fn main() -> eframe::Result {
                 source = SourceKind::Wav;
                 wav = Some(PathBuf::from(value("--wav")));
             }
+            "--kiwi" => {
+                source = SourceKind::Kiwi;
+                auto.kiwi = Some(value("--kiwi"));
+            }
+            "--kiwi-freq" => auto.kiwi_freq = value("--kiwi-freq").parse().ok(),
             "--speed" => speed = value("--speed").parse().unwrap_or(1.0),
             "--out-dir" => out_dir = Some(PathBuf::from(value("--out-dir"))),
             "--profile" => {
@@ -160,7 +165,10 @@ fn main() -> eframe::Result {
     if auto.screenshot.is_some() && auto.after.is_none() {
         auto.after = Some(20.0);
     }
-    let autostart = matches!(source, SourceKind::Demo | SourceKind::Wav) || device.is_some();
+    let autostart = matches!(
+        source,
+        SourceKind::Demo | SourceKind::Wav | SourceKind::Kiwi
+    ) || device.is_some();
     // The window's own icon (title bar and taskbar while it runs). `include_bytes!`
     // puts the PNG inside the executable at compile time, so nothing is read from
     // disk; the exe's file icon comes from build.rs.

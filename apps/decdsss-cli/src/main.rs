@@ -187,9 +187,23 @@ enum Command {
         /// system default).
         #[arg(long)]
         device: Option<String>,
-        /// With --device, stop after this many seconds (default: until Ctrl-C).
+        /// With --device or --kiwi, stop after this many seconds (default: until
+        /// Ctrl-C).
         #[arg(long)]
         duration: Option<f64>,
+        /// Listen to a KiwiSDR straight off the network instead: `host`,
+        /// `host:port` or its web address. Needs --freq.
+        #[arg(long)]
+        kiwi: Option<String>,
+        /// With --kiwi: the dial frequency, kHz.
+        #[arg(long)]
+        freq: Option<f64>,
+        /// With --kiwi: lower sideband (default upper).
+        #[arg(long)]
+        lsb: bool,
+        /// With --kiwi: its password, if it needs one.
+        #[arg(long, default_value = "")]
+        kiwi_password: String,
         /// Profiles to listen on: all, or a comma-separated list of 500, 2k4, 3k.
         /// 500 listens on all three of its slots; 500@-500, 500@0 or 500@+500 on one.
         #[arg(long, default_value = "all")]
@@ -231,6 +245,8 @@ enum Command {
         /// Clock error around which the trials are spread, ppm.
         #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
         clock_ppm: f64,
+        #[command(flatten)]
+        slips: SlipArgs,
     },
     /// Run a WAV through the HF channel simulator.
     Channel {
@@ -256,7 +272,34 @@ enum Command {
         clock_ppm: f64,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        #[command(flatten)]
+        slips: SlipArgs,
     },
+}
+
+/// The listener's audio path skipping blocks, as a browser playing a web SDR
+/// into a virtual cable does.
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct SlipArgs {
+    /// Mean seconds between slips (dropped or silent blocks); omit for none.
+    #[arg(long)]
+    slip_every: Option<f64>,
+    /// Samples a block, at the audio's own rate.
+    #[arg(long, default_value_t = 128)]
+    slip_block: usize,
+    /// A slip is 1 to this many blocks, early or late.
+    #[arg(long, default_value_t = 3)]
+    slip_max: usize,
+}
+
+impl SlipArgs {
+    fn get(self) -> Option<decdsss_chan::Slips> {
+        self.slip_every.map(|every_s| decdsss_chan::Slips {
+            every_s,
+            block: self.slip_block.max(1),
+            max_blocks: self.slip_max.max(1),
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -348,17 +391,33 @@ fn main() -> Result<()> {
             input,
             device,
             duration,
+            kiwi,
+            freq,
+            lsb,
+            kiwi_password,
             profile,
             out_dir,
             verbose,
-        } => rx(
-            input.as_deref(),
-            device.as_deref(),
-            duration,
-            &profile,
-            &out_dir,
-            verbose,
-        ),
+        } => match kiwi {
+            Some(address) => rx_kiwi(
+                &address,
+                freq.context("--kiwi needs --freq KHZ, the dial frequency")?,
+                lsb,
+                &kiwi_password,
+                duration,
+                &profile,
+                &out_dir,
+                verbose,
+            ),
+            None => rx(
+                input.as_deref(),
+                device.as_deref(),
+                duration,
+                &profile,
+                &out_dir,
+                verbose,
+            ),
+        },
         Command::Sweep {
             profile,
             mode,
@@ -370,6 +429,7 @@ fn main() -> Result<()> {
             fading,
             offset,
             clock_ppm,
+            slips,
         } => sweep(
             &profile,
             &mode,
@@ -381,6 +441,7 @@ fn main() -> Result<()> {
             fading.as_deref(),
             offset,
             clock_ppm,
+            slips.get(),
         ),
         Command::Channel {
             input,
@@ -392,6 +453,7 @@ fn main() -> Result<()> {
             drift,
             clock_ppm,
             seed,
+            slips,
         } => channel(
             &input,
             &output,
@@ -402,6 +464,7 @@ fn main() -> Result<()> {
             drift,
             clock_ppm,
             seed,
+            slips.get(),
         ),
     }
 }
@@ -1168,6 +1231,68 @@ fn rx(
     }
 }
 
+/// Receives from a KiwiSDR's audio stream (see `decdsss_kiwi`): the samples as
+/// the Kiwi made them, at its own rate, with no browser or virtual cable to
+/// drop or repeat any.
+#[allow(clippy::too_many_arguments)]
+fn rx_kiwi(
+    address: &str,
+    freq_khz: f64,
+    lsb: bool,
+    password: &str,
+    duration: Option<f64>,
+    profile: &str,
+    out_dir: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let bands = parse_bands(profile)?;
+    std::fs::create_dir_all(out_dir)?;
+    let mut cfg = decdsss_kiwi::Config::new(address, freq_khz)?;
+    cfg.lsb = lsb;
+    cfg.password = password.to_string();
+    let mut kiwi = decdsss_kiwi::KiwiStream::open(&cfg, std::time::Duration::from_secs(10))?;
+    println!(
+        "listening on KiwiSDR {}:{} at {freq_khz:.3} kHz {} ({:.3} Hz){}",
+        cfg.host,
+        cfg.port,
+        if lsb { "LSB" } else { "USB" },
+        kiwi.sample_rate(),
+        duration.map_or(", Ctrl-C to stop".to_string(), |d| format!(" for {d:.0} s"))
+    );
+    let mut run = RxRun::new(&bands, kiwi.sample_rate(), out_dir, verbose);
+    let started = std::time::Instant::now();
+    let (mut notes, mut gaps) = (0usize, 0u64);
+    while duration.is_none_or(|d| started.elapsed().as_secs_f64() < d) {
+        let st = kiwi.status();
+        for n in &st.notes[notes..] {
+            println!("  KiwiSDR: {n}");
+        }
+        notes = st.notes.len();
+        if st.gap_samples > gaps {
+            println!(
+                "  KiwiSDR: {:.0} ms of audio never came (filled with silence)",
+                1e3 * (st.gap_samples - gaps) as f64 / kiwi.sample_rate()
+            );
+            gaps = st.gap_samples;
+        }
+        if kiwi.is_dead() {
+            run.summary();
+            bail!(
+                "the KiwiSDR stream stopped: {}",
+                kiwi.status().error.unwrap_or_default()
+            );
+        }
+        let audio = kiwi.read();
+        if audio.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        run.push(&audio);
+    }
+    run.summary();
+    Ok(())
+}
+
 /// "default" (or empty) means the system default device.
 fn device_name(dev: &str) -> Option<String> {
     let d = dev.trim();
@@ -1326,6 +1451,7 @@ fn channel(
     drift: f64,
     clock_ppm: f64,
     seed: u64,
+    slips: Option<decdsss_chan::Slips>,
 ) -> Result<()> {
     let profile = parse_profile(profile)?;
     let fading = match fading {
@@ -1358,7 +1484,18 @@ fn channel(
         clock_ppm,
         seed,
     };
-    let out = ch.apply(&audio, f64::from(rate));
+    let mut out = ch.apply(&audio, f64::from(rate));
+    if let Some(s) = slips {
+        let (o, made) = decdsss_chan::slip(&out, f64::from(rate), s, seed);
+        out = o;
+        for m in &made {
+            println!(
+                "  slip at {:.3} s: {:+} samples",
+                m.at as f64 / f64::from(rate),
+                m.samples
+            );
+        }
+    }
     wav::write(output, &out, rate)?;
     println!(
         "{} → {} (signal RMS {:.3}, SNR {} in {} Hz)",
@@ -1383,6 +1520,7 @@ fn sweep(
     fading: Option<&str>,
     offset: f64,
     clock_ppm: f64,
+    slips: Option<decdsss_chan::Slips>,
 ) -> Result<()> {
     use decdsss_phy::sim::{Scenario, run_many, snr_for_ebn0};
     let profile = parse_profile(profile)?;
@@ -1425,6 +1563,7 @@ fn sweep(
                 fading,
                 offset_hz: offset,
                 clock_ppm,
+                slips,
                 seed: 1000,
             },
             trials,

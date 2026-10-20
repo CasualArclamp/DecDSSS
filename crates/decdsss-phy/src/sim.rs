@@ -7,7 +7,7 @@
 use crate::framing::{Header, Layout, PayloadType};
 use crate::rx::{Event, Receiver};
 use crate::tx::{Segment, chips_to_audio, segment_chips};
-use decdsss_chan::{Channel, Watterson};
+use decdsss_chan::{Channel, Slips, Watterson};
 use decdsss_core::{Mode, Profile};
 
 /// Sample rate of every simulation.
@@ -30,6 +30,8 @@ pub struct Scenario {
     pub fading: Option<Watterson>,
     pub offset_hz: f64,
     pub clock_ppm: f64,
+    /// The listener's audio path skipping blocks ([`decdsss_chan::slip`]).
+    pub slips: Option<Slips>,
     pub seed: u64,
 }
 
@@ -96,6 +98,10 @@ pub fn run(sc: &Scenario) -> Outcome {
         ..Channel::clean(f64::from(LEVEL), sc.profile.bandwidth_hz())
     };
     let audio = ch.apply(&audio, FS);
+    let audio = match sc.slips {
+        Some(s) => decdsss_chan::slip(&audio, FS, s, sc.seed).0,
+        None => audio,
+    };
     let mut rx = Receiver::new(sc.profile, FS);
     let mut out = Outcome {
         frames_total: n,
@@ -191,6 +197,7 @@ mod tests {
             fading: Some(Watterson::GOOD),
             offset_hz: 0.0,
             clock_ppm: 0.0,
+            slips: None,
             seed: 1000,
         };
         for (e, t) in [21.0f64, 24.0]
@@ -238,6 +245,7 @@ mod tests {
             fading: Some(Watterson::MODERATE),
             offset_hz: 5.0,
             clock_ppm: 10.0,
+            slips: None,
             seed: 1000,
         };
         let mut found = 0;
@@ -289,16 +297,48 @@ mod tests {
             ..Channel::clean(f64::from(LEVEL), sc.profile.bandwidth_hz())
         };
         let audio = ch.apply(&audio, FS);
+        // Where the preamble, header and payload are (before any slip).
+        let cr = f64::from(sc.profile.chip_rate());
+        let pre = (crate::codes::PRE_A_PERIODS + crate::codes::PRE_B_PERIODS) as f64
+            * crate::codes::preamble_len(sc.profile) as f64
+            / cr;
+        let hdr = crate::tx::header_len(crate::tx::header_alphabet_for(sc.mode)) as f64 / cr;
+        println!(
+            "  preamble 1.00..{:.2} s, header ..{:.2} s",
+            1.0 + pre,
+            1.0 + pre + hdr
+        );
+        let audio = match sc.slips {
+            Some(s) => {
+                let (a, made) = decdsss_chan::slip(&audio, FS, s, sc.seed);
+                for m in made {
+                    println!("  slip at {:.2} s: {:+}", m.at as f64 / FS, m.samples);
+                }
+                a
+            }
+            None => audio,
+        };
         let mut rx = Receiver::new(sc.profile, FS);
+        let mut pushed = 0usize;
         for chunk in audio.chunks(4800) {
+            pushed += chunk.len();
+            let now = pushed as f64 / FS;
             for e in rx.push(chunk) {
                 match e {
+                    Event::Acquired(d) => println!("  {now:.1} s acquired {:.1} Hz", d.freq_hz),
+                    Event::PreambleLocked(l) => println!(
+                        "  {now:.1} s preamble locked, header at {:.2} s",
+                        l.header_start / (cr * crate::rx::frontend::SPS as f64)
+                    ),
                     Event::Header {
                         header,
                         snr_db,
                         fingers,
                         ..
-                    } => println!("  header {} snr {snr_db:.1} fingers {fingers}", header.mode),
+                    } => println!(
+                        "  {now:.1} s header {} snr {snr_db:.1} fingers {fingers}",
+                        header.mode
+                    ),
                     Event::Block { result, .. } => println!(
                         "  block {}: ok {:?} iters {:?} snr {:.1} freq {:.2} fingers {:?}",
                         result.index,
@@ -312,9 +352,52 @@ mod tests {
                         result.freq_hz,
                         result.fingers
                     ),
-                    Event::Lost(w) => println!("  lost: {w}"),
+                    Event::Lost(w) => println!("  {now:.1} s lost: {w}"),
                     _ => {}
                 }
+            }
+        }
+    }
+
+    /// Transmissions through audio that slips (a browser into a virtual cable):
+    /// prints what the receiver did with each one that lost frames.
+    /// `DEBUG_MODE`, `DEBUG_PROFILE` (2k4, 3k, 500), `SLIP_EVERY` (s),
+    /// `DEBUG_EBN0`, `DEBUG_DEPTH`, `DEBUG_NBLOCKS`, `DEBUG_TRIALS` change it. `cargo test --release -p
+    /// decdsss-phy debug_slips -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn debug_slips() {
+        let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
+        let profile = match var("DEBUG_PROFILE", "3k").as_str() {
+            "2k4" => Profile::W2400,
+            "500" => Profile::N500,
+            _ => Profile::W3000,
+        };
+        let base = Scenario {
+            profile,
+            mode: Mode::from_name(&var("DEBUG_MODE", "csk8-3/4")).unwrap(),
+            depth: var("DEBUG_DEPTH", "1").parse().unwrap(),
+            nblocks: var("DEBUG_NBLOCKS", "6").parse().unwrap(),
+            segments: 1,
+            ebn0_db: var("DEBUG_EBN0", "14").parse().unwrap(),
+            fading: None,
+            offset_hz: 3.0,
+            clock_ppm: 0.0,
+            slips: Some(decdsss_chan::Slips {
+                every_s: var("SLIP_EVERY", "3").parse().unwrap(),
+                block: 128,
+                max_blocks: 3,
+            }),
+            seed: 1000,
+        };
+        let trials: usize = var("DEBUG_TRIALS", "8").parse().unwrap();
+        for t in 0..trials {
+            let mut s = base.clone();
+            s.seed = base.seed + t as u64;
+            let o = run(&s);
+            println!("trial {t}: {}/{} frames", o.frames_ok, o.frames_total);
+            if o.frames_ok < o.frames_total {
+                run_verbose(&s);
             }
         }
     }
@@ -331,6 +414,7 @@ mod tests {
             fading: None,
             offset_hz: 4.0,
             clock_ppm: 10.0,
+            slips: None,
             seed: 1,
         };
         let o = run(&sc);
@@ -356,6 +440,7 @@ mod tests {
                 fading: None,
                 offset_hz: 5.0,
                 clock_ppm: 0.0,
+                slips: None,
                 seed: 2000,
             },
             16,

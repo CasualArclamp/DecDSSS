@@ -741,6 +741,7 @@ dependencies = [
  "decdsss-codec2",
  "decdsss-core",
  "decdsss-image",
+ "decdsss-kiwi",
  "decdsss-link",
  "decdsss-phy",
  "decdsss-rig",
@@ -784,6 +785,7 @@ dependencies = [
  "decdsss-core",
  "decdsss-dsp",
  "decdsss-image",
+ "decdsss-kiwi",
  "decdsss-link",
  "decdsss-phy",
  "decdsss-rig",
@@ -801,6 +803,13 @@ version = "0.0.8"
 dependencies = [
  "image",
  "jpeg-encoder",
+]
+
+[[package]]
+name = "decdsss-kiwi"
+version = "0.0.8"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]

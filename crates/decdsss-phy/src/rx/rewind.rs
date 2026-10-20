@@ -235,6 +235,46 @@ pub fn is_clean_slip(old: &[f64], new: &[f64], split: usize, win: usize, noise: 
         && (split < win / 2 || new_before <= SLIP_CLEAN * old_before)
 }
 
+/// How far above the noise, in robust standard deviations, what a shift
+/// collects must stand. The search tries about a thousand lags, so a few sigma
+/// would be passed by chance near threshold; and a sum over a few CSK symbols
+/// has a longer tail than a Gaussian.
+pub const SLIP_SIGMAS: f64 = 8.0;
+
+/// Whether `got`, what a shift collects over `fingers` lags of `energy` (the
+/// search's energy at each lag), stands clear of what noise collects: most lags
+/// hold no signal, so the median and the median absolute deviation of `energy`
+/// are the noise's level and spread (1.4826 MAD is one standard deviation of a
+/// Gaussian). Near threshold a window of the watch dips by chance, and without
+/// this the best of a thousand noise lags was taken for the signal.
+pub fn significant(energy: &[f64], fingers: usize, got: f64) -> bool {
+    if energy.len() < 8 {
+        return false;
+    }
+    let mut v = energy.to_vec();
+    v.sort_by(f64::total_cmp);
+    let med = v[v.len() / 2];
+    let mut dev: Vec<f64> = v.iter().map(|x| (x - med).abs()).collect();
+    dev.sort_by(f64::total_cmp);
+    let sigma = 1.4826 * dev[dev.len() / 2];
+    let n = fingers.max(1) as f64;
+    got > n * med + SLIP_SIGMAS * sigma * n.sqrt()
+}
+
+/// The decided code's power, less what noise alone would give the largest of
+/// the codes (H_L times the mean of the others): the signal a CSK symbol holds
+/// at one lag, about zero where there is none.
+pub fn csk_excess(w: &[decdsss_dsp::Iq], h_l: f64) -> f64 {
+    let (mut top, mut total) = (0.0f64, 0.0f64);
+    for z in w {
+        let p = f64::from(z.norm_sqr());
+        top = top.max(p);
+        total += p;
+    }
+    let others = (total - top) / (w.len() as f64 - 1.0).max(1.0);
+    top - h_l * others
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
