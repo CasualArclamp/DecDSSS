@@ -127,6 +127,25 @@ Over the scrambler, the two families modulate differently:
   the change from the symbol before (differential BPSK), so there are still no pilots,
   and the phase has to hold from one symbol to the next. Sent in the version-2
   header (Over structure).
+- **DS-PSK with a code-multiplexed pilot** (`dsc`, added 2026-10-20, see *A
+  code-multiplexed pilot* under Verification) — every chip carries the pilot,
+  Walsh code 0 (all ones) at β = 1/8 of the power, and the QPSK data symbol spread
+  by Walsh code 1 (alternating signs) at the rest, both under the scrambler:
+  chip = scr · (√(1−β)·d·W₁ + √β). The two codes are orthogonal over a symbol, so
+  on one path the pilot adds nothing to the data's correlator. The overhead is
+  DS-PSK's, 10·log₁₀(8/7) = 0.58 dB (derived), taken as power rather than as one
+  symbol in eight, so every symbol carries data: 8/7 of DS-PSK's rate at the same
+  SF. SF 8 to 64 (`CDM_SPREADS`): the data needs a Walsh code of SF chips other
+  than the pilot's, and the deep end is where DS-PSK's pilots are sparse in time
+  (DS64 on `500` has 0.78 a second, so a channel changing faster than ±0.39 Hz
+  aliases, derived; the moderate Watterson channel's spread is 0.5 Hz). Code 1 has
+  the most sign changes of any, so a carrier error, which puts a slow ramp on the
+  pilot across a symbol, leaks least of it into the data. A chip is no longer of
+  constant amplitude (|a·d ± b|² = 1 ± 2ab·Re d, 0.53 to 1.47, derived); measured
+  on the transmitted audio of a block (`tx::tests::papr_of_the_payload`), the peak
+  rises about 0.5 dB (8.4–8.5 dB over the RMS against DS-PSK's 7.8–8.0) and the
+  99.9th percentile not at all (6.6–6.75 dB for both). Sent in the version-2 header
+  as family 3, the last free code (Over structure).
 
 Walsh codes are exactly orthogonal, binary, and cost only adds to detect. Two
 other choices were rejected:
@@ -161,6 +180,10 @@ The scrambler on top keeps the spectrum white whatever code is sent.
 | BCSK64 | 30 | 210 | 105 |
 | BCSK128 | 15 | 120 | 60 |
 | BCSK256 | 7.5 | 67.5 | 33.75 |
+| DSC8 | 240 | 480 | 240 |
+| DSC16 | 120 | 240 | 120 |
+| DSC32 | 60 | 120 | 60 |
+| DSC64 | 30 | 60 | 30 |
 
 `3k` is 1.25× these rates and `500` is 0.208×. FEC rates are ½, ⅔ and ¾. The
 in-band SNR a mode needs is `Eb/N0 + 10·log₁₀(Rb / B)`, where B is the profile's
@@ -216,7 +239,9 @@ A transmission is one or more *segments*; a segment is:
    before, and a build that predates version 1 skips a version-1 header, which is
    all it could do with a type it does not know. Bi-orthogonal CSK (below) does
    not fit the one family bit, so it goes in a version-2 header: the family field
-   is 2 bits (0 DS-PSK, 1 CSK, 2 bi-orthogonal CSK, 3 unused), its alphabets 32 to
+   is 2 bits (0 DS-PSK, 1 CSK, 2 bi-orthogonal CSK, 3 `dsc`, which took the last
+   code on 2026-10-20 with SF 8 to 64 as its codes 0 to 3, its header alphabet
+   DS-PSK's at the same SF; a v0.0.8 or older build reads family 3 as no header), its alphabets 32 to
    256 are codes 0 to 3 of their own 3-bit ladder, the type field is 4 bits as in
    version 1, and the session is 4 bits (0 to 15) to pay for both. Every DS-PSK and
    CSK header is still version 0 or 1, bit for bit as before, and a v0.0.4 or older
@@ -380,6 +405,88 @@ despread again from there with the track moved from the step on, and the block's
 known-chip refinement starts at the step. A fade is left alone: holding the loops
 in it, as BinModem does, cost DS4 whole transmissions on moderate fading, because
 the loops were held at the start before they had settled.
+
+**`dsc` blocks** (`rx/payload.rs`, the DS-PSK path with `DsWork::cdm`). Every
+symbol is despread once per finger, as for DS-PSK, and correlated twice: with
+Walsh code 0 (the pilot; the plain sum) and with code 1 (the data). The pilot is
+summed coherently over *chunks* of eight symbols, which hold a DS-PSK pilot
+symbol's energy at the same SF and come as often (8·L·β = L chips' worth,
+derived), and the chunks drive what DS-PSK's pilots drive: the carrier loop (the
+product of successive chunks), the delay profile of the pre-pass and of the
+in-block searcher, and the display. (Chunks of 64 chips were tried first: at SF 64
+that is one symbol with an eighth of a DS64 pilot's energy, and the carrier loop
+went wrong at low SNR, measured under *A code-multiplexed pilot*.) The early/late
+loop and the watch take the two codes' power together. The decoder does not use
+the chunks: each symbol's own pilot correlation is a raw channel estimate, and the
+estimate the data is combined with is those smoothed by a triangle whose width is
+chosen per block by leave-one-out cross-validation (`cdm_half_width`): each
+symbol's raw estimate is predicted from the others', and the half-width (1 to 256
+symbols) with the least squared error, summed over the fingers, is taken. The raw
+estimate is the channel plus noise independent of its neighbours', so that error
+is the noise (the same at every width) plus the prediction's own error, and the
+least is the width that estimates the channel best, at whatever fading rate and
+SNR (derived; a still channel at a low SNR takes a long triangle and a fast one at
+a high SNR a short one, `cross_validation_picks_…`). DS-PSK's pilots cannot be
+smoothed that way to any profit: a channel faster than their Nyquist rate has
+aliased before any width is tried. Then power subtraction per finger as for
+DS-PSK, maximal-ratio combining of the data code, and the LDPC decoder. No G-RAKE:
+it gave DS-PSK nothing measurable at SF 4 and above, and `dsc` is SF 8 to 64.
+
+**Reacquisition** (`rx/reacq.rs`, all four families). The slip search above looks
+for the fingers' pattern moved, in one clean step, over the last four seconds and
+±60 ms. A fade defeats it when it lasts longer, and so does anything that moves
+the carrier while the signal is gone (a rig's drift, the carrier loop walking on
+noise) or that moves the timing in a way the step test cannot see. So while the
+watch says lost and the slip search has found nothing, a second search looks for
+the station on what is known of its signal, a watch window at a time: DS-PSK's
+pilot symbols, each coherently; `dsc`'s pilot code coherently over a quarter of a
+second; for CSK and bi-orthogonal CSK, whose data is unknown, the largest Walsh
+correlation of each symbol. Each is taken at every lag of the fingers' pattern
+moved by up to ±60 ms in half chips, and at carrier offsets a bin of
+1/(2·coherent length) apart within ±4 Hz (where a unit is long enough for a bin to
+be narrower than that: `dsc`'s 2 Hz bins, one bin for most others). Each window's
+cells are scaled by their own median, as the preamble search's are, and the last
+two seconds or so of windows (at most eight) are summed. With known chips a cell
+in noise is a sum of exponential powers, so the threshold is the gamma tail at a
+false-alarm rate of 10⁻⁴ a test over all the cells (Wilson–Hilferty); but two
+fingers within a chip or so of each other see nearly the same noise, and a sum of
+correlated exponentials has a heavier tail than the gamma of that many terms, so
+the shape is measured from each window's cells (for a gamma of shape k,
+Var(ln X) = ψ₁(k), the trigamma function, whatever the scale; the logarithm keeps
+the few cells with signal from pulling it, derived). Without that, `dsc` found
+stations that were not there in the middle of a fade, four times in one 20 s fade,
+at scores 1.00 to 1.23 times the threshold. The Walsh maxima are not exponential,
+and their threshold is a robust z-score (median and MAD over the cells) with a
+margin of 1 over the normal quantile. A cell over the threshold that is not where
+the loops are, and holds at least twice what their place holds (the slip search's
+ratio, noise off both: a path that takes over from another in a fade otherwise
+looks like the pattern moved onto it), is where the station is: the tracking state
+goes back to before the loss and the symbols are despread again with the track,
+and now also the carrier, moved from the window where the station came back (the
+same rewind as for a slip). Found where the loops are, the station was only
+weaker, and the watch starts again from the level there is. While the search can
+still look, the watch stays lost for up to a minute rather than four seconds. A
+slip found in a fade, by either search, starts where the signal returns, not where
+the split between the two lags falls (in a fade both hold noise and it can fall
+anywhere): the block's known-chip refinement starts at the slip, and started in
+the silence it fitted the clock to the noise (the next blocks then began chips
+off). `DECDSSS_NO_REACQ` switches the search off, and with it the longer watch.
+Its cost is small: 334 s of moderate-fading audio through `decdsss rx` on the
+2.4 kHz band took 11.4 s for DSC16, 4.7 s for DS8 and 10.0 s for CSK64 with it and
+10.1, 6.3 and 13.0 s without (measured; DS8 without it also lost 4 of 60 frames,
+which cost rewinds of their own). The GUI shows *searching* on the station's card
+while it runs and counts the times it moved the track.
+
+**The block-end refinement and the carrier.** The known-chip refinement measures
+the carrier error over quarter-second segments, from the carrier the block began
+with, so an error near a multiple of 4 Hz is a whole turn a segment and looks like
+none, and the fit, which then finds the chips poorly, set the carrier back to the
+block's start, undoing what the carrier loop had learnt within it. Seen after a
+fade in which the carrier moved 3 Hz: DS8 sat 4 Hz off block after block, and the
+timing fitted on it walked chips a block. Where the loop ended the block more than
+0.5 Hz from where it began, the refinement is now tried from there too and the fit
+that finds the chips better (the larger sum of segment correlation powers) is
+kept. With it, the same transmissions held the carrier to 0.03 Hz with no slips.
 
 Why not one early/late loop on one finger: with two paths a chip or so apart the
 late arm picks up the next path's correlation tail, and the loop settles
@@ -680,7 +787,24 @@ started from, if any, so `--version` and `--write-demo` still print.
     chips as received, and despread), the last codeword's soft bits, and the
     symbol SNR and carrier strips. A strip point is half a second: the signal
     powers summed over the noise powers summed. Left defaults to the
-    constellation or the Walsh bank, right to the delay profile.
+    constellation or the Walsh bank, right to the delay profile. For DS-PSK and
+    `dsc` (added 2026-10-20) three more: *Channel*, the main finger's channel as
+    the pilots measure it (a pilot symbol, or a `dsc` pilot chunk) drawn as a path
+    through the I/Q plane, scaled to its RMS (a fade is the path swinging through
+    the middle, a carrier error a steady turn); *Doppler*, the power spectrum of the
+    newest 16 to 256 of those points (Hann window) over their own Nyquist range, so
+    a channel faster than DS-PSK's pilots shows folded in, with the band of the
+    estimate the last block was decoded with marked (half its noise bandwidth: the
+    smoothing's Σw²/(Σw)² times the rate of what it smooths), and as its reading the
+    spread 2σ from the trace's autocorrelation at one and two points
+    (|R(2dt)|/|R(dt)| = exp(−6π²σ²dt²) for a Gaussian Doppler spectrum; white
+    noise and a carrier offset do not bias it, derived; within 20 % of 0.5 and
+    1 Hz through noise as strong as the channel in `scope::tests`); and for `dsc`,
+    *Codes*, the main finger's power on the pilot's Walsh code, the data's and the
+    mean of the others, each in dB over the others (on one clean path they hold
+    noise only; another path leaks into them about 1/SF of its power).
+    `--plots LEFT,RIGHT` (the tabs' saved names, `channel,doppler`) sets them for
+    one run, for screenshots.
   - a frame map of the transmission
 - **Files** — the received list (click to open), progress bars, the log.
 - **Speech** — cards in the same strip: the waveform of the speech so far
@@ -693,7 +817,7 @@ started from, if any, so `--version` and `--write-demo` still print.
 - **Transmit** — *send as* file, picture or voice; callsign, profile, mode (with its rate and the SNR it
   needs), depth, preamble interval, coded frames, passes, level, output device;
   play to the sound card (at that device's own rate) or save a WAV. The spreading
-  family is a pair of buttons (DS-PSK, CSK) above the mode. Beside the controls
+  family is a row of buttons (DS-PSK, CSK, BCSK, DSC) above the mode. Beside the controls
   (under them in the narrow RX + TX column) a preview of what goes on air: the
   audio band with the signal's place (and for 500 Hz the other two slots
   outlined); the transmission to scale, VOX tone, each segment's preamble and
@@ -979,10 +1103,15 @@ modem is about 2 dB above its code.
 | | BCSK64 ½ | 3.5 dB | −10.1 dB |
 | | BCSK128 ½ | 3.5 dB | −12.5 dB |
 | | BCSK256 ½ | 3.5 dB | −15.0 dB |
+| | DSC8 ½ | 3.0 dB | −7.0 dB |
+| | DSC16 ½ | 3.0 dB | −10.0 dB |
+| | DSC32 ½ | 3.5 dB | −12.5 dB |
+| | DSC64 ½ | 4.0 dB | −15.0 dB |
 | 3 kHz | DS8 ½ | 4.0 dB | −6.6 dB |
 | | CSK64 ½ | 4.0 dB | −10.3 dB |
 | | CSK256 ½ | 4.0 dB | −15.0 dB |
 | 500 Hz | DS8 ½ | 4.0 dB | −6.6 dB |
+| | DSC8 ½ | 3.5 dB | −6.5 dB |
 | | CSK64 ½ | 6.0 dB (one frame of 14 lost at 4–5 dB) | −8.3 dB |
 
 The long header, a rate-¼ CSK256 codeword, decodes 12 of 12 times from −15 dB to
@@ -1582,9 +1711,157 @@ sign reference to improve the code decision itself (the first symbol's phase is 
 coherent reference for the second, which a noncoherent code metric throws away), the 3 kHz
 and 500 Hz profiles, rates ⅔ and ¾, and the CPU cost against CSK.
 
+### A code-multiplexed pilot (2026-10-20)
+
+Rory asked what more DS modes could add robustness, then how a code-multiplexed
+pilot would look and whether it could regain lock without the preamble, and then
+for it (Q&A: a new family beside DS-PSK, SF 8 to 64, β = 1/8, the reacquisition for
+every family). `dsc8` to `dsc64` (`Family::DsCdm`; Chips and codes, Receiver chain).
+
+**Why.** DS-PSK's pilots are one symbol in eight, so they sample the channel at
+1/(8·T_sym): 30 a second for DS8 and 3.75 for DS64 on `2k4`, 6.25 and 0.78 on `500`.
+A channel whose Doppler spectrum is wider than half that aliases, whatever the
+smoothing (derived). The moderate Watterson channel is 0.5 Hz wide and flutter 10 Hz,
+so DS64 on `500` (±0.39 Hz) cannot follow the first and DS16 on `2k4` (±7.5 Hz) not
+the second. A pilot under every chip has the same energy a second for the same
+overhead and no sampling limit: the estimate's bandwidth is the smoothing's choice.
+
+**Measured** (`decdsss sweep`, whole receiver, rate ½, `2k4` depth 4 two blocks,
+`500` depth 2 two blocks; ±3 Hz offset and 10 ppm on the fading channels, ±1 Hz on
+`500`; 24 transmissions a point on AWGN and 32 on fading; frame loss, which counts
+the frames of a transmission whose header did not decode; same build for both
+families, commit 12c6cc1):
+
+| Profile | Channel | Eb/N0 | DS8 | DSC8 | DS16 | DSC16 | DS32 | DSC32 | DS64 | DSC64 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2.4 kHz | AWGN, no loss from | | 4.0 | 3.0 | 4.0 | 3.0 | 4.0 | 3.5 | 4.5 | 4.0 |
+| | moderate | 6 dB | 27.7 % | 9.4 % | 17.2 % | 6.3 % | | | 53.5 % | 43.8 % |
+| | | 9 dB | 3.1 % | 3.1 % | 3.1 % | 1.6 % | | | 0 | 3.1 % |
+| | | 12–15 dB | 0 | 0 | 0 | 0 | | | 0–3.1 % | 0 |
+| | | 18 dB | 0 | 1.6 % | 6.3 % | 0 | | | 0 | 0 |
+| | poor | 6 dB | | | 3.5 % | 6.3 % | | | | |
+| | | 9 dB | | | 0 | 3.1 % | | | | |
+| | | 12–18 dB | | | 0 | 0 | | | | |
+| | flutter | 9 dB | 0.4 % | 0.4 % | 100 % | 23.8 % | | | | |
+| | | 12 dB | 3.1 % | 0 | 100 % | 3.1 % | | | | |
+| | | 15–21 dB | 0–3.1 % | 0 | 86–96 % | 0 | | | | |
+| 500 Hz | AWGN, no loss from | | 4.0 | 3.5 | | | | | | |
+| | moderate | 9 dB | | | 26.6 % | 25.0 % | 75.8 % | 37.5 % | 100 % | 92.2 % |
+| | | 12 dB | | | 12.5 % | 6.3 % | 35.2 % | 15.6 % | 100 % | 68.8 % |
+| | | 15 dB | | | 3.1 % | 3.1 % | 21.9 % | 12.5 % | 100 % | 53.1 % |
+| | | 18 dB | | | 6.3 % | 3.1 % | 18.8 % | 15.6 % | 100 % | 40.6 % |
+
+(Eb/N0 in dB; "no loss from" is the lowest point, in 0.5 dB steps, at which every
+frame arrived. On flutter DS8 does
+not need the help there, its pilots come 30 a second.)
+
+- **AWGN.** 0.5 to 1 dB less Eb/N0 for no loss at every SF, on both profiles. The
+  in-band SNR is about the same (`dsc` sends 8/7 the bits for the same signal, 0.58 dB,
+  derived). The likely reason, derived: DS-PSK combines with a pilot-gain estimate
+  smoothed by [1 2 1]/4, which carries 0.375 of a pilot's noise; at DS8's threshold a
+  pilot's Es/N0 is about 3.4 dB, so the estimate is about 7.7 dB over its noise and
+  costs coherent detection about 10·log₁₀(1 + 1/5.9) = 0.7 dB. `dsc`'s
+  cross-validated triangle on a still channel is hundreds of symbols long and costs
+  almost nothing.
+- **Fast fading.** Flutter is the clearest result of the change: DS16 loses nearly
+  everything at any SNR measured, `dsc` loses nothing from 15 dB. On moderate fading at
+  `2k4` the two are level from 9 dB and `dsc` is better below (a third of DS8's loss
+  at 6 dB, of DS16's too). On poor fading they are level within a transmission or
+  two (`dsc` 1 to 2 more at 6 and 9 dB).
+- **500 Hz, moderate fading.** DS64 delivers nothing at any SNR, as the pilot rate
+  says it cannot (above). DSC64 delivers, and from 15 dB every transmission whose
+  header decoded was delivered whole (17 of 32 headers and 60 of 128 frames at 15 dB;
+  19 and 76 at 18): what is left is the header. DSC32 the same from 15 dB (28 and 112,
+  27 and 108). The long CSK256 header's symbols are 0.64 s on `500`, longer than a
+  0.5 Hz channel holds still, and it decodes in 15 to 24 of 32 transmissions here
+  whichever the payload family. That is the next thing to fix on `500`, not the
+  payload.
+- **Chunks.** The pilot chunks were 64 chips at first. On a genie start (AWGN,
+  `2k4`, depth 2, two blocks, 24 transmissions, `debug_cdm_floor`), DSC64 ½ at 4.5 dB
+  lost 22 of 96 frames with them, none with the carrier loop frozen
+  (`DEBUG_FREEZE=cdm_loop`) and none with chunks of 512 chips; at 3.5 dB with 512, none,
+  where DS64 ½ lost 14. So the chunks are eight symbols (`CDM_CHUNK_SYMBOLS`). On
+  flutter that changed nothing measurable (DSC16 with 64-chip chunks, `DEBUG_CDM_CHUNK=64`:
+  18.4, 3.1, 0, 0, 0 % at 9 to 21 dB against 23.8, 3.1, 0, 0, 0).
+- **Round trip.** A 3000-byte file in DSC16 ½ (`decdsss tx`, 334 s), through
+  `decdsss channel --snr 3 --fading moderate --offset 4 --clock-ppm 15` and `decdsss rx`,
+  came back byte for byte (60 of 60 frames); the GUI decodes it with the new plots
+  (`--wav … --plots channel,doppler`).
+
+**Verdict.** Worth keeping, and the mode to use at SF 8 to 64 where DS-PSK would be:
+never measurably worse but on poor fading by a transmission or two, 0.5 to 1 dB better
+on AWGN, better below the knee on moderate fading, and it works where DS-PSK cannot at
+all (flutter at SF 16, moderate fading at SF 32 and 64 on `500`). The prices: 8/7 the
+symbols despread twice (two correlators a finger, and a Walsh transform of the main
+finger for the Codes plot), a peak 0.5 dB higher with the 99.9th percentile unchanged,
+the last free family code, about 400 lines outside the tests, and no G-RAKE. Limits of
+the evidence: simulator channels only (Watterson, one or two paths), rate ½ only, the
+3 kHz profile and rates ⅔ and ¾ not measured, 24 to 32 transmissions a point, and two
+paths at most, so the pilot's leakage into the data through a second path (about 1/SF
+of its power) was not measured on its own.
+
+### Reacquisition (2026-10-20)
+
+`rx::payload::tests::reacq_fade_curve` (ignored): a transmission of about a minute
+of payload goes silent 15 s into it for `fade` seconds (50 ms raised-cosine edges),
+the audio slips by `slip` ms at the middle of the silence (cut out when negative,
+silence put in when positive), and the carrier moves by `step` Hz from there on;
+then AWGN at 10 dB Eb/N0 with a 2 Hz offset and 20 ppm. Four seeds a case; frames
+counted from the blocks that start two seconds or more after the fade ends. Run with
+the search and with `DECDSSS_NO_REACQ=1` (which also gives the watch back its four
+seconds); the same build.
+
+Frames delivered after the fade, with the search / without it:
+
+| Profile | Mode | 2 s | 8 s | 8 s, −20 ms | 8 s, +3 Hz | 8 s, −20 ms, +3 Hz | 20 s, +30 ms, −3 Hz |
+|---|---|---|---|---|---|---|---|
+| 2.4 kHz | DS8 | 56 / 56 of 56 | 48 / 48 of 48 | 48 / 48 | 48 / 48 | 48 / 48 | **32 / 24** of 32 |
+| | DSC8 | 72 / 72 of 72 | 56 / 56 of 56 | 56 / 56 | 56 / 56 | 56 / 56 | 40 / 40 of 40 |
+| | DS64 | 12 / 12 of 12 | 8 / 8 of 8 | 8 / 8 | 0 / 0 | 0 / 0 | 0 / 0 of 8 |
+| | DSC64 | 12 / 12 of 12 | 8 / 8 of 8 | 8 / 8 | 8 / 8 | 8 / 7 | 6 / 6 of 8 |
+| | CSK64 | 28 / 28 of 28 | 24 / 24 of 24 | 24 / 24 | 24 / 24 | 24 / 23 | 16 / 16 of 16 |
+| | BCSK64 | 28 / 28 of 28 | 24 / 24 of 24 | 24 / 24 | 24 / 24 | 24 / 24 | **16 / 8** of 16 |
+| 500 Hz | DS16 | 12 / 12 of 12 | 12 / 11 of 12 | 10 / 9 | 0 / 0 | 0 / 0 | 2 / 0 of 8 |
+| | DSC16 | 12 / 12 of 12 | 8 / 8 of 8 | 8 / 8 | 5 / 7 | 5 / 5 | 6 / 5 of 8 |
+| | CSK64 | 12 / 12 of 12 | 11 / 9 of 12 | **12 / 0** | **9 / 6** | **12 / 3** | **4 / 2** of 8 |
+
+(The frames counted differ between modes because a mode's blocks start at different
+times; "of" is the same for the cells to its right in the row.) What it shows:
+
+- Where the station comes back where the loops are, after a short fade or a long
+  one, nothing changes: the slip search and the loops were enough before, and the
+  search found nothing to move.
+- It matters most where the receiver had no other way back. CSK64 on `500` lost all
+  twelve frames after an 8 s fade with a 20 ms slip without it and none with it, and
+  is better in every case with a slip or a carrier step; BCSK64 and DS8 on `2k4` lost
+  half and a quarter of theirs after the 20 s fade without it, none with it.
+- `dsc` mostly did not need it: the watch staying lost longer let the slip search
+  find the slips, and its carrier loop pulled the 3 Hz steps. Its remaining losses
+  on `500` after a carrier step (DSC16: 5 to 7 of 8, either way) are not the search's
+  to fix.
+- DS-PSK at a deep SF cannot follow a carrier step, with the search or without:
+  DS64 on `2k4` and DS16 on `500` got nothing after a 3 Hz step. Their pilots are a
+  quarter of a second apart (0.27 s for DS64 on `2k4`, 0.32 s for DS16 on `500`,
+  derived), so a carrier 3 Hz off turns most of a cycle between two of them and the
+  carrier loop cannot tell which way; the search's pilot symbols are too short (33
+  and 40 ms) for a frequency bin narrower than its ±4 Hz reach, so it tries the
+  track's own carrier only. DSC64 at the same place got every frame.
+- A cost seen here: on `500` the slip search sometimes moved DS16 and CSK64 to and
+  fro dozens of times in a transmission (up to 131 slips counted without the search,
+  93 with it), with frames still delivered; it was there before the search and was
+  not looked into.
+
+`a_station_that_moved_in_a_long_fade_is_found_again` keeps one case as a default
+test (DS8 and DSC8, 20 s, +30 ms, −3 Hz, the seed on which DS8 without the search
+lost all eight frames after the fade).
+
 ### Not yet measured
 
-The 3 kHz and 500 Hz profiles on fading (DS2, DS1, CSK16, CSK8 and bi-orthogonal
+The 3 kHz profile for `dsc`, `dsc` at rates ⅔ and ¾, and the reacquisition on fading
+channels (only silence, slips and carrier steps on AWGN were measured); the 500 Hz
+header on fading (the long CSK256 header decodes in about half to three quarters of
+moderate-fading transmissions on `500`, see *A code-multiplexed pilot*);
+the 3 kHz and 500 Hz profiles on fading (DS2, DS1, CSK16, CSK8 and bi-orthogonal
 CSK included); bi-orthogonal CSK at rates ⅔ and ¾; flutter fading beyond the
 points above; the voice modes on fading beyond the Codec2 1200 and 1600 points
 under *Faster voice*; the effect of in-band interference; two stations at once

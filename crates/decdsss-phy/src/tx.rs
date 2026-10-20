@@ -482,6 +482,53 @@ mod tests {
     use crate::framing::PayloadType;
     use decdsss_core::Mode;
 
+    /// The peak-to-average power of a payload's audio (blocks only, no preamble or
+    /// header): the largest sample and the 99.9th percentile of |sample| against the
+    /// RMS, dB. `cargo test -p decdsss-phy --release -- --ignored --nocapture papr`.
+    #[test]
+    #[ignore]
+    fn papr_of_the_payload() {
+        for name in [
+            "ds8-1/2",
+            "dsc8-1/2",
+            "ds16-1/2",
+            "dsc16-1/2",
+            "ds64-1/2",
+            "dsc64-1/2",
+            "csk64-1/2",
+            "bcsk64-1/2",
+        ] {
+            for profile in [Profile::W2400, Profile::N500] {
+                let mode = Mode::from_name(name).unwrap();
+                let layout = Layout::new(profile, mode, 4);
+                let scr = Scrambler::new(own_code("VK2ABC").unwrap());
+                let frames: Vec<Vec<u8>> = (0..4)
+                    .map(|f| {
+                        (0..layout.frame_bytes())
+                            .map(|b| (f * 37 + b * 11 + 5) as u8)
+                            .collect()
+                    })
+                    .collect();
+                let chips = block_chips(&layout, &frames, &scr, 0);
+                let audio = chips_to_audio(&chips, profile, 48_000.0, 0.2, 0.0, 0.0);
+                // The middle of the block, away from the filter's start and end.
+                let mid = &audio[audio.len() / 10..audio.len() * 9 / 10];
+                let rms = (mid.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>()
+                    / mid.len() as f64)
+                    .sqrt();
+                let mut mags: Vec<f64> = mid.iter().map(|v| f64::from(v.abs())).collect();
+                mags.sort_by(f64::total_cmp);
+                let peak = mags[mags.len() - 1];
+                let p999 = mags[mags.len() * 999 / 1000];
+                println!(
+                    "{name:10} {profile:?}: peak {:.2} dB, 99.9 % {:.2} dB over RMS",
+                    20.0 * (peak / rms).log10(),
+                    20.0 * (p999 / rms).log10()
+                );
+            }
+        }
+    }
+
     fn seg(mode: &str, depth: usize, nblocks: u16) -> Segment {
         let header = Header {
             profile: Profile::W2400,

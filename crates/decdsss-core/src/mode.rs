@@ -261,6 +261,11 @@ impl Mode {
             (Profile::W2400, Csk, 8, R2_3) => 5.5,
             // Bi-orthogonal CSK, measured 2026-10-20 (14 transmissions a point).
             (Profile::W2400, BiCsk, 32 | 64 | 128 | 256, R1_2) => 3.5,
+            // DS-PSK with a code-multiplexed pilot, measured 2026-10-20 (24 a point).
+            (Profile::W2400, DsCdm, 8 | 16, R1_2) => 3.0,
+            (Profile::W2400, DsCdm, 32, R1_2) => 3.5,
+            (Profile::W2400, DsCdm, 64, R1_2) => 4.0,
+            (Profile::N500, DsCdm, 8, R1_2) => 3.5,
             (Profile::W2400, Csk, 32, R3_4) => 4.0,
             (Profile::W2400, Csk, 64, R3_4) => 3.5,
             (Profile::W3000, DsPsk, 8, R1_2) => 4.0,
