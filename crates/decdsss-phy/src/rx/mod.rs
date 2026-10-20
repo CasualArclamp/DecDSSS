@@ -15,6 +15,7 @@ pub mod grake;
 pub mod header;
 pub mod payload;
 pub mod preamble;
+pub mod reacq;
 pub mod refine;
 pub mod rewind;
 #[cfg(test)]

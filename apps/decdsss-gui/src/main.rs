@@ -28,7 +28,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: decdsss-gui [--demo | --wav FILE] [--speed X] [--profile 500,2k4,3k] \
-[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--window-size WxH] [--tx] [--tx-file FILE] [--tx-text MSG|cq] [--tx-band 500@+500] [--tx-wfid] [--record-for SECS [--mic NAME]] [--view rx|tx|both] [--monitor OUTPUT] [--open-cat] [--fake-rig] | --write-demo OUT.wav";
+[--device NAME] [--out-dir DIR] [--after SECS] [--screenshot OUT.png] [--plots LEFT,RIGHT] [--window-size WxH] [--tx] [--tx-file FILE] [--tx-text MSG|cq] [--tx-band 500@+500] [--tx-wfid] [--record-for SECS [--mic NAME]] [--view rx|tx|both] [--monitor OUTPUT] [--open-cat] [--fake-rig] | --write-demo OUT.wav";
 
 /// Attaches to the console of the process that started this one (a terminal), if
 /// there is one; harmless when output is redirected or there is no terminal.
@@ -124,6 +124,7 @@ fn main() -> eframe::Result {
                 bands = Some(on);
             }
             "--after" => auto.after = value("--after").parse().ok(),
+            "--plots" => auto.plots = Some(value("--plots")),
             "--screenshot" => auto.screenshot = Some(PathBuf::from(value("--screenshot"))),
             "--tx" => auto.open_tx = true,
             "--open-cat" => auto.open_cat = true,

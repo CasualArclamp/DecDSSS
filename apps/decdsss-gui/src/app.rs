@@ -99,6 +99,9 @@ pub struct Automation {
     pub ptt_for: Option<f64>,
     /// Like `ptt_for`, but live: stream from the microphone for this long.
     pub live_for: Option<f64>,
+    /// The station cards' two plots, by their saved names (`channel,doppler`), for
+    /// this run only.
+    pub plots: Option<String>,
     pub requested_at: Option<Instant>,
 }
 
@@ -304,15 +307,28 @@ impl App {
             .get("monitor_volume")
             .and_then(|v| v.parse().ok())
             .map_or(1.0, |v: f32| v.clamp(0.0, 4.0));
+        let asked: Vec<Plot> = auto
+            .plots
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|k| Plot::from_key(k.trim()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let card_plots = [
-            prefs
-                .get("card_left")
-                .and_then(Plot::from_key)
-                .unwrap_or(Plot::Symbols),
-            prefs
-                .get("card_right")
-                .and_then(Plot::from_key)
-                .unwrap_or(Plot::Delay),
+            asked.first().copied().unwrap_or_else(|| {
+                prefs
+                    .get("card_left")
+                    .and_then(Plot::from_key)
+                    .unwrap_or(Plot::Symbols)
+            }),
+            asked.get(1).copied().unwrap_or_else(|| {
+                prefs
+                    .get("card_right")
+                    .and_then(Plot::from_key)
+                    .unwrap_or(Plot::Delay)
+            }),
         ];
         let mut app = App {
             engine: Engine::spawn(radio.clone()),
@@ -1790,10 +1806,16 @@ enum Plot {
     Soft,
     Snr,
     Carrier,
+    /// DS-PSK and `dsc`: the channel the pilots measure, as a phasor trace.
+    Channel,
+    /// DS-PSK and `dsc`: its Doppler spectrum.
+    Doppler,
+    /// `dsc`: the power on the pilot's, the data's and the other Walsh codes.
+    Codes,
 }
 
 impl Plot {
-    const ALL: [Plot; 8] = [
+    const ALL: [Plot; 11] = [
         Plot::Symbols,
         Plot::Detail,
         Plot::Timing,
@@ -1802,7 +1824,19 @@ impl Plot {
         Plot::Soft,
         Plot::Snr,
         Plot::Carrier,
+        Plot::Channel,
+        Plot::Doppler,
+        Plot::Codes,
     ];
+
+    /// Whether the plot has anything to show for a family (its tab is offered).
+    fn applies(self, family: Family) -> bool {
+        match self {
+            Plot::Channel | Plot::Doppler => family.is_ds(),
+            Plot::Codes => family == Family::DsCdm,
+            _ => true,
+        }
+    }
 
     /// The tab's name.
     fn label(self, family: Family) -> &'static str {
@@ -1817,6 +1851,9 @@ impl Plot {
             (Plot::Soft, _) => "LLR",
             (Plot::Snr, _) => "SNR",
             (Plot::Carrier, _) => "Carrier",
+            (Plot::Channel, _) => "Channel",
+            (Plot::Doppler, _) => "Doppler",
+            (Plot::Codes, _) => "Codes",
         }
     }
 
@@ -1831,6 +1868,9 @@ impl Plot {
             Plot::Soft => "soft",
             Plot::Snr => "snr",
             Plot::Carrier => "carrier",
+            Plot::Channel => "channel",
+            Plot::Doppler => "doppler",
+            Plot::Codes => "codes",
         }
     }
 
@@ -1940,6 +1980,15 @@ fn channel_card(
             }
             kpi(ui, "Carrier", format!("{:+.2} Hz", c.carrier_hz));
             kpi(ui, "E−L", format!("{disc:+.2}"));
+            if live.searching {
+                ui.label(RichText::new("searching").strong().color(col::MARK))
+                    .on_hover_text(
+                        "The station was lost; the reacquisition search is looking for it over lag and carrier",
+                    );
+            }
+            if live.reacquired > 0 {
+                kpi(ui, "Reacquired", format!("{}", live.reacquired));
+            }
         });
 
         // The two plots, each under its own row of tabs.
@@ -1953,7 +2002,7 @@ fn channel_card(
                     ui.set_width(half);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        for p in Plot::ALL {
+                        for p in Plot::ALL.into_iter().filter(|p| p.applies(family)) {
                             let text = RichText::new(p.label(family)).size(11.0);
                             if ui.selectable_label(*slot == p, text).clicked() {
                                 *slot = p;
@@ -2016,6 +2065,11 @@ fn plot(ui: &mut Ui, p: Plot, c: &ChannelView, size: egui::Vec2) {
                 size,
             );
         }
+        Plot::Channel => scope::channel_trace(ui, &live.pilot_trace, live.trace_dt, size),
+        Plot::Doppler => {
+            scope::doppler(ui, &live.pilot_trace, live.trace_dt, live.est_band_hz, size)
+        }
+        Plot::Codes => scope::code_powers(ui, live.code_power, size),
         Plot::Carrier => {
             let f = live.freq_hz.last().copied().unwrap_or(f32::NAN);
             scope::strip(

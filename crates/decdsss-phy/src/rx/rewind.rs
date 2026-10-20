@@ -214,6 +214,28 @@ pub fn slip_at(old: &[f64], new: &[f64]) -> usize {
     best.0
 }
 
+/// Where the signal is back at the new lag, from the split on: the first `win`
+/// symbols whose mean (less the `noise`) reach half the mean after the split. A slip
+/// in the clear is back at once; one found in a fade, where both lags hold noise
+/// until the station returns, can split anywhere in the fade, and the block's
+/// known-chip refinement, which starts at the slip, must not start in the silence
+/// (it fitted the clock to the noise there: the next blocks started chips off).
+pub fn back_at(new: &[f64], split: usize, win: usize, noise: f64) -> usize {
+    let n = new.len();
+    if split >= n {
+        return split;
+    }
+    let after = &new[split..];
+    let level = (after.iter().sum::<f64>() / after.len() as f64 - noise).max(0.0);
+    if level <= 0.0 {
+        return split;
+    }
+    let w = win.clamp(1, after.len());
+    (split..=n - w)
+        .find(|&i| new[i..i + w].iter().sum::<f64>() / w as f64 - noise >= 0.5 * level)
+        .unwrap_or(split)
+}
+
 /// A slip is a step: the energy leaves the old lag and turns up at the new
 /// one at the same symbol, and the new lag held nothing before. A fade of one
 /// path with another path at the new lag fails the second test. With fewer than
@@ -321,6 +343,17 @@ mod tests {
         let step: Vec<f64> = (0..60).map(|s| if s < 30 { 1.0 } else { 2.0 }).collect();
         assert!(!is_clean_slip(&old, &step, slip_at(&old, &step), 12, 0.0));
         assert!(is_clean_slip(&old, &step, slip_at(&old, &step), 12, 1.0));
+    }
+
+    #[test]
+    fn a_slip_in_a_fade_is_back_where_the_signal_returns() {
+        // Silent from 10 to 40, the signal at the new lag from 40.
+        let new: Vec<f64> = (0..60).map(|s| if s >= 40 { 1.0 } else { 0.1 }).collect();
+        // Half the level after the split (0.375 over the noise) is first reached by
+        // the four symbols from 37, which hold one of the signal's.
+        assert_eq!(back_at(&new, 12, 4, 0.1), 37);
+        // In the clear it is back at the split.
+        assert_eq!(back_at(&new, 40, 4, 0.1), 40);
     }
 
     #[test]
