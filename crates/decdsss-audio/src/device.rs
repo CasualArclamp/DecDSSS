@@ -30,7 +30,7 @@ pub struct DeviceInfo {
     /// Stable backend identifier (survives reboots and renames; good for config files), if
     /// the backend provides one. Also accepted wherever a device name is.
     pub id: Option<String>,
-    /// Audio API in use, e.g. `"WASAPI"` or `"ALSA"`.
+    /// Audio API in use, e.g. `"WASAPI"`, `"PipeWire"` or `"ALSA"`.
     pub host: String,
     /// Whether this is an input or output device.
     pub direction: Direction,
@@ -84,11 +84,60 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     list_devices(Direction::Output)
 }
 
-/// Lists the devices of one direction on the default audio host (WASAPI on Windows, ALSA on
-/// Linux). A machine without sound cards yields an empty list, not an error.
-pub fn list_devices(direction: Direction) -> Result<Vec<DeviceInfo>> {
+/// Environment variable that names the audio host to use instead of the default, e.g.
+/// `DECDSSS_AUDIO_HOST=alsa` to bypass PipeWire. Case-insensitive; see [`available_hosts`].
+pub const HOST_ENV: &str = "DECDSSS_AUDIO_HOST";
+
+/// Name of the audio host in use: [`HOST_ENV`] if it is set, else the platform default
+/// (WASAPI on Windows; on Linux PipeWire when its daemon is running, otherwise ALSA).
+pub fn host_name() -> Result<String> {
+    Ok(audio_host()?.id().name().to_string())
+}
+
+/// Names of the audio hosts this build can reach right now, e.g. `["PipeWire", "ALSA"]`.
+pub fn available_hosts() -> Vec<String> {
+    cpal::available_hosts()
+        .into_iter()
+        .map(|id| id.name().to_string())
+        .collect()
+}
+
+/// The audio host every function here goes through: the one named by [`HOST_ENV`], or cpal's
+/// default for the platform.
+fn audio_host() -> Result<cpal::Host> {
     quiet_alsa();
-    let host = cpal::default_host();
+    match std::env::var(HOST_ENV) {
+        Ok(want) if !want.trim().is_empty() => host_by_name(want.trim()),
+        _ => Ok(cpal::default_host()),
+    }
+}
+
+/// The available audio host called `want` (any case), or an error that lists the ones there are.
+fn host_by_name(want: &str) -> Result<cpal::Host> {
+    let hosts = cpal::available_hosts();
+    // `HostId` is a small `Copy` enum, so `.copied()` turns the `&HostId` items into values.
+    let Some(id) = hosts
+        .iter()
+        .copied()
+        .find(|id| id.name().eq_ignore_ascii_case(want))
+    else {
+        let names: Vec<&str> = hosts.iter().map(|id| id.name()).collect();
+        return Err(cpal::Error::with_message(
+            cpal::ErrorKind::HostUnavailable,
+            format!(
+                "no audio host {want:?} ({HOST_ENV}); available: {}",
+                names.join(", ")
+            ),
+        )
+        .into());
+    };
+    Ok(cpal::host_from_id(id)?)
+}
+
+/// Lists the devices of one direction on the audio host in use (see [`host_name`]). A machine
+/// without sound cards yields an empty list, not an error.
+pub fn list_devices(direction: Direction) -> Result<Vec<DeviceInfo>> {
+    let host = audio_host()?;
     let host_name = host.id().name().to_string();
     // On WASAPI the default device is a special handle that follows the system default (and
     // is not `==` to the enumerated endpoint), so identify it by its resolved id, or name.
@@ -135,8 +184,8 @@ pub fn list_devices(direction: Direction) -> Result<Vec<DeviceInfo>> {
 
 /// Name of the system default device of `direction`, if there is one.
 pub fn default_device_name(direction: Direction) -> Option<String> {
-    quiet_alsa();
-    default_device(&cpal::default_host(), direction).map(|d| device_name(&d))
+    let host = audio_host().ok()?;
+    default_device(&host, direction).map(|d| device_name(&d))
 }
 
 /// alsa-lib writes to stderr whenever cpal, listing or opening sound cards, comes to one
@@ -188,8 +237,9 @@ fn default_config(dev: &cpal::Device, direction: Direction) -> Result<SupportedS
 /// Finds a device by name: `None` selects the default device; otherwise an exact name or id
 /// match wins, then a unique case-insensitive substring of the name.
 pub(crate) fn find_device(direction: Direction, name: Option<&str>) -> Result<cpal::Device> {
-    quiet_alsa();
-    let host = cpal::default_host();
+    // The host is dropped when this returns, with the device still to be opened. That is fine:
+    // a cpal device is plain data, and each PipeWire stream takes its own library-init guard.
+    let host = audio_host()?;
     let Some(wanted) = name.map(str::trim).filter(|n| !n.is_empty()) else {
         return default_device(&host, direction).ok_or(Error::NoDefaultDevice(direction));
     };
@@ -383,6 +433,22 @@ fn rate_cost(rate: u32, want: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosts_are_found_by_name_in_any_case() {
+        let default = cpal::default_host().id().name();
+        assert!(host_by_name(&default.to_lowercase()).is_ok());
+        assert!(host_by_name(&default.to_uppercase()).is_ok());
+        let err = match host_by_name("no-such-host") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unknown host was accepted"),
+        };
+        assert!(
+            err.contains("no-such-host") && err.contains(default),
+            "{err}"
+        );
+        assert!(available_hosts().iter().any(|h| h == default));
+    }
 
     #[test]
     fn rate_preferences() {

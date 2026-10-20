@@ -697,6 +697,18 @@ Sound card in and out (cpal), with VOX or manual PTT, or the transmitter keyed b
 the program (below). Files: WAV (mono audio, or stereo as I/Q) and raw `cf32`.
 Live tests go through VB-Audio cable A, which is silent.
 
+**Linux audio:** cpal reaches the sound card through WASAPI on Windows and, on
+Linux, through PipeWire or ALSA. The `pipewire` feature of `decdsss-audio`
+(default on in both apps) adds the PipeWire host, which cpal then prefers when a
+PipeWire daemon is running; with no daemon, or built `--no-default-features`, it
+is ALSA. `DECDSSS_AUDIO_HOST=alsa` (or `pipewire`) forces one, and `decdsss
+devices` says which is in use. Choosing PipeWire costs a build-time dependency
+(`libpipewire-0.3-dev`, plus `libclang-dev` for the bindings) and a run-time
+link to `libpipewire-0.3.so`, so a system without PipeWire needs the
+ALSA-only build. A saved device name from one host will not match the other's
+(ALSA `hw:CARD=…` against PipeWire node names). Not yet run on a real Linux
+machine: CI builds and tests it, nothing has opened a stream.
+
 **Keying** (`decdsss-rig`, the GUI's *CAT / PTT…* button in the bar; a dialog laid
 out as WSJT-X's "CAT and PTT Config"). The program only keys the transmitter: the
 operator sets the frequency and the mode (USB, or data) on the radio, as with any
@@ -801,7 +813,7 @@ text, a choice of size or speed (a slow waterfall, such as WSJT-X's, needs a row
 | `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes, air time and byte budget), voice framing, receive-side assembly (the readable front of a file still arriving, speech so far). |
 | `decdsss-codec2` | Codec2 (vendored C core, LGPL-2.1) with a safe wrapper: modes 3200 … 450, bit-exact frame packing. |
 | `decdsss-image` | Pictures: load, scale and compress to a byte budget as a progressive JPEG; decode one that is cut short. |
-| `decdsss-audio` | Sound-card capture and playback (cpal) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
+| `decdsss-audio` | Sound-card capture and playback (cpal: WASAPI, PipeWire, ALSA) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
 | `decdsss-rig` | Transmitter keying: CAT (IC-7300, FT-710, Hamlib `rigctld`) and DTR/RTS, on a thread that owns the rig. |
 | `apps/decdsss-cli` | `decdsss`: modes, devices, tx, rx, channel, sweep. |
 | `apps/decdsss-gui` | `decdsss-gui`: the window above. |

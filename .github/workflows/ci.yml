@@ -28,19 +28,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # eframe/glow needs the X11/Wayland and GL development headers on Linux,
-      # cpal (sound card) the ALSA ones.
+      # cpal (sound card) the ALSA ones, and its PipeWire host libpipewire plus
+      # libclang (bindgen writes the bindings at build time).
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev pkg-config
+            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev \
+            libpipewire-0.3-dev libclang-dev pkg-config
 
       - name: Build
         run: cargo build --workspace --all-targets
 
       - name: Test
         run: cargo test --workspace
+
+      # The apps' default features include PipeWire; this is the ALSA-only build.
+      - name: Check without PipeWire
+        if: runner.os == 'Linux'
+        run: cargo check --workspace --all-targets --no-default-features
 
       - name: Smoke test
         run: cargo run -p decdsss-cli -- modes
@@ -57,7 +64,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev pkg-config
+            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev \
+            libpipewire-0.3-dev libclang-dev pkg-config
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:

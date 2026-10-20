@@ -12,6 +12,13 @@ rust-version.workspace = true
 name = "decdsss-gui"
 path = "src/main.rs"
 
+[features]
+# On Linux the sound card is reached through PipeWire as well as ALSA (see
+# decdsss-audio). `--no-default-features` builds ALSA alone, which needs no
+# libpipewire to build or to run.
+default = ["pipewire"]
+pipewire = ["decdsss-audio/pipewire"]
+
 [dependencies]
 decdsss-audio = { path = "../../crates/decdsss-audio" }
 decdsss-chan = { path = "../../crates/decdsss-chan" }

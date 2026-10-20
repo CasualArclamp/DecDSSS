@@ -47,7 +47,7 @@ pub enum Error {
     #[error("WAV writer: {0}")]
     Wav(#[from] hound::Error),
 
-    /// The audio backend (WASAPI on Windows, ALSA on Linux, via cpal) reported an error.
+    /// The audio backend (WASAPI on Windows, PipeWire or ALSA on Linux, via cpal) reported an error.
     #[error("audio backend: {0}")]
     Audio(#[from] cpal::Error),
 

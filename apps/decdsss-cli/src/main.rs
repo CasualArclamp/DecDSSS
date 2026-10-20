@@ -1175,6 +1175,20 @@ fn device_name(dev: &str) -> Option<String> {
 }
 
 fn devices() -> Result<()> {
+    let host = decdsss_audio::host_name()?;
+    let others: Vec<String> = decdsss_audio::available_hosts()
+        .into_iter()
+        .filter(|h| *h != host)
+        .collect();
+    if others.is_empty() {
+        println!("Audio host: {host}");
+    } else {
+        println!(
+            "Audio host: {host}  (also {}; pick one with {})",
+            others.join(", "),
+            decdsss_audio::HOST_ENV
+        );
+    }
     for (label, list) in [
         ("Inputs", decdsss_audio::list_input_devices()?),
         ("Outputs", decdsss_audio::list_output_devices()?),

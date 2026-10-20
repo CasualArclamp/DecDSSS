@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# PipeWire as an audio host on Linux and the BSDs, beside ALSA: cpal then picks it
+# when a PipeWire daemon is running and falls back to ALSA when not. It links
+# libpipewire-0.3 and its bindings are generated at build time, so building wants
+# libpipewire-0.3-dev and libclang; leave it off for an ALSA-only build. A no-op on
+# Windows and macOS.
+pipewire = ["cpal/pipewire"]
+
 [dependencies]
 # Sound cards: WASAPI on Windows, ALSA on Linux. "realtime" promotes the audio
 # callback threads to real-time (MMCSS) priority on Windows so a busy CPU cannot
