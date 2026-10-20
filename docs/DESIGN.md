@@ -789,7 +789,8 @@ zeros dimmed) and the rig is tuned by that digit's place, one step per wheel cli
 above and stopping at 0 and 999.999.999 Hz. *Type digits over a digit* and they
 replace it and everything below, one place at a time (shown amber): the last place
 sets it, Enter sets it early, Backspace takes a digit back, Esc or leaving the dial
-drops it; to type 7.074 the entry starts at the tens of megahertz and begins with
+drops it. *Right-click a digit* and it and every digit below it go to zero
+(`dial::clear_from`). To type 7.074 the entry starts at the tens of megahertz and begins with
 the 0. *Click the mode* and the rig's other modes (`Model::modes`) slide out to its
 right (wiped out and moved 28 points over 0.3 s, cubic ease-out); one clicked puts
 the rig in it and the row slides back the way it came, as does a click anywhere

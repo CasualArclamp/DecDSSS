@@ -33,6 +33,13 @@ pub fn step(hz: u64, place: usize, steps: i64) -> u64 {
     moved.clamp(0, i128::from(MAX_HZ)) as u64
 }
 
+/// `hz` with the digit at `place` and every digit below it set to zero: what a
+/// right click does, and where a typed entry starts from.
+pub fn clear_from(hz: u64, place: usize) -> u64 {
+    let unit = place_value(place + 1);
+    hz / unit * unit
+}
+
 /// Whether the digit at `place` is a leading zero of `hz`, which the display
 /// dims. The megahertz digit and those below it always count.
 pub fn is_leading_zero(hz: u64, place: usize) -> bool {
@@ -55,9 +62,8 @@ pub struct Entry {
 impl Entry {
     /// Start at `place` of `hz`: everything from there down is cleared.
     pub fn begin(hz: u64, place: usize) -> Self {
-        let unit = place_value(place + 1);
         Self {
-            hz: hz / unit * unit,
+            hz: clear_from(hz, place),
             first: place,
             next: Some(place),
         }
@@ -122,6 +128,15 @@ mod tests {
         assert_eq!(step(0, 0, -5), 0);
         assert_eq!(step(MAX_HZ - 10, 1, 4), MAX_HZ);
         assert_eq!(step(14_097_000, 8, 1), 114_097_000);
+    }
+
+    #[test]
+    fn clearing_from_a_digit_zeros_it_and_those_below() {
+        assert_eq!(clear_from(14_097_250, 3), 14_090_000);
+        assert_eq!(clear_from(14_097_250, 6), 10_000_000);
+        assert_eq!(clear_from(14_097_250, 0), 14_097_250);
+        assert_eq!(clear_from(14_097_250, 8), 0);
+        assert_eq!(clear_from(0, 4), 0);
     }
 
     #[test]

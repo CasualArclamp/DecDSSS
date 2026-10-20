@@ -11,6 +11,7 @@
 //! - **Type digits while over a digit** and they replace that digit and
 //!   everything below it, a place at a time (Enter sets it early, Backspace
 //!   takes a digit back, Esc or leaving the dial gives up).
+//! - **Right-click a digit** and it and every digit below it go to zero.
 //! - **Click the mode** and the rig's other modes slide out to its right; click
 //!   one to put the rig in it and they slide back.
 //!
@@ -42,7 +43,8 @@ const CHIP_GAP: f32 = 6.0;
 /// What the dial says when it is hovered.
 const DIAL_HELP: &str = "Scroll over a digit to tune by that digit.\n\
 Type digits while over one to enter a frequency from that digit down \
-(Enter sets it, Backspace takes one back, Esc cancels).";
+(Enter sets it, Backspace takes one back, Esc cancels).\n\
+Right-click a digit to zero it and the digits below it.";
 
 /// The lamp's colour: grey when the program keys nothing, amber while the rig
 /// is being found, green when it is ready, red when the transmitter is keyed or
@@ -271,6 +273,12 @@ fn dial_widget(ui: &mut Ui, radio: &Radio, shown_hz: u64, live: bool) {
         }
     } else if hover_place.is_none() {
         ui.data_mut(|d| d.remove_temp::<f32>(wheel_id));
+    }
+
+    // A right click zeroes the digit and all those to its right.
+    if let (Some(place), true) = (hover_place, response.secondary_clicked()) {
+        entry = None;
+        set = Some(dial::clear_from(shown_hz, place));
     }
 
     if let Some(hz) = set
@@ -562,12 +570,20 @@ mod tests {
         }
 
         fn click(&mut self, at: Pos2) {
+            self.press(at, PointerButton::Primary);
+        }
+
+        fn right_click(&mut self, at: Pos2) {
+            self.press(at, PointerButton::Secondary);
+        }
+
+        fn press(&mut self, at: Pos2, button: PointerButton) {
             self.move_to(at);
             for pressed in [true, false] {
                 self.frames(
                     &[Event::PointerButton {
                         pos: at,
-                        button: PointerButton::Primary,
+                        button,
                         pressed,
                         modifiers: Default::default(),
                     }],
@@ -658,6 +674,26 @@ mod tests {
         b.wheel(3.0);
         b.settle(|| b.rig.hz() == 17_096_000);
         assert_eq!(b.radio.status().tuning.map(|t| t.hz), Some(17_096_000));
+        assert!(b.rig.keyings().is_empty());
+    }
+
+    #[test]
+    fn a_right_click_zeroes_the_digit_and_those_to_its_right() {
+        let mut b = Bench::new();
+        // 14.097.000: from the hundreds of kilohertz down (0, 9, 7) is cleared.
+        b.right_click(b.cell(5));
+        b.settle(|| b.rig.hz() == 14_000_000);
+        // Over the megahertz digit it goes too: 14 becomes 10.
+        b.right_click(b.cell(6));
+        b.settle(|| b.rig.hz() == 10_000_000);
+        // Over a digit that is already zero it changes nothing, and tunes nothing.
+        b.right_click(b.cell(2));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(b.rig.hz(), 10_000_000);
+        // Off the dial, nothing.
+        b.right_click(OFF_DIAL);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(b.rig.hz(), 10_000_000);
         assert!(b.rig.keyings().is_empty());
     }
 
