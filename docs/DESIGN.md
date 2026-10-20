@@ -876,10 +876,14 @@ text, a choice of size or speed (a slow waterfall, such as WSJT-X's, needs a row
   did not finish) and the GUI. *Done* (see Verification).
 - **M4** — voice, VOX/manual PTT, CAT keying. Link layer and CLI (`tx --voice`,
   `rx` writes the speech), GUI (record, send, receive cards, play) and VOX tone
-  *done*; CAT/PTT keying *done* (Radio I/O; not yet tried on a real transmitter);
-  the fast-mode fix (see Verification) to do.
+  *done*; CAT/PTT keying *done* (Radio I/O; not yet tried on a real transmitter).
+  The fast-mode slip-rewind fix (see *Dropped and repeated audio*) is built and
+  measured on branch `claude/elastic-pike-1afe0d`, not yet merged.
 - **M5** — ARQ connected mode.
-- **M6** — polish and the first release (portable exes), when Rory says so.
+- **M6** — polish and releases. Portable Windows exes are cut from `main` as GitHub
+  releases (v0.0.1 to v0.0.4 on 2026-10-19 and -20, v0.0.5 on 2026-10-20), each
+  with notes that say what was measured and what was not. Linux is build-from-source
+  (`docs/LINUX.md`), checked by CI only.
 
 ## Verification
 
@@ -1534,8 +1538,11 @@ and 500 Hz profiles, rates ⅔ and ¾, and the CPU cost against CSK.
 
 ### Not yet measured
 
-The 3 kHz and 500 Hz profiles on fading (DS2 and DS1 included); flutter fading
-beyond the one point above; voice modes (no
-Codec2 yet); the effect of in-band interference; two stations at once beyond
-the functional test in `rx::tests` (equal levels, different codes, 12 s
-apart).
+The 3 kHz and 500 Hz profiles on fading (DS2, DS1, CSK16, CSK8 and bi-orthogonal
+CSK included); bi-orthogonal CSK at rates ⅔ and ¾; flutter fading beyond the
+points above; the voice modes on fading beyond the Codec2 1200 and 1600 points
+under *Faster voice*; the effect of in-band interference; two stations at once
+beyond the functional test in `rx::tests` (equal levels, different codes, 12 s
+apart); anything on a real transmitter or a real Linux machine (CAT and PTT
+keying, the rig strip's dial and mode reads, the waterfall ID, PipeWire and ALSA
+streams).

@@ -37,17 +37,19 @@ the picture and the speech received.*
 |---|---|---|---|
 | Chip rate | 400 /s | 1920 /s | 2400 /s |
 | Occupies (audio) | 1250–1750 Hz | 300–2700 Hz | 300–3300 Hz |
-| Information rate | 5.5 – 131 bit/s | 26 – 630 bit/s | 33 – 788 bit/s |
+| Information rate | 5.5 – 525 bit/s | 26 – 2520 bit/s | 33 – 3150 bit/s |
 
 Chips are root-raised-cosine shaped (α = 0.25) and scrambled with a Gold code:
 a shared *call code* for the preamble and header, then each station's *own code*
 (from its callsign) for the data, so several stations on one frequency decode
 side by side. Two ways of spreading, as a ladder of modes (`decdsss modes`):
 
-- **DS-PSK**: a QPSK symbol held for SF chips (4 … 64), coherent, with a known
-  pilot every eighth symbol and maximal-ratio rake combining.
-- **CSK**: one of L orthogonal Walsh codes (32 … 256) per symbol, noncoherent,
-  rake-combined on power: the robust end.
+- **DS-PSK**: a QPSK symbol held for SF chips (1 … 64), coherent, with a known
+  pilot every eighth symbol and maximal-ratio rake combining. DS4 and deeper are
+  the spread modes; DS2 and DS1 are the fast end for a clean, strong channel.
+- **CSK**: one of L orthogonal Walsh codes (8 … 256) per symbol, noncoherent,
+  rake-combined on power: the robust end, and at CSK16 and CSK8 a fast end with a
+  lower frame-loss floor on fading than DS4 at the same rate.
 
 LDPC (rate ½, ⅔ or ¾, 1152-bit codewords, designed in this repository) and a
 time interleaver sit under both. The 500 Hz profile has three slots, 500 Hz apart
@@ -115,8 +117,16 @@ install, the build and install commands, and the sound setup. The sound card is
 reached through PipeWire when its daemon is running and through ALSA otherwise;
 `--no-default-features` builds ALSA alone.
 
-DecDSSS never keys a transmitter: it plays audio and you do the rest. Spread
-spectrum is restricted below VHF in some countries (for example, US Part 97 allows
-it only on 222 MHz and up): check your own licence conditions.
+**Windows.** Each [release](https://github.com/CasualArclamp/DecDSSS/releases) has
+two portable 64-bit executables, `decdsss-gui-v<version>.exe` (the window) and
+`decdsss-v<version>.exe` (the command line), that run from any folder with nothing
+installed.
+
+DecDSSS keys the transmitter only as you set it in the window's *CAT / PTT* dialog
+(CAT for the IC-7300 and FT-710, any Hamlib rig through `rigctld`, or a serial
+DTR/RTS line); with the default, VOX, it plays audio and the radio does the rest.
+It never sets the rig's frequency or mode. Spread spectrum is restricted below VHF
+in some countries (for example, US Part 97 allows it only on 222 MHz and up):
+check your own licence conditions.
 
 Licence: GPL-3.0-or-later.
