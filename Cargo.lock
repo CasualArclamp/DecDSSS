@@ -712,7 +712,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "decdsss-audio"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "alsa",
  "cpal",
@@ -724,14 +724,14 @@ dependencies = [
 
 [[package]]
 name = "decdsss-chan"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "decdsss-dsp",
 ]
 
 [[package]]
 name = "decdsss-cli"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -750,25 +750,25 @@ dependencies = [
 
 [[package]]
 name = "decdsss-codec2"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "decdsss-core"
-version = "0.0.8"
+version = "0.0.9"
 
 [[package]]
 name = "decdsss-dsp"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "num-complex",
 ]
 
 [[package]]
 name = "decdsss-fec"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "decdsss-core",
  "decdsss-dsp",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "decdsss-gui"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "decdsss-audio",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "decdsss-image"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "image",
  "jpeg-encoder",
@@ -807,14 +807,14 @@ dependencies = [
 
 [[package]]
 name = "decdsss-kiwi"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "decdsss-link"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "decdsss-chan",
  "decdsss-codec2",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "decdsss-phy"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "decdsss-chan",
  "decdsss-core",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "decdsss-rig"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "serialport",
 ]
