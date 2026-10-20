@@ -40,6 +40,8 @@ pub const SLIP_S: f64 = 0.06;
 /// A slip must move the signal at least this many samples (half a chip);
 /// anything smaller the loop follows.
 const SLIP_MIN: f64 = 2.0;
+/// The odds that noise alone passes the slip search's floor, a search.
+const SLIP_FALSE: f64 = 1e-3;
 
 /// Measurement switch (environment `DECDSSS_NO_PREAMBLE_SLIP`): no slip
 /// search in the preamble. Read once.
@@ -239,12 +241,19 @@ impl PreambleTracker {
             .map(|d| (d, at(d)))
             .max_by(|a, b| a.1.total_cmp(&b.1))?;
         // Strong enough to be the preamble, gone from where it was, and clear
-        // of the noise at the lags searched (near threshold the strongest
-        // period itself is not far over the noise, so half of it is no test:
-        // at 500 Hz, −13 dB in-band, a quarter of the locks were moved off the
-        // path by the best of the noise lags).
+        // of the noise at the lags searched. Near threshold the strongest
+        // period is not far over the noise, so half of it is no test: at 500
+        // Hz, −13 dB in-band, a quarter of the locks were moved off the path
+        // by the best of the noise lags. One period's power in noise alone is
+        // exponential (the larger of A's and B's, nearly so), its mean the
+        // median over ln 2; of n such lags the largest passes μ·ln(n/p) with
+        // odds p, so it must stand over that at p = 10⁻³.
         let old = (-1..=1).map(at).fold(0.0, f64::max);
-        if pk < 0.5 * self.pmax || old > 0.25 * pk || !super::rewind::significant(&p, 1, pk) {
+        let mut sorted = p.clone();
+        sorted.sort_by(f64::total_cmp);
+        let noise = sorted[sorted.len() / 2] / std::f64::consts::LN_2;
+        let floor = noise * (2.0 * p.len() as f64 / SLIP_FALSE).ln();
+        if pk < 0.5 * self.pmax || old > 0.25 * pk || pk < floor {
             return None;
         }
         // Not a path that was there all along.
@@ -605,6 +614,36 @@ mod tests {
                 lock.freq_hz
             );
         }
+    }
+
+    /// Near threshold the slip search must leave the lock alone: 500 Hz at −13
+    /// dB in-band (DSC64 ½ at about 6 dB Eb/N0), 32 seeds with the offsets and
+    /// clocks spread, no lock off by a fraction of a period (what a slip taken
+    /// from noise does; before its noise floor, 8 of 32 with a header after
+    /// the preamble). A lock a whole number of periods off is the end pattern's
+    /// doing, not this search's, and is not counted here. Ignored (32
+    /// preambles of 4.4 s); `cargo test --release -p decdsss-phy
+    /// weak_locks_stay_put -- --ignored`.
+    #[test]
+    #[ignore]
+    fn weak_locks_stay_put() {
+        let n = (SPS * preamble_len(Profile::N500)) as f64;
+        let mut off = Vec::new();
+        for seed in 1000..1032u64 {
+            let k = (seed - 1000) as f64;
+            let offset = 1.0 + (k % 7.0) * 2.0 - 6.0;
+            let clock = 10.0 + (k % 5.0) * 15.0 - 30.0;
+            if let Some((lock, truth)) = lock_on(Profile::N500, -13.0, offset, clock, None, seed) {
+                let e = lock.header_start - truth;
+                if (e - (e / n).round() * n).abs() > 4.0 {
+                    off.push((seed, e));
+                }
+            }
+        }
+        assert!(
+            off.is_empty(),
+            "a fraction of a period off (seed, samples): {off:?}"
+        );
     }
 
     #[test]
