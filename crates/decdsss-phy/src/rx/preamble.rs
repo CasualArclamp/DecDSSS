@@ -35,11 +35,26 @@ const LOOKAHEAD: usize = 2;
 /// of the strongest seen (−5 dB).
 const STRONG: f64 = 0.3;
 /// The B pair's evidence ([`PreambleTracker::pattern`], in nats) needed to end the
-/// preamble there. From noise alone a period's [`glrt`] exceeds 3 when its power
-/// is 5.5 times the mean or more, e^−5.5 = 0.4 % of periods (derived); a B
+/// preamble there. From noise alone a period's [`glrt`] exceeds 2 when its power
+/// is 4.5 times the mean or more, e^−4.5 = 1.1 % of periods (derived); a B
 /// period at 6 dB of correlation SNR averages 2.4 (derived, at power 5 times the
 /// noise: 5 − 1 − ln 5).
-const B_EVIDENCE: f64 = 3.0;
+const B_EVIDENCE: f64 = 2.0;
+
+/// The fit ([`PreambleTracker::pattern`], nats) that ends the preamble at its
+/// best period when the B pair never stood out. Noise alone gives a period
+/// 0.15 nats on average (derived: E[glrt] for an exponential of mean 1,
+/// e^−1 − E₁(1)), so about 2 over the fourteen periods; a preamble at 6 dB of
+/// correlation SNR a period about 34 (fourteen times 2.4).
+const FALLBACK_FIT: f64 = 20.0;
+
+/// Measurement switch (environment `DECDSSS_OLD_PREAMBLE_END`): end the preamble
+/// by the per-period ratio test it used before 2026-10-20 (see
+/// [`PreambleTracker::pattern`]). Read once.
+fn old_preamble_end() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("DECDSSS_OLD_PREAMBLE_END").is_some())
+}
 
 /// The generalized log-likelihood ratio of a correlation of power `x` times
 /// the noise's against noise alone, the path's gain unknown: maximised over
@@ -220,6 +235,32 @@ impl PreambleTracker {
         }
     }
 
+    /// The end of the preamble by the test used before 2026-10-20, for
+    /// `DECDSSS_OLD_PREAMBLE_END`: per period z = (p_B − p_A)/(p_B + p_A); the
+    /// score of period i is the mean z of the B pair to i less the mean of the
+    /// three periods before; the end is a local maximum over 0.7, declared once
+    /// the period after it is in.
+    fn old_end(&self) -> Option<usize> {
+        let z = |m: usize| {
+            let (a, b) = self.powers[m];
+            f64::from(b - a) / f64::from(b + a).max(1e-30)
+        };
+        let score = |i: usize| {
+            if i + 1 < PRE_B_PERIODS + 3 {
+                return f64::NEG_INFINITY;
+            }
+            let bz = (i + 1 - PRE_B_PERIODS..=i).map(z).sum::<f64>() / PRE_B_PERIODS as f64;
+            let az = (i + 1 - PRE_B_PERIODS - 3..i + 1 - PRE_B_PERIODS)
+                .map(z)
+                .sum::<f64>()
+                / 3.0;
+            bz - az
+        };
+        let k = self.powers.len().checked_sub(2).filter(|&k| k >= 1)?;
+        let s = score(k);
+        (s > 0.7 && s >= score(k - 1) && s > score(k + 1)).then_some(k)
+    }
+
     /// The noise power of a period's correlation with a template that is not
     /// there: the median of the weaker of the two over the periods so far,
     /// divided by ln 2 (the median of an exponential is ln 2 of its mean). In
@@ -308,14 +349,20 @@ impl PreambleTracker {
                 return State::Working;
             }
             if self.count >= self.max_periods {
-                if std::env::var("DEBUG_PRE").is_ok() {
+                // The B pair never stood out (it can fade away whole on one
+                // path): the period that fits the whole pattern best, if the
+                // A periods were there at all. A wrong guess costs a header
+                // that fails its CRC, which a lost preamble costs anyway.
+                if !old_preamble_end() {
                     let noise = self.noise();
-                    let v: Vec<String> = (0..self.powers.len()).map(|k| {
-                        let (a, b) = self.powers[k];
-                        let pt = self.pattern(k, noise).map_or((0.0, 0.0), |p| p);
-                        format!("{k}:{:.1}/{:.1} fit {:.1} b {:.1}", f64::from(a) / noise, f64::from(b) / noise, pt.0, pt.1)
-                    }).collect();
-                    eprintln!("NOLOCK noise {noise:.3e}: {}", v.join(" | "));
+                    let best = (0..self.powers.len())
+                        .filter_map(|k| self.pattern(k, noise).map(|p| (k, p.0)))
+                        .max_by(|a, b| a.1.total_cmp(&b.1));
+                    if let Some((k, fit)) = best
+                        && fit >= FALLBACK_FIT
+                    {
+                        return State::Locked(self.finish(buf, k));
+                    }
                 }
                 return State::Failed("no end-of-preamble marker");
             }
@@ -408,16 +455,17 @@ impl PreambleTracker {
             // over A, and the pattern fits it at least as well as the period
             // before and better than the `LOOKAHEAD` after, which must be in.
             let m = self.powers.len() - 1;
-            if m > LOOKAHEAD {
+            if old_preamble_end() {
+                if let Some(k) = self.old_end() {
+                    return State::Locked(self.finish(buf, k));
+                }
+            } else if m > LOOKAHEAD {
                 let k = m - LOOKAHEAD;
                 let noise = self.noise();
                 let fit = |k: usize| self.pattern(k, noise).map_or(f64::NEG_INFINITY, |p| p.0);
                 let (pa, pb) = (k.saturating_sub(1)..=k).fold((0.0, 0.0), |(a, b), i| {
                     (a + self.powers[i].0, b + self.powers[i].1)
                 });
-                if std::env::var("DEBUG_PRE").is_ok() && let Some((here, b)) = self.pattern(k, noise) {
-                    eprintln!("CHECK m {m} k {k} noise {noise:.3e} here {here:.1} b {b:.1} pa {pa:.3e} pb {pb:.3e} before {:.1} after {:?}", fit(k - 1), (k + 1..=m).map(fit).collect::<Vec<_>>());
-                }
                 if let Some((here, b)) = self.pattern(k, noise)
                     && b >= B_EVIDENCE
                     && pb > pa
@@ -670,7 +718,8 @@ mod tests {
     /// no lock. Run with
     /// `cargo test -p decdsss-phy --release -- --ignored --nocapture
     /// end_of_preamble_curve`; `PREAMBLE_TRIALS` sets the trials a point (32),
-    /// `PREAMBLE_SNR` one SNR only.
+    /// `PREAMBLE_SNR` one SNR only, `PREAMBLE_WORKERS` the threads; `PREAMBLE_SHOW`
+    /// prints the seed of every lock that is not on a path.
     #[test]
     #[ignore]
     fn end_of_preamble_curve() {
@@ -691,7 +740,9 @@ mod tests {
                     let workers = std::env::var("PREAMBLE_WORKERS")
                         .ok()
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+                        .unwrap_or_else(|| {
+                            std::thread::available_parallelism().map_or(4, |n| n.get())
+                        });
                     std::thread::scope(|sc| {
                         for w in 0..workers as u64 {
                             let (tally, header) = (&tally, &header);
@@ -700,7 +751,13 @@ mod tests {
                                     let offset = 1.0 + (t % 7) as f64 * 2.0 - 6.0;
                                     let clock = 10.0 + (t % 5) as f64 * 15.0 - 30.0;
                                     let got = lock_on_then(
-                                        profile, header, snr, offset, clock, fading, 1000 + t,
+                                        profile,
+                                        header,
+                                        snr,
+                                        offset,
+                                        clock,
+                                        fading,
+                                        1000 + t,
                                     );
                                     let k = match got {
                                         None => 3,
@@ -723,15 +780,54 @@ mod tests {
                                             }
                                         }
                                     };
+                                    if k != 0 && std::env::var_os("PREAMBLE_SHOW").is_some() {
+                                        println!(
+                                            "    {profile} {name} {snr:+.0} dB seed {}: class {k}",
+                                            1000 + t
+                                        );
+                                    }
                                     tally.lock().unwrap()[k] += 1;
                                 }
                             });
                         }
                     });
                     let [right, wrong, other, none] = tally.into_inner().unwrap();
-                    println!("  {snr:+5.0} dB: {right:3} / {wrong:3} / {other:3} / {none:3} of {trials}");
+                    println!(
+                        "  {snr:+5.0} dB: {right:3} / {wrong:3} / {other:3} / {none:3} of {trials}"
+                    );
                 }
             }
+        }
+    }
+
+    /// Two transmissions on the moderate channel at −1 dB in-band whose preamble
+    /// the per-period ratio test ended a period out (`end_of_preamble_curve`,
+    /// seeds 1007 on 500 Hz and 1005 on 2.4 kHz, with `DECDSSS_OLD_PREAMBLE_END`):
+    /// the whole-pattern fit ends both on a path.
+    #[test]
+    fn the_end_is_found_through_a_fade() {
+        for (profile, offset, clock, seed) in [
+            (Profile::N500, -5.0, 10.0, 1007),
+            (Profile::W2400, 5.0, -20.0, 1005),
+        ] {
+            let h = crate::rx::testrig::header(profile, "dsc64-1/2", 2, 2);
+            let header = crate::tx::header_chips(&h).unwrap();
+            let (lock, truth) = lock_on_then(
+                profile,
+                &header,
+                -1.0,
+                offset,
+                clock,
+                Some(Watterson::MODERATE),
+                seed,
+            )
+            .unwrap_or_else(|| panic!("{profile}: no lock"));
+            let chips = (lock.header_start - truth) / lock.step;
+            // On a path: the second is 1 ms after the first.
+            assert!(
+                chips > -1.0 && chips < 3.0,
+                "{profile}: {chips:.1} chips out"
+            );
         }
     }
 

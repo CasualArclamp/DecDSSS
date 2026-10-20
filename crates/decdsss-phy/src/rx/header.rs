@@ -73,6 +73,32 @@ pub struct HeaderResult {
     pub snr_db: f64,
 }
 
+/// Where the header is looked for, in preamble periods from where the preamble
+/// put it: there, then a period earlier, then a period later. On a fading channel
+/// the B pair that marks the end of the preamble can fade away, and the
+/// preamble then ends a whole period or more out (`preamble::PreambleTracker`),
+/// most often by one; trying the neighbours costs a header demodulation or two
+/// more when the first fails, and the LDPC and CRC decide.
+pub const HEADER_SHIFTS: [i32; 3] = [0, -1, 1];
+
+/// Header tries in all: every alphabet of `tx::HEADER_ALPHABETS` at each of
+/// [`HEADER_SHIFTS`].
+pub const HEADER_TRIES: usize = HEADER_SHIFTS.len() * crate::tx::HEADER_ALPHABETS.len();
+
+/// Try `i` (below [`HEADER_TRIES`]): the shift in periods and the alphabet,
+/// the alphabets shortest first at each shift.
+pub fn header_try(i: usize) -> (i32, usize) {
+    let n = crate::tx::HEADER_ALPHABETS.len();
+    (HEADER_SHIFTS[i / n], crate::tx::HEADER_ALPHABETS[i % n])
+}
+
+/// The lock with its header start moved by `shift` preamble periods of `p` chips.
+pub fn shifted(lock: &PreambleLock, shift: i32, p: usize) -> PreambleLock {
+    let mut l = lock.clone();
+    l.header_start += f64::from(shift) * p as f64 * l.step;
+    l
+}
+
 /// Chips of samples the demodulator needs past the header's own, and its
 /// length in samples at the lock's chip length: where the buffer must reach.
 pub fn header_need(lock: &PreambleLock, alphabet: usize) -> f64 {
@@ -779,7 +805,9 @@ mod tests {
                 chips.extend(header_chips_l(&seg.header, l).unwrap());
                 chips.extend(std::iter::repeat_n(decdsss_dsp::Iq::new(0.0, 0.0), 400));
                 let audio = chips_to_audio(&chips, profile, 48_000.0, 0.2, 1.0, 1.0);
-                println!("{name} L={l}: in-band SNR: ok / no lock / ok from the true carrier and start; fails: carrier > 0.3 Hz off [carrier, start errors]");
+                println!(
+                    "{name} L={l}: in-band SNR: ok / no lock / ok from the true carrier and start; fails: carrier > 0.3 Hz off [carrier, start errors]"
+                );
                 for snr in [-16.0, -13.0, -10.0, -7.0, -4.0, -1.0, 2.0] {
                     // (ok, no lock, ok with the true carrier and start, failed with
                     // the carrier more than 0.3 Hz off, the fails' carrier and
@@ -840,8 +868,10 @@ mod tests {
                         }
                     });
                     let (ok, nolock, genie, off, errs) = tally.into_inner().unwrap();
-                    let errs: Vec<String> =
-                        errs.iter().map(|(e, t)| format!("{e:+.2} Hz {t:+.2} chip")).collect();
+                    let errs: Vec<String> = errs
+                        .iter()
+                        .map(|(e, t)| format!("{e:+.2} Hz {t:+.2} chip"))
+                        .collect();
                     println!(
                         "  {snr:+5.0} dB: {ok:2} / {nolock:2} / {genie:2} of {trials}, {off} off [{}]",
                         errs.join(" ")
@@ -900,6 +930,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A preamble ended a period late: the header does not decode there and does
+    /// a period earlier, the try the receiver makes next (`HEADER_SHIFTS`).
+    #[test]
+    fn a_header_a_period_off_is_found_by_the_next_try() {
+        use super::{
+            HEADER_SHIFTS, HEADER_TRIES, HeaderOutcome, demod_header, header_try, shifted,
+        };
+        assert_eq!(header_try(0).0, 0, "where the preamble put it first");
+        assert_eq!(header_try(HEADER_TRIES - 1), (1, 256));
+        let profile = Profile::W2400;
+        let seg = segment(profile, "ds4-1/2", 1, 1);
+        let audio = through(&seg, &channel(profile, 0.0));
+        let (fe, buf, lock) = to_lock(&audio, profile).expect("preamble");
+        let p = crate::codes::preamble_len(profile);
+        let late = shifted(&lock, 1, p);
+        let decodes = |l: &crate::rx::preamble::PreambleLock| {
+            matches!(demod_header(&buf, l, fe.out_rate(), 64),
+                HeaderOutcome::Decoded(h) if h.header == seg.header)
+        };
+        assert!(!decodes(&late));
+        assert!(HEADER_SHIFTS.contains(&-1));
+        assert!(decodes(&shifted(&late, -1, p)));
     }
 
     #[test]

@@ -402,6 +402,71 @@ mod tests {
         }
     }
 
+    /// The transmissions of a `decdsss sweep` point whose header was not decoded,
+    /// with what the receiver did in each (the first `DEBUG_SHOW`, 4). The
+    /// sweep's scenario, `--fading moderate --offset 1 --clock-ppm 10`, on
+    /// `DEBUG_PROFILE` (500), `DEBUG_MODE` (dsc64-1/2), `DEBUG_DEPTH` (2),
+    /// `DEBUG_NBLOCKS` (2), `DEBUG_EBN0` (15), `DEBUG_TRIALS` (32). `cargo test
+    /// --release -p decdsss-phy debug_header_loss -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn debug_header_loss() {
+        let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
+        let profile = match var("DEBUG_PROFILE", "500").as_str() {
+            "2k4" => Profile::W2400,
+            "3k" => Profile::W3000,
+            _ => Profile::N500,
+        };
+        let base = Scenario {
+            profile,
+            mode: Mode::from_name(&var("DEBUG_MODE", "dsc64-1/2")).unwrap(),
+            depth: var("DEBUG_DEPTH", "2").parse().unwrap(),
+            nblocks: var("DEBUG_NBLOCKS", "2").parse().unwrap(),
+            segments: 1,
+            ebn0_db: var("DEBUG_EBN0", "15").parse().unwrap(),
+            fading: Some(Watterson::MODERATE),
+            offset_hz: 1.0,
+            clock_ppm: 10.0,
+            slips: None,
+            seed: 1000,
+        };
+        let trials: usize = var("DEBUG_TRIALS", "32").parse().unwrap();
+        let show: usize = var("DEBUG_SHOW", "4").parse().unwrap();
+        // The trial's offset and clock as `run_many` spreads them.
+        let trial = |t: usize| {
+            let mut s = base.clone();
+            s.seed = base.seed + t as u64;
+            s.offset_hz = base.offset_hz + (t % 7) as f64 * 2.0 - 6.0;
+            s.clock_ppm = base.clock_ppm + (t % 5) as f64 * 15.0 - 30.0;
+            s
+        };
+        let lost = std::sync::Mutex::new(Vec::new());
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::thread::scope(|sc| {
+            for w in 0..workers {
+                let (lost, trial) = (&lost, &trial);
+                sc.spawn(move || {
+                    for t in (w..trials).step_by(workers) {
+                        if !run(&trial(t)).header {
+                            lost.lock().unwrap().push(t);
+                        }
+                    }
+                });
+            }
+        });
+        let mut lost = lost.into_inner().unwrap();
+        lost.sort_unstable();
+        println!("no header in trials {lost:?} of {trials}");
+        for &t in lost.iter().take(show) {
+            let s = trial(t);
+            println!(
+                "trial {t}: offset {} Hz, clock {} ppm",
+                s.offset_hz, s.clock_ppm
+            );
+            run_verbose(&s);
+        }
+    }
+
     #[test]
     fn a_strong_signal_gets_everything_through() {
         let sc = Scenario {
