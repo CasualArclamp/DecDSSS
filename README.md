@@ -110,12 +110,10 @@ cargo run --release -p decdsss-gui -- --write-demo demo.wav
 powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 ```
 
-**Linux.** The sound card is reached through PipeWire when its daemon is running
-and through ALSA otherwise; `decdsss devices` says which. To build, install
-`libasound2-dev`, `libpipewire-0.3-dev`, `libclang-dev` and `pkg-config` (Debian
-and Ubuntu names; the GUI wants the X11/Wayland and GL headers too). For ALSA
-alone, with no PipeWire library needed to build or run, add
-`--no-default-features`. `DECDSSS_AUDIO_HOST=alsa` makes a PipeWire build use ALSA.
+**Linux.** Build from source: [docs/LINUX.md](docs/LINUX.md) has the packages to
+install, the build and install commands, and the sound setup. The sound card is
+reached through PipeWire when its daemon is running and through ALSA otherwise;
+`--no-default-features` builds ALSA alone.
 
 DecDSSS never keys a transmitter: it plays audio and you do the rest. Spread
 spectrum is restricted below VHF in some countries (for example, US Part 97 allows
