@@ -143,6 +143,81 @@ pub fn air_seconds(spec: &SendSpec, stream_len: usize) -> Result<f64, String> {
     ))
 }
 
+/// How a transmission's time is spent, for drawing it to scale: the parts
+/// [`air_seconds`] adds up. Worked out from the arithmetic alone, so no frame is
+/// encoded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Timeline {
+    /// The preamble and header that open every segment, seconds.
+    pub lead_s: f64,
+    /// One block (`depth` frames), seconds.
+    pub block_s: f64,
+    /// Frames a block.
+    pub depth: usize,
+    /// Blocks in each segment, in order.
+    pub segments: Vec<usize>,
+    /// Data frames: the first this many; the rest are coded.
+    pub data_frames: usize,
+    /// Frames in all.
+    pub frames: usize,
+    /// Frames a pass: the first is the data frames and their coded ones, each
+    /// later pass as many new coded frames.
+    pub per_pass: usize,
+    /// The postamble after the last segment, seconds.
+    pub eot_s: f64,
+}
+
+impl Timeline {
+    /// Seconds of signal in all.
+    pub fn seconds(&self) -> f64 {
+        let blocks: usize = self.segments.iter().sum();
+        self.segments.len() as f64 * self.lead_s + blocks as f64 * self.block_s + self.eot_s
+    }
+
+    /// The timeline of segments already cut, every frame of them data (speech).
+    pub fn of_segments(segments: &[Segment]) -> Option<Timeline> {
+        let h = &segments.first()?.header;
+        let frames: usize = segments.iter().map(|s| s.frames.len()).sum();
+        Some(Timeline {
+            lead_s: lead_chips_for(h.profile, h.mode) as f64 / f64::from(h.profile.chip_rate()),
+            block_s: Layout::new(h.profile, h.mode, h.depth).seconds(),
+            depth: h.depth,
+            segments: segments
+                .iter()
+                .map(|s| usize::from(s.header.nblocks))
+                .collect(),
+            data_frames: frames,
+            frames,
+            per_pass: frames,
+            eot_s: decdsss_phy::eot::seconds(h.profile),
+        })
+    }
+}
+
+/// The [`Timeline`] of sending a `stream_len`-byte stream under `spec`: the
+/// segments [`cut_segments`] makes, without making them.
+pub fn timeline(spec: &SendSpec, stream_len: usize) -> Result<Timeline, String> {
+    let sh = shape(spec, stream_len)?;
+    let layout = Layout::new(spec.profile, spec.mode, spec.depth);
+    let blocks = sh.total.div_ceil(spec.depth);
+    let per_segment = ((spec.resync_s / layout.seconds()).floor() as usize).clamp(1, 4095);
+    // Whole segments of `per_segment` blocks, and what is left over in the last.
+    let segments = (0..blocks.div_ceil(per_segment))
+        .map(|i| per_segment.min(blocks - i * per_segment))
+        .collect();
+    Ok(Timeline {
+        lead_s: lead_chips_for(spec.profile, spec.mode) as f64
+            / f64::from(spec.profile.chip_rate()),
+        block_s: layout.seconds(),
+        depth: spec.depth,
+        segments,
+        data_frames: sh.k,
+        frames: sh.total,
+        per_pass: sh.per_pass,
+        eot_s: decdsss_phy::eot::seconds(spec.profile),
+    })
+}
+
 /// The longest stream (container included) that goes in `seconds` of signal
 /// under `spec`; 0 if not even one frame does.
 pub fn max_stream_bytes(spec: &SendSpec, seconds: f64) -> usize {
@@ -351,6 +426,39 @@ mod tests {
         assert!(air_seconds(&sp, n).unwrap() <= 100.0);
         assert!(air_seconds(&sp, n + p.shard_bytes).unwrap() > 100.0);
         assert_eq!(max_stream_bytes(&sp, 0.1), 0);
+    }
+
+    #[test]
+    fn the_timeline_is_the_plan_without_the_frames() {
+        for (resync, parity, passes, depth, len) in [
+            (30.0, 0.25, 1, 2, 4000),
+            (15.0, 0.5, 3, 4, 9000),
+            (300.0, 0.0, 1, 1, 50),
+            (0.0, 1.0, 2, 8, 2000),
+        ] {
+            let sp = SendSpec {
+                depth,
+                ..spec(resync, parity, passes)
+            };
+            let stream = vec![3u8; len];
+            let p = plan(&sp, &stream).unwrap();
+            let t = timeline(&sp, len).unwrap();
+            let blocks: Vec<usize> = p
+                .segments
+                .iter()
+                .map(|s| usize::from(s.header.nblocks))
+                .collect();
+            assert_eq!(t.segments, blocks, "{resync} {parity} {passes} {depth}");
+            assert_eq!(t.data_frames, p.data_frames);
+            assert_eq!(t.frames, p.frames());
+            assert_eq!(t.per_pass, p.data_frames + p.coded_first_pass);
+            let est = air_seconds(&sp, len).unwrap();
+            assert!((t.seconds() - est).abs() < 1e-9, "{} vs {est}", t.seconds());
+            let cut = Timeline::of_segments(&p.segments).unwrap();
+            assert_eq!(cut.segments, t.segments);
+            assert!((cut.seconds() - est).abs() < 1e-9);
+        }
+        assert!(timeline(&spec(60.0, 0.25, 1), 0).is_err());
     }
 
     #[test]

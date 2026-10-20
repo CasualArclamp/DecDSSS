@@ -666,7 +666,15 @@ started from, if any, so `--version` and `--write-demo` still print.
   against bytes in all and the scans decoded; it sharpens as blocks arrive.
 - **Transmit** — *send as* file, picture or voice; callsign, profile, mode (with its rate and the SNR it
   needs), depth, preamble interval, coded frames, passes, level, output device;
-  play to the sound card (at that device's own rate) or save a WAV. Choosing an
+  play to the sound card (at that device's own rate) or save a WAV. The spreading
+  family is a pair of buttons (DS-PSK, CSK) above the mode. Beside the controls
+  (under them in the narrow RX + TX column) a preview of what goes on air: the
+  audio band with the signal's place (and for 500 Hz the other two slots
+  outlined); the transmission to scale, VOX tone, each segment's preamble and
+  header, data then coded frames, postamble, with its air time
+  (`decdsss_link::timeline`: the sender's arithmetic without encoding a frame,
+  tested equal to the planned segments and to `air_seconds`); and the mode's
+  information rate, the SNR it needs, a frame's bytes and a block's length. Choosing an
   image switches on *As a picture*: air time a pass and the lowest quality
   accepted, and the window shows the picture exactly as it will arrive (decoded
   from the JPEG that will be sent), its size, quality, bytes and seconds of

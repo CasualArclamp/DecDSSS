@@ -114,6 +114,9 @@ mod tests {
                 let chips = transmission_chips(&segs).unwrap().len();
                 let secs = chips as f64 / f64::from(profile.chip_rate());
                 assert!((secs - air_seconds(profile, copies)).abs() < 1e-9);
+                let t = crate::send::Timeline::of_segments(&segs).unwrap();
+                assert_eq!(t.segments, vec![0; copies]);
+                assert!((t.seconds() - secs).abs() < 1e-9);
             }
         }
     }

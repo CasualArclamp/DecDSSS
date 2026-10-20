@@ -6,25 +6,51 @@ use crate::engine::{Cmd, Engine, TxState};
 use crate::live::{LiveConfig, LiveTxSession, Phase};
 use crate::prefs::Prefs;
 use crate::radio::Radio;
+use crate::scope::col;
 use crate::voice::{Play, VoicePanel};
 use decdsss_audio::wav;
 use decdsss_codec2::Mode as Codec;
-use decdsss_core::{Family, Mode, Profile, Slot};
+use decdsss_core::profile::ROLLOFF;
+use decdsss_core::{Band, Family, Mode, Profile, Slot};
 use decdsss_image::Source;
 use decdsss_link::voice::{CODECS, default_codec, render_speech, voice_mode};
 use decdsss_link::{
-    SendSpec, VoiceSpec, air_seconds, container, max_stream_bytes, plan_voice, segments,
+    SendSpec, Timeline, VoiceSpec, air_seconds, container, max_stream_bytes, plan_voice, segments,
+    timeline,
 };
 use decdsss_phy::codes::normalise_call;
 use decdsss_phy::framing::{DEPTHS, Layout, PayloadType};
 use decdsss_phy::tx::{chips_to_audio_at, transmission_chips, vox_lead};
-use eframe::egui::{self, ColorImage, Context, RichText, TextureHandle, TextureOptions};
+use eframe::egui::{self, Color32, ColorImage, Context, RichText, TextureHandle, TextureOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 /// File extensions the picture mode is switched on for.
 const PICTURE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
+
+/// Panel width (points) from which the preview goes beside the controls rather
+/// than under them: the transmit-only view has it, the side panel does not.
+const TWO_COLUMNS: f32 = 640.0;
+
+/// The VOX lead: seconds of 1 kHz tone, then of silence, ahead of the signal.
+const VOX_TONE_S: f64 = 0.4;
+const VOX_GAP_S: f64 = 0.3;
+
+/// The families the Spreading buttons offer, and what each is.
+const FAMILIES: [(Family, &str, &str); 2] = [
+    (
+        Family::DsPsk,
+        "DS-PSK",
+        "Direct sequence: a QPSK symbol held for SF chips, coherent, pilot-aided",
+    ),
+    (
+        Family::Csk,
+        "CSK",
+        "Code-shift keying: one of L Walsh codes of L chips, log2(L) bits a symbol, \
+         noncoherent",
+    ),
+];
 
 /// What a prepared picture depends on.
 #[derive(Clone, PartialEq)]
@@ -49,6 +75,9 @@ struct Prepared {
 }
 
 type PicResult = Result<Prepared, String>;
+
+/// Speech as planned for sending: a line saying what it comes to, and its timeline.
+type VoicePlanned = Result<(String, Option<Timeline>), String>;
 
 /// Compressing a picture takes a moment, so it runs off the UI thread.
 struct PicJob {
@@ -153,8 +182,9 @@ pub struct TxPanel {
     codec: Option<Codec>,
     /// A 1 kHz tone ahead of the signal, to key a radio on VOX.
     vox: bool,
-    /// What the speech summary was worked out for, and the summary.
-    voice_summary: Option<(String, Result<String, String>)>,
+    /// What the speech summary was worked out for, the summary, and the
+    /// transmission's timeline for the preview.
+    voice_summary: Option<(String, VoicePlanned)>,
     /// Live voice (streamed while the PTT is held) rather than overs.
     live_mode: bool,
     /// The live transmission in progress.
@@ -477,7 +507,8 @@ impl TxPanel {
             let edit = ui.add(
                 egui::TextEdit::multiline(&mut self.message)
                     .desired_rows(3)
-                    .desired_width(300.0)
+                    // As wide as the grid's column leaves, up to 300.
+                    .desired_width(ui.available_width().clamp(160.0, 300.0))
                     .hint_text("type a message, or press CQ"),
             );
             if edit.changed() {
@@ -698,7 +729,7 @@ impl TxPanel {
         );
         if self.voice_summary.as_ref().is_none_or(|(k, _)| *k != key) {
             let result = plan_voice(&spec, &clip.pcm).map(|p| {
-                format!(
+                let s = format!(
                     "{:.1} s of speech → {} frames, {:.0} s of signal; the payload runs at {:.2}× the codec's rate{}",
                     p.speech_seconds,
                     p.frames,
@@ -709,12 +740,13 @@ impl TxPanel {
                     } else {
                         ""
                     }
-                )
+                );
+                (s, Timeline::of_segments(&p.segments))
             });
             self.voice_summary = Some((key, result));
         }
         match self.voice_summary.as_ref().map(|(_, r)| r) {
-            Some(Ok(s)) => {
+            Some(Ok((s, _))) => {
                 ui.label(RichText::new(s).size(11.0));
             }
             Some(Err(e)) => {
@@ -891,7 +923,7 @@ impl TxPanel {
         if !self.vox {
             return audio;
         }
-        let mut v = vox_lead(f64::from(rate), self.level, 0.4, 0.3);
+        let mut v = vox_lead(f64::from(rate), self.level, VOX_TONE_S, VOX_GAP_S);
         v.extend(audio);
         v
     }
@@ -1029,7 +1061,8 @@ impl TxPanel {
         }
     }
 
-    /// The transmit controls, drawn into `ui`.
+    /// The transmit controls, and beside them (under them in a narrow panel) what
+    /// goes on air, then Play and Save.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -1040,13 +1073,51 @@ impl TxPanel {
         listen: &(Option<String>, u32),
     ) {
         ui.label(
-                    RichText::new(
-                        "Plays audio to a sound card (or saves a WAV). You key the radio. \
-                         Spread spectrum is restricted on HF in some countries: check your licence.",
-                    )
-                    .weak()
-                    .size(11.0),
-                );
+            RichText::new(
+                "Plays audio to a sound card (or saves a WAV). You key the radio. \
+                 Spread spectrum is restricted on HF in some countries: check your licence.",
+            )
+            .weak()
+            .size(11.0),
+        );
+        let avail = ui.available_width();
+        if avail >= TWO_COLUMNS {
+            let gap = 2.0 * ui.spacing().item_spacing.x;
+            let left = (avail * 0.5).min(460.0);
+            let right = (avail - left - gap).min(560.0);
+            let top_down = egui::Layout::top_down(egui::Align::Min);
+            // `horizontal_top` lines the two columns up at their tops; each is a
+            // top-down `Ui` of its own, as wide as asked and as tall as it needs.
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(egui::vec2(left, 0.0), top_down, |ui| {
+                    ui.set_width(left);
+                    self.controls(ui, engine, devices_out, devices_in, listen);
+                });
+                ui.add_space(gap);
+                ui.allocate_ui_with_layout(egui::vec2(right, 0.0), top_down, |ui| {
+                    ui.set_width(right);
+                    self.preview(ui);
+                });
+            });
+        } else {
+            self.controls(ui, engine, devices_out, devices_in, listen);
+            ui.add_space(6.0);
+            self.preview(ui);
+        }
+        ui.separator();
+        self.actions(ui, engine, state, devices_out);
+    }
+
+    /// What to send and how: the grid of settings, and the speech controls when
+    /// sending voice.
+    fn controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        engine: &Engine,
+        devices_out: &[(String, u32)],
+        devices_in: &[String],
+        listen: &(Option<String>, u32),
+    ) {
         egui::Grid::new("txgrid").num_columns(2).show(ui, |ui| {
             ui.label(if self.voice {
                 "Speech"
@@ -1132,9 +1203,10 @@ impl TxPanel {
                 &mut self.vox,
                 "a tone ahead of the signal, to key the radio",
             )
-            .on_hover_text(
-                "0.4 s of 1 kHz and a pause, so the radio is transmitting before the preamble",
-            );
+            .on_hover_text(format!(
+                "{VOX_TONE_S} s of 1 kHz and a {VOX_GAP_S} s pause, so the radio is \
+                 transmitting before the preamble"
+            ));
             ui.end_row();
             ui.label("Bandwidth");
             ui.horizontal(|ui| {
@@ -1147,7 +1219,7 @@ impl TxPanel {
                 ui.label("Slot");
                 ui.horizontal(|ui| {
                     for s in Slot::ALL {
-                        let hz = decdsss_core::Band::new(Profile::N500, s).centre_hz();
+                        let hz = Band::new(Profile::N500, s).centre_hz();
                         ui.selectable_value(
                             &mut self.slot,
                             s,
@@ -1170,20 +1242,8 @@ impl TxPanel {
             let family = current.map_or(Family::DsPsk, |m| m.family);
             ui.label("Spreading");
             ui.horizontal(|ui| {
-                for (f, label, tip) in [
-                    (
-                        Family::DsPsk,
-                        "DS-PSK",
-                        "Direct sequence: a QPSK symbol held for SF chips, coherent, pilot-aided",
-                    ),
-                    (
-                        Family::Csk,
-                        "CSK",
-                        "Code-shift keying: one of L Walsh codes of L chips, log2(L) bits a \
-                         symbol, noncoherent",
-                    ),
-                ] {
-                    if ui.radio(family == f, label).on_hover_text(tip).clicked()
+                for (f, label, tip) in FAMILIES {
+                    if ui.selectable_label(family == f, label).on_hover_text(tip).clicked()
                         && family != f
                         && let Some(m) = nearest_mode(f, current, self.profile)
                     {
@@ -1258,28 +1318,242 @@ impl TxPanel {
                 });
             ui.end_row();
         });
-        // A message goes out at depth 1: a deeper block would pad it with empty frames.
-        let depth = if self.text { 1 } else { self.depth };
-        if let Some(layout) =
-            Mode::from_name(&self.mode).map(|m| Layout::new(self.profile, m, depth))
-        {
-            ui.label(
-                RichText::new(format!(
-                    "{} data bytes a frame, {:.1} s a block",
-                    layout.frame_bytes(),
-                    layout.seconds()
-                ))
-                .weak()
-                .size(11.0),
-            );
-        }
-        if self.picture {
-            self.picture_status(ui);
-        }
         if self.voice {
             self.voice_section(ui, devices_in, engine, devices_out, listen);
         }
-        ui.separator();
+    }
+
+    /// What goes on air: where the signal sits in the audio passband, the
+    /// transmission to scale, the mode's rates and, for a picture, the picture.
+    fn preview(&mut self, ui: &mut egui::Ui) {
+        let band = self.band();
+        let (lo, hi) = band.edges_hz();
+        caption(ui, "Audio band", format!("{lo:.0}–{hi:.0} Hz"));
+        band_strip(ui, band).on_hover_text(format!(
+            "{} chip/s × (1 + {ROLLOFF} roll-off) = {:.0} Hz occupied, {lo:.0}–{hi:.0} Hz{}",
+            band.profile.chip_rate(),
+            band.profile.bandwidth_hz(),
+            if band.profile == Profile::N500 {
+                "; the outlines are the other two 500 Hz slots"
+            } else {
+                ""
+            }
+        ));
+        ui.add_space(8.0);
+        self.transmission(ui);
+        // A CQ packet is headers only, in its own mode: the mode's rates do not apply.
+        if !(self.text && self.cq_packet) {
+            ui.add_space(8.0);
+            self.rate_tiles(ui);
+        }
+        if self.picture {
+            ui.add_space(8.0);
+            self.picture_status(ui);
+        }
+    }
+
+    /// The transmission as set up, worked out without building it.
+    fn timeline(&self) -> Result<Timeline, NoTimeline> {
+        use NoTimeline::{Problem, Waiting};
+        if self.text && self.cq_packet {
+            let call = normalise_call(&self.call).ok_or(Waiting("enter your callsign"))?;
+            let copies = self.repeat.max(decdsss_link::cq::DEFAULT_COPIES);
+            let segs =
+                decdsss_link::cq::plan_cq(self.profile, &call, 0, copies).map_err(Problem)?;
+            return Timeline::of_segments(&segs).ok_or(Waiting("no copies to send"));
+        }
+        if self.voice {
+            if self.vp.clip.is_none() {
+                return Err(Waiting("record some speech or choose a WAV"));
+            }
+            // `voice_section` plans the speech when the clip or the settings change.
+            return match self.voice_summary.as_ref().map(|(_, r)| r) {
+                Some(Ok((_, Some(t)))) => Ok(t.clone()),
+                Some(Err(e)) => Err(Problem(e.clone())),
+                _ => Err(Waiting("planning the speech…")),
+            };
+        }
+        let mode = Mode::from_name(&self.mode).ok_or(Waiting("choose a mode"))?;
+        let spec = |ptype, depth| SendSpec {
+            profile: self.profile,
+            mode,
+            depth,
+            call: String::new(),
+            session: 0,
+            ptype,
+            resync_s: self.resync,
+            parity: self.parity / 100.0,
+            passes: self.repeat.max(1),
+        };
+        if self.text {
+            let text = decdsss_link::text::tidy(&self.message);
+            if text.is_empty() {
+                return Err(Waiting("type a message, or press CQ"));
+            }
+            // As `plan_text` sends it: at depth 1, in a container with no name.
+            let stream = container::pack("", text.as_bytes()).len();
+            return timeline(&spec(PayloadType::Text, 1), stream).map_err(Problem);
+        }
+        let path = self.file.as_ref().ok_or(Waiting("choose a file"))?;
+        let (stream, ptype) = if self.picture {
+            match (&self.pic_result, self.wanted_key()) {
+                (Some((k, Ok(p))), Some(want)) if *k == want => (
+                    container::pack(&p.name, &[]).len() + p.jpeg.len(),
+                    PayloadType::Picture,
+                ),
+                // `picture_status` says what is wrong with it.
+                (Some((k, Err(_))), Some(want)) if *k == want => {
+                    return Err(Waiting("no picture to send"));
+                }
+                _ => return Err(Waiting("preparing the picture…")),
+            }
+        } else {
+            let name = path
+                .file_name()
+                .map_or("file".to_string(), |n| n.to_string_lossy().into_owned());
+            let len = std::fs::metadata(path)
+                .map_err(|e| Problem(format!("{}: {e}", path.display())))?
+                .len();
+            // The container adds a fixed head and tail to the file (`container::pack`).
+            (
+                container::pack(&name, &[]).len() + len as usize,
+                PayloadType::File,
+            )
+        };
+        timeline(&spec(ptype, self.depth), stream).map_err(Problem)
+    }
+
+    /// The transmission to scale and what it adds up to.
+    fn transmission(&self, ui: &mut egui::Ui) {
+        let t = self.timeline();
+        let vox_s = if self.vox {
+            VOX_TONE_S + VOX_GAP_S
+        } else {
+            0.0
+        };
+        let total = t
+            .as_ref()
+            .map_or(String::new(), |t| air_time(vox_s + t.seconds()));
+        caption(ui, "Transmission", total);
+        let t = match t {
+            Ok(t) => t,
+            Err(NoTimeline::Waiting(why)) => {
+                ui.label(RichText::new(why).weak().size(11.0));
+                return;
+            }
+            Err(NoTimeline::Problem(e)) => {
+                ui.colored_label(col::BAD, RichText::new(e).size(11.0));
+                return;
+            }
+        };
+        let blocks: usize = t.segments.iter().sum();
+        let mut tip = format!(
+            "To scale. Preamble and header {:.2} s, × {}\n{blocks} blocks of {:.2} s\nPostamble {:.2} s",
+            t.lead_s,
+            t.segments.len(),
+            t.block_s,
+            t.eot_s
+        );
+        if vox_s > 0.0 {
+            tip = format!("{tip}\nVOX tone and pause {vox_s:.1} s");
+        }
+        timeline_bar(ui, &t, vox_s).on_hover_text(tip);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if vox_s > 0.0 {
+                swatch(ui, col::REF, "VOX");
+            }
+            swatch(ui, col::MARK, "preamble + header");
+            if t.frames > 0 {
+                swatch(ui, col::TRACE, "data");
+            }
+            if t.frames > t.data_frames {
+                swatch(ui, CODED, "coded");
+            }
+        });
+        let segments = match t.segments.len() {
+            1 => "1 segment".to_string(),
+            n => format!("{n} segments"),
+        };
+        let what = if t.frames == 0 {
+            // A CQ packet: each segment is one copy of the header.
+            match t.segments.len() {
+                1 => "one header, nothing after it".to_string(),
+                n => format!("{n} copies of the header, nothing after them"),
+            }
+        } else if t.frames == t.data_frames {
+            format!("{} frames in {segments}", t.frames)
+        } else {
+            let passes = t.frames / t.per_pass.max(1);
+            format!(
+                "{} data + {} coded frames in {segments}{}",
+                t.data_frames,
+                t.frames - t.data_frames,
+                if passes > 1 {
+                    format!(", {passes} passes")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        ui.label(RichText::new(what).size(11.0));
+    }
+
+    /// The mode's numbers: its information rate, the SNR it needs, a frame's data
+    /// and a block's length.
+    fn rate_tiles(&self, ui: &mut egui::Ui) {
+        let Some(m) = Mode::from_name(&self.mode) else {
+            return;
+        };
+        // A message goes out at depth 1: a deeper block would pad it with empty frames.
+        let depth = if self.text { 1 } else { self.depth };
+        let layout = Layout::new(self.profile, m, depth);
+        let rb = m.info_bit_rate(self.profile);
+        let (ebn0, measured) = m.ebn0_needed_db(self.profile);
+        let offset = m.snr_offset_db(self.profile);
+        // `columns` splits the width into equal parts, one `Ui` each.
+        ui.columns(4, |c| {
+            tile(
+                &mut c[0],
+                "info rate",
+                if rb >= 100.0 {
+                    format!("{rb:.0}")
+                } else {
+                    format!("{rb:.1}")
+                },
+                "bit/s",
+            )
+            .on_hover_text(format!(
+                "{}: the coded rate × the code rate, pilots taken out; preambles, headers \
+                 and CRCs come off this",
+                m.name()
+            ));
+            tile(&mut c[1], "needs SNR", format!("≈ {:.0}", ebn0 + offset), "dB").on_hover_text(
+                format!(
+                    "In the {} occupied width: Eb/N0 {ebn0:.1} dB ({}) + 10·log10(Rb / B) {offset:.1} dB",
+                    self.profile,
+                    if measured {
+                        "measured"
+                    } else {
+                        "not measured: 4 dB assumed"
+                    }
+                ),
+            );
+            tile(&mut c[2], "a frame", layout.frame_bytes().to_string(), "bytes")
+                .on_hover_text("Data bytes a frame carries");
+            tile(&mut c[3], "a block", format!("{:.1}", layout.seconds()), "s")
+                .on_hover_text(format!("{depth} frame(s) interleaved"));
+        });
+    }
+
+    /// Play and Save, the transmission under way, and what came of the last one.
+    fn actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        engine: &Engine,
+        state: &TxState,
+        devices_out: &[(String, u32)],
+    ) {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!state.active, |ui| {
                 if ui.button("▶ Play to the sound card").clicked() {
@@ -1322,7 +1596,7 @@ impl TxPanel {
                 if ui
                     .add(
                         egui::Button::new(RichText::new("■ Stop transmission").strong())
-                            .fill(crate::scope::col::BAD),
+                            .fill(col::BAD),
                     )
                     .clicked()
                 {
@@ -1333,12 +1607,191 @@ impl TxPanel {
             ui.label(RichText::new("stopped").weak());
         }
         if let Some(e) = &state.error {
-            ui.colored_label(crate::scope::col::BAD, e);
+            ui.colored_label(col::BAD, e);
         }
         if !self.note.is_empty() {
             ui.label(RichText::new(&self.note).size(11.0));
         }
     }
+}
+
+/// Why there is no transmission to draw.
+enum NoTimeline {
+    /// Nothing to send yet: what to do about it.
+    Waiting(&'static str),
+    /// What is set up cannot be sent.
+    Problem(String),
+}
+
+/// Coded frames: the data colour, paler (a dimmer one vanished into the panel).
+const CODED: Color32 = Color32::from_rgb(170, 216, 242);
+
+/// A small heading with a figure on the right of the same line.
+fn caption(ui: &mut egui::Ui, title: &str, figure: String) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).weak().size(11.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(figure).size(11.0));
+        });
+    });
+}
+
+/// Seconds as `43.2 s`, `2 min 23 s` or `1 h 38 min`.
+fn air_time(s: f64) -> String {
+    if s < 60.0 {
+        return format!("{s:.1} s");
+    }
+    let s = s.round() as u64;
+    if s < 3600 {
+        format!("{} min {:02} s", s / 60, s % 60)
+    } else {
+        let m = (s + 30) / 60;
+        format!("{} h {:02} min", m / 60, m % 60)
+    }
+}
+
+/// The audio passband from 0 to 3.5 kHz with `band` filled in, and for 500 Hz
+/// the other two slots outlined (where two more stations can go).
+fn band_strip(ui: &mut egui::Ui, band: Band) -> egui::Response {
+    const TOP_HZ: f64 = 3500.0;
+    let w = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(w, 40.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let x = |hz: f64| rect.left() + (hz / TOP_HZ) as f32 * rect.width();
+    let base = rect.top() + 24.0;
+    let span = |(a, b): (f64, f64), top: f32| {
+        egui::Rect::from_min_max(egui::pos2(x(a), top), egui::pos2(x(b), base))
+    };
+    if band.profile == Profile::N500 {
+        for s in Slot::ALL {
+            p.rect_stroke(
+                span(Band::new(Profile::N500, s).edges_hz(), rect.top() + 6.0),
+                2.0,
+                egui::Stroke::new(1.0, col::REF),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    let r = span(band.edges_hz(), rect.top() + 2.0);
+    p.rect_filled(r, 2.0, col::TRACE.gamma_multiply(0.35));
+    p.rect_stroke(
+        r,
+        2.0,
+        egui::Stroke::new(1.0, col::TRACE),
+        egui::StrokeKind::Inside,
+    );
+    let axis = egui::Stroke::new(1.0, col::AXIS);
+    p.line_segment(
+        [
+            egui::pos2(rect.left(), base),
+            egui::pos2(rect.right(), base),
+        ],
+        axis,
+    );
+    let weak = ui.visuals().weak_text_color();
+    for (hz, label, anchor) in [
+        (0.0, "0", egui::Align2::LEFT_TOP),
+        (1000.0, "1 kHz", egui::Align2::CENTER_TOP),
+        (2000.0, "2 kHz", egui::Align2::CENTER_TOP),
+        (3000.0, "3 kHz", egui::Align2::CENTER_TOP),
+    ] {
+        let at = x(hz);
+        p.line_segment([egui::pos2(at, base), egui::pos2(at, base + 3.0)], axis);
+        p.text(
+            egui::pos2(at, base + 4.0),
+            anchor,
+            label,
+            egui::FontId::proportional(11.0),
+            weak,
+        );
+    }
+    response
+}
+
+/// The transmission drawn to scale: the VOX tone, then each segment's preamble
+/// and header and its blocks (data frames first, then coded ones), then the
+/// postamble. The preambles and the postamble are drawn at least a pixel wide,
+/// so they show on a long transmission.
+fn timeline_bar(ui: &mut egui::Ui, t: &Timeline, vox_s: f64) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let px = f64::from(rect.width()) / (vox_s + t.seconds());
+    let piece = |from: f64, secs: f64, colour: Color32, min_px: f32| {
+        let x0 = rect.left() + (from * px) as f32;
+        let x1 = (rect.left() + ((from + secs) * px) as f32).max(x0 + min_px);
+        p.rect_filled(
+            egui::Rect::from_x_y_ranges(x0..=x1, rect.y_range()),
+            0.0,
+            colour,
+        );
+    };
+    if vox_s > 0.0 {
+        piece(0.0, vox_s, col::REF, 1.0);
+    }
+    // The bodies first, then the leads over them, so a lead widened to a pixel
+    // is not painted over by the block after it.
+    let mut leads = Vec::with_capacity(t.segments.len() + 1);
+    let (mut at, mut frame0) = (vox_s, 0usize);
+    for &n in &t.segments {
+        leads.push(at);
+        at += t.lead_s;
+        let body = n as f64 * t.block_s;
+        // Frames go `depth` to a block, the data ones first.
+        let data =
+            (t.data_frames.saturating_sub(frame0) as f64 / t.depth as f64 * t.block_s).min(body);
+        if data > 0.0 {
+            piece(at, data, col::TRACE, 0.0);
+        }
+        if body > data {
+            piece(at + data, body - data, CODED, 0.0);
+        }
+        at += body;
+        frame0 += n * t.depth;
+    }
+    for &from in &leads {
+        piece(from, t.lead_s, col::MARK, 1.0);
+    }
+    piece(at, t.eot_s, col::MARK, 1.0);
+    // Headers back to back (a CQ's copies) would run together: a hairline where
+    // one segment with no blocks ends and the next begins.
+    let line = egui::Stroke::new(1.0, ui.visuals().panel_fill);
+    for (i, &from) in leads.iter().enumerate().skip(1) {
+        if t.segments[i - 1] == 0 {
+            let x = rect.left() + (from * px) as f32;
+            p.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                line,
+            );
+        }
+    }
+    response
+}
+
+/// A legend entry: a square of `colour` and what it stands for.
+fn swatch(ui: &mut egui::Ui, colour: Color32, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 1.0, colour);
+    ui.label(RichText::new(text).weak().size(11.0));
+    ui.add_space(6.0);
+}
+
+/// A figure with a small label over it and its unit after it.
+fn tile(ui: &mut egui::Ui, label: &str, value: String, unit: &str) -> egui::Response {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(label).weak().size(11.0));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.label(RichText::new(value).strong().size(15.0));
+                ui.label(RichText::new(unit).size(11.0));
+            });
+        })
+        .response
 }
 
 #[cfg(test)]
@@ -1347,6 +1800,13 @@ mod tests {
 
     fn m(s: &str) -> Mode {
         Mode::from_name(s).unwrap()
+    }
+
+    #[test]
+    fn air_times_read_in_the_largest_sensible_unit() {
+        assert_eq!(air_time(43.21), "43.2 s");
+        assert_eq!(air_time(143.0), "2 min 23 s");
+        assert_eq!(air_time(5879.0), "1 h 38 min");
     }
 
     #[test]
