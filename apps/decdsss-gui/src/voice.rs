@@ -184,6 +184,17 @@ impl VoicePanel {
             .map_or(0, |i| i + 1);
     }
 
+    /// Keeps the microphone on the same card after the device list changed (a new audio API).
+    pub fn remap_mic(&mut self, old: &[String], new: &[String]) {
+        self.mic = self
+            .mic
+            .checked_sub(1)
+            .and_then(|i| old.get(i))
+            .map_or(0, |n| {
+                crate::app::matching_device(new.iter().map(String::as_str), n)
+            });
+    }
+
     /// The microphone chosen for recording (None: the default).
     pub fn mic_name(&self, devices_in: &[String]) -> Option<String> {
         self.mic

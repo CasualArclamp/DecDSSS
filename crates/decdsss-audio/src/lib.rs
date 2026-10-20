@@ -21,6 +21,8 @@
 pub mod channels;
 mod device;
 mod error;
+#[cfg(windows)]
+mod mme;
 pub mod stream;
 pub mod wav;
 
@@ -29,7 +31,7 @@ use std::time::Duration;
 
 pub use device::{
     ConfigRange, DeviceInfo, HOST_ENV, available_hosts, default_device_name, host_name,
-    list_devices, list_input_devices, list_output_devices,
+    list_devices, list_input_devices, list_output_devices, set_host,
 };
 pub use error::{Error, Result};
 pub use stream::{

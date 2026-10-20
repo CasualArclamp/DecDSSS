@@ -100,7 +100,7 @@ pub(crate) struct ErrorSink {
 }
 
 impl ErrorSink {
-    fn report(&mut self, err: cpal::Error) {
+    pub(crate) fn report(&mut self, err: cpal::Error) {
         match err.kind() {
             cpal::ErrorKind::Xrun => {
                 self.health.xruns.fetch_add(1, Relaxed);
@@ -115,6 +115,33 @@ impl ErrorSink {
                 // Drop the error if the queue is full: the owner is not polling anyway.
                 let _ = self.queue.push(err);
             }
+        }
+    }
+}
+
+/// The running device stream behind an [`InputStream`] / [`OutputStream`]: a cpal stream
+/// (WASAPI, ALSA, PipeWire) or, on Windows, our own MME one. An `enum` is Rust's closed
+/// "one of these" type; each method just forwards to whichever variant is held.
+enum Backend {
+    Cpal(cpal::Stream),
+    #[cfg(windows)]
+    Mme(crate::mme::MmeStream),
+}
+
+impl Backend {
+    fn play(&self) -> Result<()> {
+        match self {
+            Backend::Cpal(s) => Ok(s.play()?),
+            #[cfg(windows)]
+            Backend::Mme(s) => s.play(),
+        }
+    }
+
+    fn pause(&self) -> Result<()> {
+        match self {
+            Backend::Cpal(s) => Ok(s.pause()?),
+            #[cfg(windows)]
+            Backend::Mme(s) => s.pause(),
         }
     }
 }
@@ -261,7 +288,7 @@ impl Capturer {
 /// ```
 pub struct InputStream {
     // Declared first so it is dropped (device stopped) before the buffers.
-    stream: Option<cpal::Stream>,
+    stream: Option<Backend>,
     consumer: Consumer<f32>,
     shared: Arc<InputShared>,
     health: Arc<StreamHealth>,
@@ -278,6 +305,10 @@ impl InputStream {
     /// normalised `f32` in the callback. If the preferred rate or channel count is not
     /// supported, the closest supported configuration is used — check [`format`](Self::format).
     pub fn open(opts: &InputOptions) -> Result<Self> {
+        #[cfg(windows)]
+        if crate::device::use_mme() {
+            return Self::open_mme(opts);
+        }
         let device = find_device(Direction::Input, opts.device.as_deref())?;
         let chosen = choose_config(&device, Direction::Input, opts.sample_rate, opts.channels)?;
         let format = chosen.format();
@@ -285,8 +316,23 @@ impl InputStream {
         let (mut this, capturer, sink) = Self::parts(format, capacity);
         let stream = build_input(&device, chosen, capturer, sink)?;
         stream.play()?;
-        this.stream = Some(stream);
+        this.stream = Some(Backend::Cpal(stream));
         this.device_name = device_name(&device);
+        Ok(this)
+    }
+
+    /// [`open`](Self::open) through the MME backend (Windows). Its streams start running
+    /// as soon as they are open.
+    #[cfg(windows)]
+    fn open_mme(opts: &InputOptions) -> Result<Self> {
+        let device = crate::mme::find_device(Direction::Input, opts.device.as_deref())?;
+        let format =
+            crate::mme::choose_format(Direction::Input, &device, opts.sample_rate, opts.channels)?;
+        let capacity = format.duration_to_frames(opts.buffer).max(4096) as usize;
+        let (mut this, capturer, sink) = Self::parts(format, capacity);
+        let stream = crate::mme::open_input(&device, format, capturer, sink)?;
+        this.stream = Some(Backend::Mme(stream));
+        this.device_name = device.name;
         Ok(this)
     }
 
@@ -406,18 +452,18 @@ impl InputStream {
 
     /// Pauses capture (if the backend supports it).
     pub fn pause(&self) -> Result<()> {
-        if let Some(s) = &self.stream {
-            s.pause()?;
+        match &self.stream {
+            Some(s) => s.pause(),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Resumes capture after [`pause`](Self::pause).
     pub fn play(&self) -> Result<()> {
-        if let Some(s) = &self.stream {
-            s.play()?;
+        match &self.stream {
+            Some(s) => s.play(),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -693,7 +739,7 @@ impl Renderer {
 /// resampling.
 pub struct OutputStream {
     // Declared first so it is dropped (device stopped) before the buffers.
-    stream: Option<cpal::Stream>,
+    stream: Option<Backend>,
     producer: Producer<f32>,
     shared: Arc<OutputShared>,
     health: Arc<StreamHealth>,
@@ -701,12 +747,23 @@ pub struct OutputStream {
     format: AudioFormat,
     device_name: String,
     capacity_frames: usize,
+    /// How long audio takes from the renderer to the speaker once the queue is empty:
+    /// what [`drain`](Self::drain) waits out before the caller may stop the device.
+    tail: Duration,
 }
+
+/// The wait [`OutputStream::drain`] adds after the queue empties on a cpal stream (the
+/// last callback's worth).
+const CPAL_TAIL: Duration = Duration::from_millis(50);
 
 impl OutputStream {
     /// Opens and starts a playback stream. It plays silence until
     /// [`OutputOptions::start_threshold`] worth of audio has been queued.
     pub fn open(opts: &OutputOptions) -> Result<Self> {
+        #[cfg(windows)]
+        if crate::device::use_mme() {
+            return Self::open_mme(opts);
+        }
         let device = find_device(Direction::Output, opts.device.as_deref())?;
         let chosen = choose_config(&device, Direction::Output, opts.sample_rate, opts.channels)?;
         let format = chosen.format();
@@ -715,8 +772,25 @@ impl OutputStream {
         let (mut this, renderer, sink) = Self::parts(format, capacity, threshold);
         let stream = build_output(&device, chosen, renderer, sink)?;
         stream.play()?;
-        this.stream = Some(stream);
+        this.stream = Some(Backend::Cpal(stream));
         this.device_name = device_name(&device);
+        Ok(this)
+    }
+
+    /// [`open`](Self::open) through the MME backend (Windows).
+    #[cfg(windows)]
+    fn open_mme(opts: &OutputOptions) -> Result<Self> {
+        let device = crate::mme::find_device(Direction::Output, opts.device.as_deref())?;
+        let format =
+            crate::mme::choose_format(Direction::Output, &device, opts.sample_rate, opts.channels)?;
+        let capacity = format.duration_to_frames(opts.buffer).max(4096) as usize;
+        let threshold = format.duration_to_frames(opts.start_threshold) as usize;
+        let (mut this, renderer, sink) = Self::parts(format, capacity, threshold);
+        let stream = crate::mme::open_output(&device, format, renderer, sink)?;
+        // MME holds several blocks queued ahead of the speaker; drain must wait them out.
+        this.tail = stream.latency() + CPAL_TAIL;
+        this.stream = Some(Backend::Mme(stream));
+        this.device_name = device.name;
         Ok(this)
     }
 
@@ -754,6 +828,7 @@ impl OutputStream {
             format,
             device_name: String::new(),
             capacity_frames,
+            tail: CPAL_TAIL,
         };
         (stream, renderer, sink)
     }
@@ -884,9 +959,9 @@ impl OutputStream {
             std::thread::sleep(nap(queued, self.format.sample_rate, deadline));
         };
         if drained {
-            // Let the device play the last callback's worth before the caller stops it.
+            // Let the device play what is already queued in it before the caller stops it.
             let rest = deadline.saturating_duration_since(Instant::now());
-            std::thread::sleep(Duration::from_millis(50).min(rest));
+            std::thread::sleep(self.tail.min(rest));
         }
         self.shared.draining.store(false, Relaxed);
         drained
@@ -904,18 +979,18 @@ impl OutputStream {
 
     /// Pauses playback (if the backend supports it).
     pub fn pause(&self) -> Result<()> {
-        if let Some(s) = &self.stream {
-            s.pause()?;
+        match &self.stream {
+            Some(s) => s.pause(),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Resumes playback after [`pause`](Self::pause).
     pub fn play(&self) -> Result<()> {
-        if let Some(s) = &self.stream {
-            s.play()?;
+        match &self.stream {
+            Some(s) => s.play(),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Pushes whole frames without blocking; returns frames pushed.

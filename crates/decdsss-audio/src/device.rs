@@ -2,6 +2,8 @@
 // Copied from COFDMtv's `cofdmtv-io` (same author), itself from DecDRM's `decdrm-io`.
 //! Sound-card enumeration and stream-configuration selection (cpal).
 
+use std::sync::Mutex;
+
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{SampleFormat, SupportedStreamConfig, SupportedStreamConfigRange};
 
@@ -85,29 +87,79 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
 }
 
 /// Environment variable that names the audio host to use instead of the default, e.g.
-/// `DECDSSS_AUDIO_HOST=alsa` to bypass PipeWire. Case-insensitive; see [`available_hosts`].
+/// `DECDSSS_AUDIO_HOST=wasapi` on Windows or `=alsa` to bypass PipeWire on Linux.
+/// Case-insensitive; see [`available_hosts`]. [`set_host`] takes precedence.
 pub const HOST_ENV: &str = "DECDSSS_AUDIO_HOST";
 
-/// Name of the audio host in use: [`HOST_ENV`] if it is set, else the platform default
-/// (WASAPI on Windows; on Linux PipeWire when its daemon is running, otherwise ALSA).
+/// The host chosen by [`set_host`], if any (it wins over [`HOST_ENV`]).
+static HOST_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Chooses the audio host for everything opened or listed from now on (`None`: back to
+/// [`HOST_ENV`] and the default). Streams already running keep the host they were opened on.
+/// An unknown name makes the listing and open functions fail with the available hosts named.
+pub fn set_host(name: Option<&str>) {
+    let name = name.map(str::trim).filter(|n| !n.is_empty());
+    // A poisoned lock only means another thread panicked holding it; the value is plain data.
+    *HOST_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = name.map(str::to_string);
+}
+
+/// The host asked for, by [`set_host`] or [`HOST_ENV`].
+fn wanted_host() -> Option<String> {
+    if let Some(name) = HOST_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return Some(name);
+    }
+    std::env::var(HOST_ENV)
+        .ok()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+}
+
+/// Whether `name` is MME (WinMM), which only exists on Windows.
+fn is_mme(name: &str) -> bool {
+    cfg!(windows) && (name.eq_ignore_ascii_case("mme") || name.eq_ignore_ascii_case("winmm"))
+}
+
+/// Whether streams and listings go through our own MME backend rather than cpal. On
+/// Windows that is the default; WASAPI is one [`set_host`] or [`HOST_ENV`] away.
+pub(crate) fn use_mme() -> bool {
+    cfg!(windows) && wanted_host().is_none_or(|w| is_mme(&w))
+}
+
+/// Name of the audio host in use: the one asked for with [`set_host`] or [`HOST_ENV`], else
+/// the platform default (MME on Windows; on Linux PipeWire when its daemon is running,
+/// otherwise ALSA).
 pub fn host_name() -> Result<String> {
+    if use_mme() {
+        return Ok("MME".to_string());
+    }
     Ok(audio_host()?.id().name().to_string())
 }
 
-/// Names of the audio hosts this build can reach right now, e.g. `["PipeWire", "ALSA"]`.
+/// Names of the audio hosts this build can reach right now, in the order a picker should
+/// list them: `["MME", "WASAPI"]` on Windows, e.g. `["PipeWire", "ALSA"]` on Linux.
 pub fn available_hosts() -> Vec<String> {
-    cpal::available_hosts()
-        .into_iter()
-        .map(|id| id.name().to_string())
-        .collect()
+    let mut hosts = Vec::new();
+    if cfg!(windows) {
+        hosts.push("MME".to_string());
+    }
+    hosts.extend(
+        cpal::available_hosts()
+            .into_iter()
+            .map(|id| id.name().to_string()),
+    );
+    hosts
 }
 
-/// The audio host every function here goes through: the one named by [`HOST_ENV`], or cpal's
-/// default for the platform.
+/// The cpal audio host every cpal path here goes through: the one asked for, or cpal's
+/// default for the platform. (MME is not a cpal host; see [`use_mme`].)
 fn audio_host() -> Result<cpal::Host> {
     quiet_alsa();
-    match std::env::var(HOST_ENV) {
-        Ok(want) if !want.trim().is_empty() => host_by_name(want.trim()),
+    match wanted_host() {
+        Some(want) if !is_mme(&want) => host_by_name(&want),
         _ => Ok(cpal::default_host()),
     }
 }
@@ -137,6 +189,10 @@ fn host_by_name(want: &str) -> Result<cpal::Host> {
 /// Lists the devices of one direction on the audio host in use (see [`host_name`]). A machine
 /// without sound cards yields an empty list, not an error.
 pub fn list_devices(direction: Direction) -> Result<Vec<DeviceInfo>> {
+    #[cfg(windows)]
+    if use_mme() {
+        return Ok(crate::mme::list(direction));
+    }
     let host = audio_host()?;
     let host_name = host.id().name().to_string();
     // On WASAPI the default device is a special handle that follows the system default (and
@@ -184,6 +240,10 @@ pub fn list_devices(direction: Direction) -> Result<Vec<DeviceInfo>> {
 
 /// Name of the system default device of `direction`, if there is one.
 pub fn default_device_name(direction: Direction) -> Option<String> {
+    #[cfg(windows)]
+    if use_mme() {
+        return crate::mme::default_device_name(direction);
+    }
     let host = audio_host().ok()?;
     default_device(&host, direction).map(|d| device_name(&d))
 }
@@ -247,35 +307,47 @@ pub(crate) fn find_device(direction: Direction, name: Option<&str>) -> Result<cp
         Direction::Input => host.input_devices()?.collect(),
         Direction::Output => host.output_devices()?.collect(),
     };
-    let mut named: Vec<(String, cpal::Device)> =
-        devices.into_iter().map(|d| (device_name(&d), d)).collect();
+    let items = devices
+        .into_iter()
+        .map(|d| (device_name(&d), d.id().ok().map(|id| id.to_string()), d))
+        .collect();
+    pick_by_name(direction, items, wanted)
+}
 
-    if let Some(i) = named.iter().position(|(n, d)| {
-        n == wanted || d.id().map(|id| id.to_string() == wanted).unwrap_or(false)
-    }) {
-        return Ok(named.swap_remove(i).1);
+/// Picks the entry of `items` (name, backend id, device) that `wanted` names: an exact name
+/// or id match wins, then a unique case-insensitive substring of the name.
+pub(crate) fn pick_by_name<T>(
+    direction: Direction,
+    mut items: Vec<(String, Option<String>, T)>,
+    wanted: &str,
+) -> Result<T> {
+    if let Some(i) = items
+        .iter()
+        .position(|(n, id, _)| n == wanted || id.as_deref() == Some(wanted))
+    {
+        return Ok(items.swap_remove(i).2);
     }
     let lower = wanted.to_lowercase();
-    let hits: Vec<usize> = named
+    let hits: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, (n, _))| n.to_lowercase().contains(&lower))
+        .filter(|(_, (n, _, _))| n.to_lowercase().contains(&lower))
         .map(|(i, _)| i)
         .collect();
     let list = |idx: &mut dyn Iterator<Item = usize>| {
-        idx.map(|i| named[i].0.as_str())
+        idx.map(|i| items[i].0.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     };
     match hits.as_slice() {
         [i] => {
             let i = *i;
-            Ok(named.swap_remove(i).1)
+            Ok(items.swap_remove(i).2)
         }
         [] => Err(Error::DeviceNotFound {
             direction,
             name: wanted.to_string(),
-            available: list(&mut (0..named.len())),
+            available: list(&mut (0..items.len())),
         }),
         many => Err(Error::AmbiguousDevice {
             direction,
@@ -357,16 +429,8 @@ pub(crate) fn choose_config(
         .iter()
         .map(|r| {
             let rate = pick_rate(r.min_sample_rate(), r.max_sample_rate(), want_rate);
-            let ch = usize::from(r.channels());
-            let ch_cost = if ch == want_ch {
-                0
-            } else if ch > want_ch {
-                ch - want_ch
-            } else {
-                1000 + (want_ch - ch)
-            };
             let score = (
-                ch_cost,
+                channel_cost(usize::from(r.channels()), want_ch),
                 rate_cost(rate, want_rate),
                 format_rank(r.sample_format()),
             );
@@ -417,9 +481,21 @@ fn pick_rate(min: u32, max: u32, want: u32) -> u32 {
         .unwrap_or(max)
 }
 
+/// Exact channel count is free; extra channels cost one each (the caller downmixes); too few
+/// cost far more (an I/Q input must have two).
+pub(crate) fn channel_cost(have: usize, want: usize) -> usize {
+    if have == want {
+        0
+    } else if have > want {
+        have - want
+    } else {
+        1000 + (want - have)
+    }
+}
+
 /// Exact match is free; a higher rate costs a little (resampling, but no bandwidth lost); a
 /// lower rate costs more (bandwidth lost).
-fn rate_cost(rate: u32, want: u32) -> f64 {
+pub(crate) fn rate_cost(rate: u32, want: u32) -> f64 {
     let (r, w) = (f64::from(rate), f64::from(want.max(1)));
     if rate == want {
         0.0
@@ -448,6 +524,47 @@ mod tests {
             "{err}"
         );
         assert!(available_hosts().iter().any(|h| h == default));
+    }
+
+    #[test]
+    fn names_pick_exact_then_unique_part() {
+        let items = || {
+            vec![
+                (
+                    "CABLE-A Input (VB-Audio Cable A".to_string(),
+                    Some("id-a".to_string()),
+                    1,
+                ),
+                ("CABLE-B Input (VB-Audio Cable B".to_string(), None, 2),
+                ("Speakers".to_string(), None, 3),
+                ("Speakers 2".to_string(), None, 4),
+            ]
+        };
+        let out = Direction::Output;
+        assert_eq!(pick_by_name(out, items(), "cable-b input").unwrap(), 2);
+        assert_eq!(pick_by_name(out, items(), "id-a").unwrap(), 1);
+        // An exact name wins even when it is also part of another name.
+        assert_eq!(pick_by_name(out, items(), "Speakers").unwrap(), 3);
+        assert!(matches!(
+            pick_by_name(out, items(), "Input"),
+            Err(Error::AmbiguousDevice { .. })
+        ));
+        assert!(matches!(
+            pick_by_name(out, items(), "nothing"),
+            Err(Error::DeviceNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn mme_is_only_a_host_on_windows() {
+        assert_eq!(is_mme("MME"), cfg!(windows));
+        assert_eq!(is_mme("winmm"), cfg!(windows));
+        assert!(!is_mme("wasapi"));
+        assert_eq!(
+            available_hosts().first().map(String::as_str) == Some("MME"),
+            cfg!(windows),
+            "MME is listed first"
+        );
     }
 
     #[test]

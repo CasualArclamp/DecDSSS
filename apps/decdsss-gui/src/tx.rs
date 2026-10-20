@@ -2,6 +2,7 @@
 //! The transmit window: a file in, audio out (to a sound card or a WAV).
 //! DecDSSS never keys a transmitter; it plays audio and you do the rest.
 
+use crate::app::matching_device;
 use crate::engine::{Cmd, Engine, TxState};
 use crate::live::{LiveConfig, LiveTxSession, Phase};
 use crate::prefs::Prefs;
@@ -773,6 +774,25 @@ impl TxPanel {
             }
             None => {}
         }
+    }
+
+    /// After the audio API changed and the device lists with it: keeps the transmit output
+    /// and the microphone on the same cards (the lists are indexed, so the numbers moved).
+    pub fn remap_devices(
+        &mut self,
+        old_out: &[(String, u32)],
+        new_out: &[(String, u32)],
+        old_in: &[String],
+        new_in: &[String],
+    ) {
+        self.device = self
+            .device
+            .checked_sub(1)
+            .and_then(|i| old_out.get(i))
+            .map_or(0, |d| {
+                matching_device(new_out.iter().map(|d| d.0.as_str()), &d.0)
+            });
+        self.vp.remap_mic(old_in, new_in);
     }
 
     pub fn remember(&self, p: &mut Prefs) {

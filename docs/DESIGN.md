@@ -715,12 +715,27 @@ takes the picture from inside the window, for unattended checks.
 
 ## Radio I/O
 
-Sound card in and out (cpal), with VOX or manual PTT, or the transmitter keyed by
-the program (below). Files: WAV (mono audio, or stereo as I/Q) and raw `cf32`.
-Live tests go through VB-Audio cable A, which is silent.
+Sound card in and out (cpal, and MME on Windows), with VOX or manual PTT, or the
+transmitter keyed by the program (below). Files: WAV (mono audio, or stereo as I/Q)
+and raw `cf32`. Live tests go through VB-Audio cable A, which is silent.
 
-**Linux audio:** cpal reaches the sound card through WASAPI on Windows and, on
-Linux, through PipeWire or ALSA. The `pipewire` feature of `decdsss-audio`
+**Windows audio:** MME (WinMM `waveIn`/`waveOut`) is the default; cpal has no MME
+backend, so `decdsss-audio/src/mme.rs` is ours: 20 ms blocks (8 on capture, 6 on
+playback) on an event-driven worker thread that feeds the same lock-free
+`Capturer`/`Renderer` halves as the cpal path, 16-bit PCM on the wire. WASAPI (cpal) is
+one choice away: the GUI's AUDIO card lists MME first, then WASAPI, and
+`DECDSSS_AUDIO_HOST=wasapi` does it for the CLI. A rate that is asked for is tried as
+asked, and Windows converts to the device's own rate, so any time base opens: measured
+2026-10-20 through cable A, a 1 kHz tone played at each of 8, 11.025, 16, 22.05, 32, 44.1,
+48, 88.2, 96, 176.4 and 192 kHz came back at 1 kHz, and so did mismatched pairs (48 kHz
+out / 44.1 kHz in, 44.1 / 96, 96 / 8, 16 / 48): `cargo test -p decdsss-audio --test
+mme_live -- --ignored`. Without a rate asked for the device runs at 48 kHz, stereo if it
+takes it. MME cuts device names at 31 characters ("CABLE-A Input (VB-Audio Virtual"),
+so match by a unique part of the name; a name saved under one API is matched to the
+other's by prefix. Playback sits 120 ms behind the renderer (`OutputStream::drain` waits
+it out before the key is let go).
+
+**Linux audio:** cpal reaches the sound card through PipeWire or ALSA. The `pipewire` feature of `decdsss-audio`
 (default on in both apps) adds the PipeWire host, which cpal then prefers when a
 PipeWire daemon is running; with no daemon, or built `--no-default-features`, it
 is ALSA. `DECDSSS_AUDIO_HOST=alsa` (or `pipewire`) forces one, and `decdsss
@@ -854,7 +869,7 @@ text, a choice of size or speed (a slow waterfall, such as WSJT-X's, needs a row
 | `decdsss-link` | File container, sender planning (erasure-coded frames, segments, passes, air time and byte budget), voice framing, receive-side assembly (the readable front of a file still arriving, speech so far). |
 | `decdsss-codec2` | Codec2 (vendored C core, LGPL-2.1) with a safe wrapper: modes 3200 … 450, bit-exact frame packing. |
 | `decdsss-image` | Pictures: load, scale and compress to a byte budget as a progressive JPEG; decode one that is cut short. |
-| `decdsss-audio` | Sound-card capture and playback (cpal: WASAPI, PipeWire, ALSA) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
+| `decdsss-audio` | Sound-card capture and playback (MME of our own on Windows; cpal: WASAPI, PipeWire, ALSA) and WAV files; copied from COFDMtv's `cofdmtv-io`. |
 | `decdsss-rig` | Transmitter keying: CAT (IC-7300, FT-710, Hamlib `rigctld`) and DTR/RTS, on a thread that owns the rig. |
 | `apps/decdsss-cli` | `decdsss`: modes, devices, tx, rx, channel, sweep. |
 | `apps/decdsss-gui` | `decdsss-gui`: the window above. |

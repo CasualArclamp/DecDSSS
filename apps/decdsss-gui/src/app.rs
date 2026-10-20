@@ -109,6 +109,9 @@ pub struct App {
     devices_in: Vec<String>,
     /// Output devices with the rate each runs at.
     devices_out: Vec<(String, u32)>,
+    /// The audio APIs on offer (MME first, then WASAPI) and the one in use.
+    audio_hosts: Vec<String>,
+    audio_host: String,
     device_in: usize,
     details: bool,
     prefs: Prefs,
@@ -175,6 +178,44 @@ pub struct App {
 /// goes at once.
 const STATION_LINGER: Duration = Duration::from_secs(5);
 
+/// The sound cards of the audio API in use: inputs by name, outputs by name and the rate
+/// each runs at.
+fn list_devices_now() -> (Vec<String>, Vec<(String, u32)>) {
+    let devices_in = list_input_devices()
+        .map(|v| v.into_iter().map(|d| d.name).collect())
+        .unwrap_or_default();
+    let devices_out = list_output_devices()
+        .map(|v| {
+            v.into_iter()
+                .map(|d| (d.name, d.default_format.map_or(48_000, |f| f.sample_rate)))
+                .collect()
+        })
+        .unwrap_or_default();
+    (devices_in, devices_out)
+}
+
+/// Where in a device list (1-based, 0 the system default) `name` is, found by name: the same
+/// name, else one that contains it or that it starts with. The second case is for a name
+/// from another audio API: MME cuts names at 31 characters, so "Speakers (Realtek High
+/// Definit" stands for "Speakers (Realtek High Definition Audio)". 0 when nothing matches.
+pub(crate) fn matching_device<'a>(
+    mut names: impl Iterator<Item = &'a str> + Clone,
+    name: &str,
+) -> usize {
+    let want = name.to_lowercase();
+    let lower = |n: &str| n.to_lowercase();
+    names
+        .clone()
+        .position(|n| lower(n) == want)
+        .or_else(|| {
+            names.position(|n| {
+                let n = lower(n);
+                !n.is_empty() && (n.contains(&want) || want.starts_with(&n))
+            })
+        })
+        .map_or(0, |i| i + 1)
+}
+
 fn default_out_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -192,22 +233,22 @@ impl App {
         bands: Option<[bool; 5]>,
         initial_device: Option<String>,
     ) -> App {
-        let devices_in: Vec<String> = list_input_devices()
-            .map(|v| v.into_iter().map(|d| d.name).collect())
-            .unwrap_or_default();
-        let devices_out: Vec<(String, u32)> = list_output_devices()
-            .map(|v| {
-                v.into_iter()
-                    .map(|d| (d.name, d.default_format.map_or(48_000, |f| f.sample_rate)))
-                    .collect()
-            })
-            .unwrap_or_default();
         let prefs = if auto.screenshot.is_some() {
             // Unattended runs neither take nor overwrite what the user last had.
             Prefs::default()
         } else {
             Prefs::load()
         };
+        // The audio API comes before the device lists, which depend on it. The first run
+        // (or an API this build no longer has) gets the library's default: MME on Windows.
+        let audio_hosts = decdsss_audio::available_hosts();
+        if let Some(h) = prefs.get("audio_api")
+            && audio_hosts.iter().any(|a| a == h)
+        {
+            decdsss_audio::set_host(Some(h));
+        }
+        let audio_host = decdsss_audio::host_name().unwrap_or_default();
+        let (devices_in, devices_out) = list_devices_now();
         let mut tx = TxPanel::default();
         tx.restore(&prefs);
         // The rig is looked for at once, so it is found by the first transmission.
@@ -250,12 +291,9 @@ impl App {
         let device_in = initial_device
             .as_deref()
             .or_else(|| prefs.get("device_in"))
-            .and_then(|n| {
-                devices_in
-                    .iter()
-                    .position(|d| d.to_lowercase().contains(&n.to_lowercase()))
-            })
-            .map_or(0, |i| i + 1);
+            .map_or(0, |n| {
+                matching_device(devices_in.iter().map(String::as_str), n)
+            });
         let monitor_volume = prefs
             .get("monitor_volume")
             .and_then(|v| v.parse().ok())
@@ -276,6 +314,8 @@ impl App {
             wav,
             devices_in,
             devices_out,
+            audio_hosts,
+            audio_host,
             device_in,
             details: false,
             prefs,
@@ -642,6 +682,12 @@ impl App {
             });
             frame(ui).show(ui, |ui| {
                 ui.vertical(|ui| {
+                    Self::caption(ui, "AUDIO");
+                    ui.horizontal(|ui| self.audio_api_controls(ui, sh));
+                });
+            });
+            frame(ui).show(ui, |ui| {
+                ui.vertical(|ui| {
                     Self::caption(ui, "BANDS");
                     ui.horizontal(|ui| self.band_checks(ui, sh, true));
                 });
@@ -671,6 +717,61 @@ impl App {
             });
         });
         ui.add_space(2.0);
+    }
+
+    /// The audio API the sound cards are reached through: the list offers MME first, then
+    /// WASAPI. Changing it re-lists the cards, so it waits while a run is going.
+    fn audio_api_controls(&mut self, ui: &mut Ui, sh: &Shared) {
+        let mut chosen = self.audio_host.clone();
+        ui.add_enabled_ui(!sh.running, |ui| {
+            egui::ComboBox::from_id_salt("audio_api")
+                .width(80.0)
+                .selected_text(chosen.clone())
+                .show_ui(ui, |ui| {
+                    for h in &self.audio_hosts {
+                        ui.selectable_value(&mut chosen, h.clone(), h);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "The Windows audio interface the sound cards are used through. MME takes \
+                     any sample rate and cuts device names short; WASAPI is the newer one.",
+                );
+        });
+        if chosen != self.audio_host {
+            self.switch_audio_host(chosen);
+        }
+    }
+
+    /// Moves to another audio API: lists its sound cards and keeps the input, the monitor
+    /// output, the transmit output and the microphone on the same cards where it has them.
+    fn switch_audio_host(&mut self, host: String) {
+        let old_in = std::mem::take(&mut self.devices_in);
+        let old_out = std::mem::take(&mut self.devices_out);
+        let name_of =
+            |list: &[String], i: usize| i.checked_sub(1).and_then(|i| list.get(i)).cloned();
+        let input = name_of(&old_in, self.device_in);
+        let monitor = self
+            .monitor_device
+            .checked_sub(1)
+            .and_then(|i| old_out.get(i))
+            .map(|d| d.0.clone());
+
+        decdsss_audio::set_host(Some(&host));
+        (self.devices_in, self.devices_out) = list_devices_now();
+        self.device_in = input.map_or(0, |n| {
+            matching_device(self.devices_in.iter().map(String::as_str), &n)
+        });
+        self.monitor_device = monitor.map_or(0, |n| {
+            matching_device(self.devices_out.iter().map(|d| d.0.as_str()), &n)
+        });
+        self.tx
+            .remap_devices(&old_out, &self.devices_out, &old_in, &self.devices_in);
+        self.audio_host = decdsss_audio::host_name().unwrap_or(host);
+        if self.auto.screenshot.is_none() {
+            self.prefs.set("audio_api", self.audio_host.clone());
+            self.prefs.save();
+        }
     }
 
     /// The CAT and PTT button, with a lamp: grey when the program keys nothing,
@@ -1916,5 +2017,39 @@ impl eframe::App for App {
                     self.band_view(ui, &sh);
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matching_device;
+
+    #[test]
+    fn devices_are_found_across_audio_apis() {
+        let wasapi = [
+            "Speakers (Realtek High Definition Audio)",
+            "CABLE-A Input (VB-Audio Cable A)",
+            "CABLE-B Input (VB-Audio Cable B)",
+        ];
+        // MME's name cut at 31 characters stands for the full WASAPI one, and back.
+        let mme = [
+            "Speakers (Realtek High Definit",
+            "CABLE-A Input (VB-Audio Cable A",
+        ];
+        let names = |l: &[&'static str]| l.to_vec();
+        assert_eq!(
+            matching_device(names(&mme).into_iter(), wasapi[1]),
+            2,
+            "WASAPI name into the MME list"
+        );
+        assert_eq!(
+            matching_device(names(&wasapi).into_iter(), mme[1]),
+            2,
+            "MME name into the WASAPI list"
+        );
+        // A hint is a part of the name, in any case; the exact name wins over a part.
+        assert_eq!(matching_device(names(&wasapi).into_iter(), "cable-b"), 3);
+        assert_eq!(matching_device(names(&wasapi).into_iter(), "nothing"), 0);
+        assert_eq!(matching_device(names(&["A", "A B"]).into_iter(), "A"), 1);
     }
 }
