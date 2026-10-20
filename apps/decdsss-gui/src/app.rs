@@ -1057,13 +1057,9 @@ impl App {
         }
     }
 
-    fn profile_section(
-        &mut self,
-        ui: &mut Ui,
-        snap: &Snapshot,
-        index: usize,
-        transfers: &[Transfer],
-    ) {
+    /// What the receivers are doing to find a station: the code search, then the
+    /// preamble and header of each candidate. The right-hand column.
+    fn search_section(&mut self, ui: &mut Ui, snap: &Snapshot, index: usize) {
         let n = snap.channels.len();
         let title = format!(
             "{}  ·  {}",
@@ -1086,53 +1082,104 @@ impl App {
                 for a in &snap.attempts {
                     attempt_card(ui, a, w);
                 }
-                // Open channels, live; stations whose segment has just ended, dimmed.
-                // A channel cleared while open stays hidden until it closes.
-                self.hidden
-                    .retain(|&(i, id)| i != index || snap.channels.iter().any(|c| c.id == id));
-                let shown: Vec<&ChannelView> = snap
-                    .channels
-                    .iter()
-                    .filter(|c| !self.hidden.contains(&(index, c.id)))
-                    .collect();
-                for c in &shown {
-                    self.stations.insert(
-                        (index, c.header.call.clone(), c.header.session),
-                        ((*c).clone(), Instant::now()),
-                    );
-                }
-                let live: Vec<(String, u8)> = shown
-                    .iter()
-                    .map(|c| (c.header.call.clone(), c.header.session))
-                    .collect();
-                // A closed channel's card goes once its transfer is finished, or
-                // when nothing more has come for `STATION_LINGER`.
-                self.stations.retain(|(i, call, session), (_, seen)| {
-                    if *i != index || live.contains(&(call.clone(), *session)) {
-                        return true;
+            });
+    }
+
+    /// Keeps the station cards up to date: open channels live, stations whose
+    /// segment has just ended dimmed. A channel cleared while open stays hidden
+    /// until it closes. A closed channel's card goes once its transfer is
+    /// finished, or when nothing more has come for `STATION_LINGER`. Returns the
+    /// cards to draw, each with whether its channel is open now.
+    fn track_stations(
+        &mut self,
+        snaps: &[Snapshot],
+        transfers: &[Transfer],
+    ) -> Vec<(ChannelView, bool)> {
+        let mut live: std::collections::HashSet<(usize, String, u8)> = Default::default();
+        for (i, snap) in snaps.iter().enumerate() {
+            let index = Band::ALL.iter().position(|b| *b == snap.band).unwrap_or(i);
+            self.hidden
+                .retain(|&(i, id)| i != index || snap.channels.iter().any(|c| c.id == id));
+            for c in snap
+                .channels
+                .iter()
+                .filter(|c| !self.hidden.contains(&(index, c.id)))
+            {
+                let key = (index, c.header.call.clone(), c.header.session);
+                self.stations
+                    .insert(key.clone(), (c.clone(), Instant::now()));
+                live.insert(key);
+            }
+        }
+        self.stations.retain(|key, (_, seen)| {
+            if live.contains(key) {
+                return true;
+            }
+            let (_, call, session) = key;
+            let finished = transfers
+                .iter()
+                .any(|t| t.call == *call && t.session == *session && (t.done || t.ended));
+            !finished && seen.elapsed() < STATION_LINGER
+        });
+        self.stations
+            .iter()
+            .map(|(key, (v, _))| (v.clone(), live.contains(key)))
+            .collect()
+    }
+
+    /// The running decoders: a card for every station being received, side by
+    /// side along the bottom of the centre column.
+    fn decoders_panel(
+        &mut self,
+        ui: &mut Ui,
+        cards: &[(ChannelView, bool)],
+        transfers: &[Transfer],
+    ) {
+        egui::Panel::bottom("decoders")
+            .resizable(true)
+            .default_size((ui.ctx().content_rect().height() * 0.36).clamp(240.0, 440.0))
+            .min_size(90.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Decoders").strong().size(15.0));
+                    if cards.is_empty() {
+                        ui.label(RichText::new("Nothing is being received.").weak());
                     }
-                    let finished = transfers
-                        .iter()
-                        .any(|t| t.call == *call && t.session == *session && (t.done || t.ended));
-                    !finished && seen.elapsed() < STATION_LINGER
+                    // Empties the strip: closed stations go, and open channels are
+                    // hidden until they close (the receiver goes on decoding them).
+                    if ui
+                        .add_enabled(
+                            !self.stations.is_empty(),
+                            egui::Button::new("Clear decoders"),
+                        )
+                        .on_hover_text("Remove every station card; a station shows again when its next segment starts")
+                        .clicked()
+                    {
+                        for ((i, _, _), (v, _)) in &self.stations {
+                            self.hidden.insert((*i, v.id));
+                        }
+                        self.stations.clear();
+                    }
                 });
-                let keep: Vec<(ChannelView, bool)> = self
-                    .stations
-                    .iter()
-                    .filter(|((i, _, _), _)| *i == index)
-                    .map(|((_, call, session), (v, _))| {
-                        (v.clone(), live.contains(&(call.clone(), *session)))
-                    })
-                    .collect();
                 // Every card shares one choice of plots: a tab clicked on any
                 // card changes them all, and is remembered.
                 let mut plots = self.card_plots;
-                for (c, is_live) in &keep {
-                    let tr = transfers
-                        .iter()
-                        .find(|t| t.call == c.header.call && t.session == c.header.session);
-                    channel_card(ui, c, tr, w, *is_live, &mut plots);
-                }
+                let plot_h = (ui.available_height() - CARD_CHROME_H).clamp(80.0, CARD_PLOT_H);
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            for (c, is_live) in cards {
+                                let tr = transfers.iter().find(|t| {
+                                    t.call == c.header.call && t.session == c.header.session
+                                });
+                                ui.vertical(|ui| {
+                                    ui.set_width(CARD_W);
+                                    channel_card(ui, c, tr, CARD_W, plot_h, *is_live, &mut plots);
+                                });
+                            }
+                        });
+                    });
                 if plots != self.card_plots {
                     self.card_plots = plots;
                     self.prefs.set("card_left", plots[0].key());
@@ -1594,9 +1641,10 @@ impl App {
         }
     }
 
-    /// The right-hand panel: every station being received, with its instruments.
-    fn stations_panel(&mut self, ui: &mut Ui, sh: &Shared) {
-        egui::Panel::right("stations")
+    /// The right-hand panel: the search for stations, with the preamble and
+    /// header each candidate is going through.
+    fn search_panel(&mut self, ui: &mut Ui, sh: &Shared) {
+        egui::Panel::right("search")
             .resizable(true)
             .default_size(560.0)
             .min_size(380.0)
@@ -1605,25 +1653,10 @@ impl App {
                     if sh.snapshots.is_empty() {
                         ui.label(RichText::new("Nothing is being received.").weak());
                     }
-                    // Empties the panel: closed stations go, and open channels are
-                    // hidden until they close (the receiver goes on decoding them).
-                    if ui
-                        .add_enabled(
-                            !self.stations.is_empty(),
-                            egui::Button::new("Clear decoders"),
-                        )
-                        .on_hover_text("Remove every station card; a station shows again when its next segment starts")
-                        .clicked()
-                    {
-                        for ((i, _, _), (v, _)) in &self.stations {
-                            self.hidden.insert((*i, v.id));
-                        }
-                        self.stations.clear();
-                    }
                     let snaps = sh.snapshots.clone();
                     for (i, s) in snaps.iter().enumerate() {
                         let idx = Band::ALL.iter().position(|b| *b == s.band).unwrap_or(i);
-                        self.profile_section(ui, s, idx, &sh.transfers);
+                        self.search_section(ui, s, idx);
                     }
                 });
             });
@@ -1758,6 +1791,12 @@ impl Plot {
 
 /// Height of a station card's two plots, px.
 const CARD_PLOT_H: f32 = 190.0;
+/// A station card's width in the decoders strip.
+const CARD_W: f32 = 470.0;
+/// What a station card needs besides its two plots (header, margin bar, numbers,
+/// tabs, frame map), so the plots can take the rest of a short strip. Measured
+/// off the demo's cards.
+const CARD_CHROME_H: f32 = 205.0;
 
 /// The symbol SNR over the last three strip points (about 1.5 s), averaged as
 /// powers; `None` with no points yet.
@@ -1778,6 +1817,7 @@ fn channel_card(
     c: &ChannelView,
     tr: Option<&Transfer>,
     w: f32,
+    plot_h: f32,
     is_live: bool,
     plots: &mut [Plot; 2],
 ) {
@@ -1868,7 +1908,7 @@ fn channel_card(
                             }
                         }
                     });
-                    plot(ui, *slot, c, vec2(half, CARD_PLOT_H));
+                    plot(ui, *slot, c, vec2(half, plot_h));
                 });
             }
         });
@@ -2084,9 +2124,12 @@ impl eframe::App for App {
                     });
                 });
         }
-        if self.view != View::Tx {
-            self.stations_panel(ui, &sh);
-        }
+        let cards = if self.view != View::Tx {
+            self.search_panel(ui, &sh);
+            self.track_stations(&sh.snapshots, &sh.transfers)
+        } else {
+            Vec::new()
+        };
         // The side panels are laid out first, so they run the full height under the
         // bar and the files, log and pictures sit in the column beside them rather
         // than cutting the instruments off.
@@ -2105,6 +2148,10 @@ impl eframe::App for App {
             egui::Panel::bottom("pictures")
                 .resizable(false)
                 .show(ui, |ui| self.pictures_panel(ui, &sh.pictures, &sh.voices));
+        }
+        // Last of the bottom panels, so the decoders sit right under the waterfall.
+        if self.view != View::Tx {
+            self.decoders_panel(ui, &cards, &sh.transfers);
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
