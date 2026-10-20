@@ -44,6 +44,14 @@ impl Rigctld {
         Ok(self.ask_lines(command, 1)?.swap_remove(0))
     }
 
+    /// Send a command that sets something: `RPRT 0` is done.
+    fn set(&mut self, command: &str) -> Result<(), String> {
+        match self.ask(command)?.as_str() {
+            "RPRT 0" => Ok(()),
+            other => Err(format!("rigctld answered \"{other}\"")),
+        }
+    }
+
     /// Send `command` and take the `count` lines that answer it (a command that
     /// gets a value back answers one line to a value; `m` answers two). An
     /// `RPRT` first line is the whole answer: the command failed.
@@ -71,7 +79,7 @@ impl Rigctld {
 
 /// Hamlib's mode names as a panel would write them: its `PKT` modes are the
 /// data modes.
-fn mode_name(hamlib: &str) -> String {
+pub fn mode_name(hamlib: &str) -> String {
     match hamlib {
         "PKTUSB" => "USB-D".into(),
         "PKTLSB" => "LSB-D".into(),
@@ -79,6 +87,19 @@ fn mode_name(hamlib: &str) -> String {
         "PKTAM" => "AM-D".into(),
         "CWR" => "CW-R".into(),
         "RTTYR" => "RTTY-R".into(),
+        other => other.to_string(),
+    }
+}
+
+/// The Hamlib name of the panel name `mode`, the other way from [`mode_name`].
+pub fn hamlib_mode(mode: &str) -> String {
+    match mode {
+        "USB-D" => "PKTUSB".into(),
+        "LSB-D" => "PKTLSB".into(),
+        "FM-D" => "PKTFM".into(),
+        "AM-D" => "PKTAM".into(),
+        "CW-R" => "CWR".into(),
+        "RTTY-R" => "RTTYR".into(),
         other => other.to_string(),
     }
 }
@@ -115,6 +136,19 @@ impl Cat for Rigctld {
             hz,
             mode: mode_name(&said[0]),
         })
+    }
+
+    /// `F` sets the frequency in hertz.
+    fn set_frequency(&mut self, hz: u64) -> Result<(), String> {
+        self.set(&format!("F {hz}"))
+    }
+
+    /// `M` sets the mode and a passband; 0 is the rig's usual one for it.
+    fn set_mode(&mut self, mode: &str) -> Result<(), String> {
+        if !mode.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!("{mode:?} is not a mode"));
+        }
+        self.set(&format!("M {} 0", hamlib_mode(mode)))
     }
 
     fn key(&mut self, on: bool) -> Result<(), String> {
@@ -176,6 +210,40 @@ mod tests {
         assert!(rig.keyings().is_empty());
         assert_eq!(mode_name("PKTLSB"), "LSB-D");
         assert_eq!(mode_name("CWR"), "CW-R");
+    }
+
+    #[test]
+    fn it_retunes_and_changes_mode() {
+        let rig = FakeRig::new(Model::Rigctld);
+        let mut rigctld = Rigctld::new(Box::new(rig.clone()));
+        rigctld.set_frequency(7_074_000).unwrap();
+        rigctld.set_mode("LSB-D").unwrap();
+        assert_eq!((rig.hz(), rig.mode().name()), (7_074_000, "LSB-D"));
+        assert_eq!(
+            rig.heard(),
+            "F 7074000
+M PKTLSB 0
+"
+        );
+        for name in Model::Rigctld.modes() {
+            rigctld.set_mode(name).unwrap();
+            assert_eq!(rigctld.tuning().unwrap().mode, *name);
+            assert_eq!(mode_name(&hamlib_mode(name)), *name);
+        }
+        assert!(
+            rigctld
+                .set_mode(
+                    "USB
+T 1"
+                )
+                .is_err()
+        );
+        assert!(!rig.transmitting());
+        let mut refusing = Rigctld::new(Box::new(FakeRig::new(Model::Rigctld).refuse(true)));
+        assert_eq!(
+            refusing.set_frequency(7_074_000),
+            Err("rigctld answered \"RPRT -8\"".into())
+        );
     }
 
     #[test]

@@ -37,6 +37,13 @@ const PTT: [u8; 2] = [0x1C, 0x00];
 const READ_FREQ: [u8; 1] = [0x03];
 const READ_MODE: [u8; 1] = [0x04];
 const READ_DATA: [u8; 2] = [0x1A, 0x06];
+/// Set the operating frequency (5 bytes of BCD) and the operating mode (a mode
+/// and a filter). DATA mode is set with the same `1A 06` that reads it, with
+/// 00 or 01 and a filter after it.
+const SET_FREQ: u8 = 0x05;
+const SET_MODE: u8 = 0x06;
+/// The filter used when the rig does not say which is selected: FIL1.
+const FILTER_1: u8 = 0x01;
 
 /// How long the rig has to answer a command, and how often it is sent.
 const ANSWER: Duration = Duration::from_millis(250);
@@ -117,7 +124,7 @@ pub fn hz_bcd(hz: u64) -> [u8; 5] {
 
 /// What an Icom's mode byte names. The IC-7300 has these eight (06, WFM, is
 /// on its relatives).
-fn mode_name(code: u8) -> String {
+pub fn mode_name(code: u8) -> String {
     match code {
         0x00 => "LSB".into(),
         0x01 => "USB".into(),
@@ -130,6 +137,22 @@ fn mode_name(code: u8) -> String {
         0x08 => "RTTY-R".into(),
         other => format!("mode {other:02X}"),
     }
+}
+
+/// The mode byte of the panel name `base` (no `-D`), the other way from
+/// [`mode_name`]. None for a mode the IC-7300 has no byte for.
+pub fn mode_code(base: &str) -> Option<u8> {
+    Some(match base {
+        "LSB" => 0x00,
+        "USB" => 0x01,
+        "AM" => 0x02,
+        "CW" => 0x03,
+        "RTTY" => 0x04,
+        "FM" => 0x05,
+        "CW-R" => 0x07,
+        "RTTY-R" => 0x08,
+        _ => return None,
+    })
 }
 
 /// An IC-7300, or any Icom that speaks CI-V, at `rig`.
@@ -178,6 +201,17 @@ impl Icom {
     }
 }
 
+impl Icom {
+    /// Send a command that sets something: the rig answers done or refused.
+    fn command(&mut self, body: &[u8]) -> Result<(), String> {
+        match self.ask(body)?.as_slice() {
+            [OK] => Ok(()),
+            [NG] => Err("refused".into()),
+            other => Err(format!("answered {other:02X?}")),
+        }
+    }
+}
+
 impl Cat for Icom {
     fn identify(&mut self) -> Result<String, String> {
         match self.ask(&READ_ID)?.as_slice() {
@@ -209,14 +243,49 @@ impl Cat for Icom {
         Ok(Tuning { hz, mode })
     }
 
+    fn set_frequency(&mut self, hz: u64) -> Result<(), String> {
+        // Five bytes of BCD hold ten digits.
+        if hz > 9_999_999_999 {
+            return Err(format!("{hz} Hz is more than CI-V can say"));
+        }
+        let mut body = vec![SET_FREQ];
+        body.extend(hz_bcd(hz));
+        self.command(&body)
+    }
+
+    /// A mode is a mode byte and, on the IC-7300, DATA mode on top of it. Both
+    /// carry a filter, which is left as the rig has it: asked first, and said
+    /// back, since a command that sets must name one.
+    fn set_mode(&mut self, mode: &str) -> Result<(), String> {
+        let (base, data) = match mode.strip_suffix("-D") {
+            Some(base) => (base, true),
+            None => (mode, false),
+        };
+        let code = mode_code(base).ok_or_else(|| format!("the rig has no {mode} mode"))?;
+        let filter = match self.ask(&READ_MODE)?.as_slice() {
+            [0x04, _, filter, ..] => *filter,
+            _ => FILTER_1,
+        };
+        self.command(&[SET_MODE, code, filter])?;
+        // A rig with no DATA mode (an older one) cannot be asked to leave it.
+        let data_filter = match self.ask(&READ_DATA) {
+            Ok(body) => match body.as_slice() {
+                [0x1A, 0x06, _, filter, ..] => *filter,
+                _ => FILTER_1,
+            },
+            Err(_) if !data => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        match self.command(&[0x1A, 0x06, u8::from(data), data_filter]) {
+            Err(e) if !data && e == "refused" => Ok(()),
+            other => other,
+        }
+    }
+
     fn key(&mut self, on: bool) -> Result<(), String> {
         let mut body = PTT.to_vec();
         body.push(u8::from(on));
-        match self.ask(&body)?.as_slice() {
-            [OK] => Ok(()),
-            [NG] => Err("refused".into()),
-            other => Err(format!("answered {other:02X?}")),
-        }
+        self.command(&body)
     }
 
     fn set_baud(&mut self, baud: u32) -> Result<(), String> {
@@ -325,6 +394,62 @@ mod tests {
             // Reading changes nothing and keys nothing.
             assert!(!rig.transmitting() && rig.keyings().is_empty());
         }
+    }
+
+    #[test]
+    fn mode_bytes_are_the_panel_names_the_other_way() {
+        for (code, name) in [(0x00, "LSB"), (0x01, "USB"), (0x05, "FM"), (0x07, "CW-R")] {
+            assert_eq!(mode_code(name), Some(code));
+            assert_eq!(mode_name(code), name);
+        }
+        assert_eq!(mode_code("AM-N"), None);
+    }
+
+    #[test]
+    fn it_retunes_and_changes_mode_past_echoes_and_reports() {
+        for echo in [false, true] {
+            let rig = FakeRig::new(Model::Ic7300).echo(echo).chatter(true);
+            let mut icom = Icom::new(Box::new(rig.clone()), IC7300);
+            icom.set_frequency(7_074_000).unwrap();
+            assert_eq!(rig.hz(), 7_074_000);
+            for name in ["LSB", "LSB-D", "USB", "USB-D", "FM", "CW-R", "AM"] {
+                icom.set_mode(name).unwrap();
+                assert_eq!(rig.mode().name(), name, "echo {echo}");
+                // What the rig says is what was asked.
+                assert_eq!(icom.tuning().unwrap().mode, name);
+            }
+            // Retuning is not keying.
+            assert!(!rig.transmitting() && rig.keyings().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_mode_the_rig_has_not_got_is_not_sent() {
+        let rig = FakeRig::new(Model::Ic7300);
+        let mut icom = Icom::new(Box::new(rig.clone()), IC7300);
+        assert_eq!(
+            icom.set_mode("AM-N"),
+            Err("the rig has no AM-N mode".into())
+        );
+        assert_eq!(rig.mode().name(), "USB-D");
+        // An Icom with no DATA mode can still be put in a plain mode, not in a data one.
+        let rig = FakeRig::new(Model::Ic7300).without_data_mode(true);
+        let mut icom = Icom::new(Box::new(rig.clone()), IC7300);
+        icom.set_mode("LSB").unwrap();
+        assert_eq!(rig.mode().name(), "LSB");
+        assert!(icom.set_mode("LSB-D").is_err());
+        assert_eq!(
+            icom.set_frequency(10_000_000_000),
+            Err("10000000000 Hz is more than CI-V can say".into())
+        );
+    }
+
+    #[test]
+    fn a_rig_that_refuses_to_retune_says_so() {
+        let rig = FakeRig::new(Model::Ic7300).refuse(true);
+        let mut icom = Icom::new(Box::new(rig.clone()), IC7300);
+        assert_eq!(icom.set_frequency(7_074_000), Err("refused".into()));
+        assert_eq!(rig.hz(), 14_097_000);
     }
 
     #[test]

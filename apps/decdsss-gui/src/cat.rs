@@ -165,8 +165,8 @@ impl CatDialog {
         ui.label(RichText::new("Rig control").strong());
         ui.checkbox(&mut self.edit.cat, "Enable CAT control").on_hover_text(
             "Find the rig on its port, ask it what it is and show its frequency and mode across the top \
-             of the window. DecDSSS only reads them and keys the transmitter: set the frequency and \
-             the mode (USB, or data) on the radio.",
+             of the window. Scroll over a digit of the dial to tune the rig, type digits over it to \
+             enter a frequency, and click the mode to choose another; nothing else retunes it.",
         );
         ui.add_enabled_ui(cat, |ui| {
             egui::Grid::new("cat_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {

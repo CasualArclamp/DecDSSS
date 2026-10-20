@@ -5,7 +5,9 @@
 //! The thread's shape (jobs in, the rig found first, and always let go on the
 //! way out) is voicemodem's `Keyer`; what is new is that a caller can wait for
 //! the answer, so audio is not started before the rig has keyed, and that the
-//! key can be a control line as well as CAT.
+//! key can be a control line as well as CAT. The same thread retunes the rig
+//! when asked ([`Ptt::tune`]): a dial turned quickly is a stream of requests,
+//! of which only the last of a run is sent.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -326,6 +328,8 @@ pub struct Status {
     pub tuning: Option<Tuning>,
     /// Why the rig could not be read, when the last try failed.
     pub tuning_problem: Option<String>,
+    /// Why the last retune did not take, until the next one is asked.
+    pub tune_problem: Option<String>,
 }
 
 #[derive(Debug)]
@@ -335,6 +339,10 @@ struct State {
     keyed: bool,
     tuning: Option<Tuning>,
     tuning_problem: Option<String>,
+    tune_problem: Option<String>,
+    /// Counts the retunes asked for. An answer to "where is the dial" that was
+    /// asked before the latest retune is out of date, and is not kept.
+    tune_epoch: u64,
     /// The last job finished, and how it went.
     done: u64,
     result: Result<(), String>,
@@ -359,9 +367,39 @@ impl Shared {
     }
 }
 
-struct Job {
-    on: bool,
-    seq: u64,
+enum Job {
+    Key {
+        on: bool,
+        seq: u64,
+    },
+    /// Retune: either part may be left as it is.
+    Tune {
+        hz: Option<u64>,
+        mode: Option<String>,
+    },
+}
+
+/// `jobs` with each run of retunes made one: the later request wins where both
+/// set the same thing, and each keeps what the other did not set. Keying keeps
+/// its place in the order, so a retune asked before a key is done before it.
+fn coalesce(jobs: Vec<Job>) -> Vec<Job> {
+    let mut out: Vec<Job> = Vec::new();
+    for job in jobs {
+        match (out.last_mut(), job) {
+            (
+                Some(Job::Tune { hz, mode }),
+                Job::Tune {
+                    hz: new_hz,
+                    mode: new_mode,
+                },
+            ) => {
+                *hz = new_hz.or(*hz);
+                *mode = new_mode.or(mode.take());
+            }
+            (_, job) => out.push(job),
+        }
+    }
+    out
 }
 
 /// A transmitter key. The rig is found on a thread of its own, which then keys
@@ -410,6 +448,8 @@ impl Ptt {
                 keyed: false,
                 tuning: None,
                 tuning_problem: None,
+                tune_problem: None,
+                tune_epoch: 0,
                 done: 0,
                 result: Ok(()),
             }),
@@ -441,7 +481,43 @@ impl Ptt {
             keyed: state.keyed,
             tuning: state.tuning.clone(),
             tuning_problem: state.tuning_problem.clone(),
+            tune_problem: state.tune_problem.clone(),
         }
+    }
+
+    /// Retune the rig to `hz` and/or `mode` (as [`crate::Cat::set_mode`] names
+    /// them), and return at once: the rig thread does it, and
+    /// [`Ptt::status`] says what the rig says afterwards. The dial in the status
+    /// is changed here already, so a caller that turns a dial a step at a time
+    /// builds each step on the last. Never while the rig is keyed.
+    pub fn tune(&self, hz: Option<u64>, mode: Option<&str>) -> Result<(), String> {
+        let Some(jobs) = &self.jobs else {
+            return Err("the rig has been let go".into());
+        };
+        let mut state = self.shared.lock();
+        if state.phase != Phase::Ready {
+            return Err("the rig is not ready".into());
+        }
+        if state.keyed {
+            return Err("the rig is transmitting: it is not retuned on the air".into());
+        }
+        let Some(tuning) = state.tuning.as_mut() else {
+            return Err("the rig has not said where it is tuned yet".into());
+        };
+        if let Some(hz) = hz {
+            tuning.hz = hz;
+        }
+        if let Some(mode) = mode {
+            tuning.mode = mode.to_string();
+        }
+        state.tune_epoch += 1;
+        state.tune_problem = None;
+        drop(state);
+        jobs.send(Job::Tune {
+            hz,
+            mode: mode.map(str::to_string),
+        })
+        .map_err(|_| self.shared.lock().said.clone())
     }
 
     /// Key the transmitter, or let it go, and wait up to `wait` for the rig to
@@ -457,7 +533,7 @@ impl Ptt {
         let Some(jobs) = &self.jobs else {
             return Err("the rig has been let go".into());
         };
-        if jobs.send(Job { on, seq }).is_err() {
+        if jobs.send(Job::Key { on, seq }).is_err() {
             return Err(self.shared.lock().said.clone());
         }
         let deadline = Instant::now() + wait;
@@ -623,9 +699,15 @@ fn read_tuning(rig: &mut Rig, shared: &Shared, misses: &mut u32) {
     let Some(cat) = rig.cat.as_mut() else {
         return;
     };
+    let epoch = shared.lock().tune_epoch;
     // Not asked with the state locked: a rig that does not answer takes its time.
     let answer = cat.tuning();
     let mut state = shared.lock();
+    if state.tune_epoch != epoch {
+        // Retuned while the rig was being asked: what it said is out of date,
+        // and the retune will ask again.
+        return;
+    }
     match answer {
         Ok(tuning) => {
             *misses = 0;
@@ -640,6 +722,27 @@ fn read_tuning(rig: &mut Rig, shared: &Shared, misses: &mut u32) {
             state.tuning_problem = Some(e);
         }
     }
+}
+
+/// Do a retune on the rig, then ask where it is: whatever it says is what the
+/// display shows, taken or not.
+fn retune(rig: &mut Rig, shared: &Shared, hz: Option<u64>, mode: Option<&str>, misses: &mut u32) {
+    let problem = match rig.cat.as_mut() {
+        None => Some("there is no CAT to tune by".to_string()),
+        Some(cat) => hz
+            .map(|hz| {
+                cat.set_frequency(hz)
+                    .map_err(|e| format!("the rig would not change frequency: {e}"))
+            })
+            .into_iter()
+            .chain(mode.map(|mode| {
+                cat.set_mode(mode)
+                    .map_err(|e| format!("the rig would not change mode: {e}"))
+            }))
+            .find_map(Result::err),
+    };
+    shared.lock().tune_problem = problem;
+    read_tuning(rig, shared, misses);
 }
 
 fn run(
@@ -662,7 +765,7 @@ fn run(
     let mut misses = 0;
     read_tuning(&mut rig, shared, &mut misses);
     loop {
-        let job = match inbox.recv_timeout(POLL) {
+        let first = match inbox.recv_timeout(POLL) {
             Ok(job) => job,
             Err(RecvTimeoutError::Timeout) => {
                 // Idle: look where the dial is, unless the rig is on the air,
@@ -674,24 +777,40 @@ fn run(
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        maybe_on |= job.on;
-        let result = rig.key(job.on);
-        if result.is_ok() {
-            maybe_on = job.on;
-        }
-        let mut state = shared.lock();
-        state.keyed = maybe_on;
-        state.done = job.seq;
-        state.result = result.map_err(|e| {
-            let what = if job.on {
-                "would not key"
-            } else {
-                "would not let go, and may still be transmitting"
+        let mut queue = vec![first];
+        queue.extend(inbox.try_iter());
+        for job in coalesce(queue) {
+            let (on, seq) = match job {
+                Job::Key { on, seq } => (on, seq),
+                Job::Tune { hz, mode } => {
+                    if maybe_on {
+                        shared.lock().tune_problem =
+                            Some("the rig is transmitting: it is not retuned on the air".into());
+                    } else {
+                        retune(&mut rig, shared, hz, mode.as_deref(), &mut misses);
+                    }
+                    continue;
+                }
             };
-            format!("the rig {what}: {e}")
-        });
-        drop(state);
-        shared.changed.notify_all();
+            maybe_on |= on;
+            let result = rig.key(on);
+            if result.is_ok() {
+                maybe_on = on;
+            }
+            let mut state = shared.lock();
+            state.keyed = maybe_on;
+            state.done = seq;
+            state.result = result.map_err(|e| {
+                let what = if on {
+                    "would not key"
+                } else {
+                    "would not let go, and may still be transmitting"
+                };
+                format!("the rig {what}: {e}")
+            });
+            drop(state);
+            shared.changed.notify_all();
+        }
     }
     // Whoever keyed the rig has gone: it is never left transmitting.
     if maybe_on {
@@ -800,6 +919,8 @@ mod tests {
                 keyed: false,
                 tuning: None,
                 tuning_problem: None,
+                tune_problem: None,
+                tune_epoch: 0,
                 done: 0,
                 result: Ok(()),
             }),
@@ -830,6 +951,105 @@ mod tests {
         let state = shared.lock();
         assert_eq!(state.tuning.as_ref().map(|t| t.hz), Some(14_097_000));
         assert_eq!(state.tuning_problem, None);
+    }
+
+    fn jobs(spec: &[(Option<u64>, Option<&str>)]) -> Vec<Job> {
+        spec.iter()
+            .map(|(hz, mode)| Job::Tune {
+                hz: *hz,
+                mode: mode.map(str::to_string),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_run_of_retunes_is_one_and_keying_keeps_its_place() {
+        let one = coalesce(jobs(&[
+            (Some(7_000_000), None),
+            (Some(7_001_000), Some("LSB")),
+            (Some(7_002_000), None),
+        ]));
+        assert!(matches!(
+            one.as_slice(),
+            [Job::Tune { hz: Some(7_002_000), mode: Some(m) }] if m == "LSB"
+        ));
+        let mut mixed = jobs(&[(Some(1), None)]);
+        mixed.push(Job::Key { on: true, seq: 1 });
+        mixed.extend(jobs(&[(Some(2), None), (Some(3), None)]));
+        let out = coalesce(mixed);
+        assert!(matches!(
+            out.as_slice(),
+            [
+                Job::Tune { hz: Some(1), .. },
+                Job::Key { on: true, seq: 1 },
+                Job::Tune { hz: Some(3), .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn the_rig_is_retuned_and_the_dial_shows_it_at_once() {
+        for model in [Model::Ft710, Model::Ic7300, Model::Rigctld] {
+            let rig = FakeRig::new(model);
+            let ptt = Ptt::with_links(with_cat(model, Method::Cat), links(&rig));
+            until(|| ptt.status().tuning.is_some());
+            ptt.tune(Some(7_074_000), None).unwrap();
+            // Before the rig thread has so much as looked at it.
+            assert_eq!(ptt.status().tuning.map(|t| t.hz), Some(7_074_000));
+            ptt.tune(None, Some("LSB")).unwrap();
+            until(|| rig.hz() == 7_074_000 && rig.mode().name() == "LSB");
+            until(|| {
+                ptt.status().tuning.map(|t| (t.hz, t.mode)) == Some((7_074_000, "LSB".into()))
+            });
+            assert_eq!(ptt.status().tune_problem, None);
+            assert!(rig.keyings().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_dial_turned_fast_ends_where_it_was_turned_to() {
+        let rig = FakeRig::new(Model::Ft710);
+        let ptt = Ptt::with_links(with_cat(Model::Ft710, Method::Cat), links(&rig));
+        until(|| ptt.status().tuning.is_some());
+        for step in 1..=40 {
+            ptt.tune(Some(14_097_000 + step * 1000), None).unwrap();
+        }
+        until(|| rig.hz() == 14_137_000);
+        // The rig's old answers do not pull the display back.
+        std::thread::sleep(POLL + Duration::from_millis(200));
+        assert_eq!(ptt.status().tuning.map(|t| t.hz), Some(14_137_000));
+    }
+
+    #[test]
+    fn a_rig_that_will_not_retune_says_why_and_the_dial_goes_back() {
+        let rig = FakeRig::new(Model::Ic7300);
+        let ptt = Ptt::with_links(with_cat(Model::Ic7300, Method::Cat), links(&rig));
+        until(|| ptt.status().tuning.is_some());
+        rig.clone().refuse(true);
+        ptt.tune(Some(7_074_000), None).unwrap();
+        until(|| ptt.status().tune_problem.is_some());
+        assert_eq!(
+            ptt.status().tune_problem.as_deref(),
+            Some("the rig would not change frequency: refused")
+        );
+        until(|| ptt.status().tuning.map(|t| t.hz) == Some(14_097_000));
+    }
+
+    #[test]
+    fn a_keyed_rig_is_not_retuned() {
+        let rig = FakeRig::new(Model::Ft710);
+        let ptt = Ptt::with_links(with_cat(Model::Ft710, Method::Cat), links(&rig));
+        until(|| ptt.status().tuning.is_some());
+        ptt.key(true, KEY_WAIT).unwrap();
+        assert!(ptt.tune(Some(7_074_000), None).is_err());
+        ptt.key(false, KEY_WAIT).unwrap();
+        assert_eq!(rig.hz(), 14_097_000);
+        // Nor one that is not there to be asked.
+        let none = Ptt::with_links(
+            with_cat(Model::Ft710, Method::Cat),
+            links(&FakeRig::new(Model::Ft710).silent(true)),
+        );
+        assert!(none.tune(Some(1), None).is_err());
     }
 
     #[test]

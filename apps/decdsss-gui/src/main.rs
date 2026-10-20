@@ -9,6 +9,7 @@
 mod app;
 mod cat;
 mod demo;
+mod dial;
 mod engine;
 mod live;
 mod monitor;

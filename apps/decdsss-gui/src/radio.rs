@@ -69,6 +69,8 @@ pub struct RadioStatus {
     pub tuning: Option<Tuning>,
     /// Why the rig is not saying, when it is found but cannot be read.
     pub tuning_problem: Option<String>,
+    /// Why the last retune from the dial did not take.
+    pub tune_problem: Option<String>,
 }
 
 impl Radio {
@@ -225,8 +227,8 @@ impl Radio {
 
     pub fn status(&self) -> RadioStatus {
         let g = self.lock();
-        let (lamp, text, keyed, tuning, tuning_problem) = match (&g.problem, &g.ptt) {
-            (Some(e), _) => (Lamp::Bad, e.clone(), false, None, None),
+        let (lamp, text, keyed, tuning, tuning_problem, tune_problem) = match (&g.problem, &g.ptt) {
+            (Some(e), _) => (Lamp::Bad, e.clone(), false, None, None, None),
             (None, Some(p)) => {
                 let s = p.status();
                 let lamp = match s.phase {
@@ -234,12 +236,20 @@ impl Radio {
                     Phase::Ready => Lamp::Ok,
                     Phase::Failed => Lamp::Bad,
                 };
-                (lamp, s.said, s.keyed, s.tuning, s.tuning_problem)
+                (
+                    lamp,
+                    s.said,
+                    s.keyed,
+                    s.tuning,
+                    s.tuning_problem,
+                    s.tune_problem,
+                )
             }
             (None, None) => (
                 Lamp::Off,
                 "no CAT, and the radio is not keyed by this program".into(),
                 false,
+                None,
                 None,
                 None,
             ),
@@ -252,7 +262,16 @@ impl Radio {
             test_note: g.test_note.clone(),
             tuning,
             tuning_problem,
+            tune_problem,
         }
+    }
+
+    /// Retune the rig from the dial: to `hz`, to `mode`, or both. It returns at
+    /// once; the rig's own answer shows in [`Radio::status`]. This never keys
+    /// anything, and is refused while the rig is keyed.
+    pub fn tune(&self, hz: Option<u64>, mode: Option<&str>) -> Result<(), String> {
+        let ptt = self.lock().ptt.clone();
+        ptt.ok_or("no CAT is set up to tune by")?.tune(hz, mode)
     }
 
     /// The program is ending: let the transmitter go, and wait until it has
@@ -325,6 +344,18 @@ mod tests {
         until(|| !rig.transmitting());
         until(|| !radio.status().testing);
         assert_eq!(rig.keyings(), [true, false]);
+    }
+
+    #[test]
+    fn the_dial_retunes_the_rig_and_never_keys_it() {
+        let rig = FakeRig::new(Model::Ft710);
+        let radio = radio_with(&rig);
+        until(|| radio.status().tuning.is_some());
+        radio.tune(Some(7_074_000), Some("LSB")).unwrap();
+        until(|| rig.hz() == 7_074_000 && rig.mode().name() == "LSB");
+        assert!(rig.keyings().is_empty());
+        // With no CAT at all there is nothing to tune.
+        assert!(Radio::default().tune(Some(7_074_000), None).is_err());
     }
 
     #[test]

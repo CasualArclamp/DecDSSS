@@ -3,11 +3,12 @@
 //! the Yaesu FT-710 by Yaesu's ASCII commands, any rig Hamlib knows through its
 //! `rigctld`), or by a serial port's DTR or RTS line.
 //!
-//! Only the transmitter's key. DecDSSS does not tune the rig: the operator
-//! sets the frequency and the mode (USB, data) on the radio, as with a sound
-//! card interface. The CAT, line and model code started as voicemodem's `rig`
-//! crate (same author); the Hamlib `rigctld` model, the DTR/RTS lines and
-//! [`Ptt`] are new here.
+//! The transmitter's key, and the dial: the CAT reads where the rig is tuned
+//! and what mode it is in, and the operator may retune it from the window
+//! ([`Ptt::tune`]); it is never retuned by anything the program does on its
+//! own. The CAT, line and model code started as voicemodem's `rig` crate (same
+//! author); the Hamlib `rigctld` model, the DTR/RTS lines, [`Ptt`] and the
+//! retuning are new here.
 //!
 //! [`Ptt`] owns the rig on a thread of its own, so a port that is slow to
 //! answer, or never does, holds nothing else up; it keys and lets go as it is
@@ -103,6 +104,24 @@ impl Model {
         }
     }
 
+    /// The modes the window offers for this rig, as its panel names them
+    /// (`-D` is the data mode of a sideband or FM), the ones this modem is
+    /// used on first. Each is one [`Cat::set_mode`] takes.
+    pub fn modes(self) -> &'static [&'static str] {
+        match self {
+            Model::Ic7300 => &[
+                "USB-D", "USB", "LSB-D", "LSB", "AM", "FM", "CW", "CW-R", "RTTY", "RTTY-R",
+            ],
+            Model::Ft710 => &[
+                "USB-D", "USB", "LSB-D", "LSB", "AM", "AM-N", "FM", "FM-D", "FM-N", "CW", "CW-R",
+                "RTTY", "RTTY-R",
+            ],
+            Model::Rigctld => &[
+                "USB-D", "USB", "LSB-D", "LSB", "AM", "FM", "FM-D", "CW", "CW-R", "RTTY", "RTTY-R",
+            ],
+        }
+    }
+
     /// What goes in the device box: a serial port, or an address.
     pub fn device_hint(self) -> &'static str {
         match self {
@@ -170,6 +189,13 @@ pub trait Cat: Send {
     /// Ask the rig where its dial is and what mode it is in. Only asks: it
     /// never changes the rig, and never keys it.
     fn tuning(&mut self) -> Result<Tuning, String>;
+
+    /// Tune the rig's dial to `hz`.
+    fn set_frequency(&mut self, hz: u64) -> Result<(), String>;
+
+    /// Put the rig in `mode`, named as [`Tuning::mode`] names them (`USB`,
+    /// `USB-D`, ...); `Err` if it has no such mode.
+    fn set_mode(&mut self, mode: &str) -> Result<(), String>;
 
     /// Key the transmitter, or let it go, and see that the rig has.
     fn key(&mut self, on: bool) -> Result<(), String>;

@@ -772,7 +772,7 @@ sideband with the radio's data mode on) and RX or TX. The rig's thread asks for
 the dial and the mode every 500 ms while it is idle, and not at all while the rig
 is keyed, so the line is the key's then. One answer that does not come leaves the
 last reading up; three in a row blank it and the reason goes in the strip and its
-tooltip. Read-only: IC-7300 `03` (frequency, five bytes of BCD, least significant
+tooltip. Reading: IC-7300 `03` (frequency, five bytes of BCD, least significant
 pair first) and `04` (mode), and `1A 06` for DATA mode (an Icom that refuses it
 shows the plain mode); FT-710 `FA;` and `MD0;` (the mode digit: 1 LSB, 2 USB,
 3 CW, 4 FM, 5 AM, 6 RTTY, 7 CW-R, 8 LSB data, 9 RTTY-R, A FM data, B FM-N, C USB
@@ -780,6 +780,32 @@ data, D AM-N; any other digit is shown as `mode E`); `rigctld` `f` and `m` (its
 `PKTUSB` is `USB-D`). `decdsss rig --model … --port …` prints the same after the
 rig's ID, and `decdsss-gui --fake-rig` puts a stand-in FT-710 in force to see the
 strip with no radio (`--demo --fake-rig --screenshot`). The filter is not read.
+
+The dial and the mode are the rig's controls as well, as on its own panel, and
+only when the operator uses them (the program never retunes by itself, and never
+while the rig is keyed). *Scroll over a digit* of the nine (`014.097.000`, leading
+zeros dimmed) and the rig is tuned by that digit's place, one step per wheel click
+(`line_scroll_speed` points; a finer wheel is summed), carrying into the digit
+above and stopping at 0 and 999.999.999 Hz. *Type digits over a digit* and they
+replace it and everything below, one place at a time (shown amber): the last place
+sets it, Enter sets it early, Backspace takes a digit back, Esc or leaving the dial
+drops it; to type 7.074 the entry starts at the tens of megahertz and begins with
+the 0. *Click the mode* and the rig's other modes (`Model::modes`) slide out to its
+right (wiped out and moved 28 points over 0.3 s, cubic ease-out); one clicked puts
+the rig in it and the row slides back the way it came, as does a click anywhere
+else. The window's side is `dial.rs` (digit arithmetic, typed entry) and
+`rig_strip.rs`; `Ptt::tune` queues the retune on the rig's thread, which folds a
+run of them into one, so a dial spun fast is not a queue of CAT round trips, and
+shows the new dial at once (an answer the rig gave before the latest retune is
+dropped, so it does not pull the display back; what the rig says after is what
+stays, with the refusal beside it). Setting: IC-7300 `05` (five bytes of BCD) and
+`06` with the filter the rig has selected, read first, then `1A 06` for DATA mode;
+FT-710 `FA` and nine digits, `MD0` and the mode digit, each read back since the rig
+does not answer them; `rigctld` `F hz` and `M mode 0` (passband 0 is the rig's
+usual). *Checked* only against the stand-in rigs and `egui` driven headless (the
+wheel, typing and the click, `cargo test -p decdsss-gui rig_strip`); the CI-V
+filter byte and DATA-mode set are from the manual, **not yet tried on a real
+IC-7300 or FT-710**.
 
 A transmission to the radio (files, pictures, text, voice overs, live voice) keys
 the transmitter before its first sample and lets go after its last: the rig's

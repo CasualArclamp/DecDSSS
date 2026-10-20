@@ -20,6 +20,63 @@ pub enum Mode {
     /// Upper sideband with DATA mode on.
     UsbData,
     Fm,
+    LsbData,
+    FmData,
+    FmNarrow,
+    Am,
+    AmNarrow,
+    Cw,
+    CwReverse,
+    Rtty,
+    RttyReverse,
+}
+
+impl Mode {
+    /// Every mode with the name its rig's panel gives it.
+    const NAMES: [(Mode, &'static str); 13] = [
+        (Mode::Lsb, "LSB"),
+        (Mode::Usb, "USB"),
+        (Mode::UsbData, "USB-D"),
+        (Mode::Fm, "FM"),
+        (Mode::LsbData, "LSB-D"),
+        (Mode::FmData, "FM-D"),
+        (Mode::FmNarrow, "FM-N"),
+        (Mode::Am, "AM"),
+        (Mode::AmNarrow, "AM-N"),
+        (Mode::Cw, "CW"),
+        (Mode::CwReverse, "CW-R"),
+        (Mode::Rtty, "RTTY"),
+        (Mode::RttyReverse, "RTTY-R"),
+    ];
+
+    /// As the panel names it, and as [`crate::Tuning::mode`] does.
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(m, _)| *m == self)
+            .map_or("", |(_, name)| name)
+    }
+
+    pub fn parse(name: &str) -> Option<Mode> {
+        Self::NAMES
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(m, _)| *m)
+    }
+
+    /// The same mode with DATA mode on or off, if the rig has one.
+    fn with_data(self, data: bool) -> Option<Mode> {
+        let base = self.name().strip_suffix("-D").unwrap_or(self.name());
+        if data {
+            Mode::parse(&format!("{base}-D"))
+        } else {
+            Mode::parse(base)
+        }
+    }
+
+    fn is_data(self) -> bool {
+        self.name().ends_with("-D")
+    }
 }
 
 /// A rig that answers what it is sent. Clones share one rig, so a test can
@@ -147,6 +204,16 @@ impl FakeRig {
         s.mode = mode;
     }
 
+    /// Where the dial is now, hertz.
+    pub fn hz(&self) -> u64 {
+        self.state().hz
+    }
+
+    /// The mode it is in now.
+    pub fn mode(&self) -> Mode {
+        self.state().mode
+    }
+
     /// Every change of transmitting, in order.
     pub fn keyings(&self) -> Vec<bool> {
         self.state().keyings.clone()
@@ -200,14 +267,48 @@ impl State {
                 [0x03] => [&[0x03][..], &hz_bcd(self.hz)].concat(),
                 [0x04] => vec![
                     0x04,
-                    match self.mode {
-                        Mode::Lsb => 0x00,
-                        Mode::Usb | Mode::UsbData => 0x01,
-                        Mode::Fm => 0x05,
-                    },
+                    crate::civ::mode_code(
+                        self.mode
+                            .name()
+                            .strip_suffix("-D")
+                            .unwrap_or(self.mode.name()),
+                    )
+                    .unwrap_or(0x01),
                     0x01,
                 ],
-                [0x1A, 0x06] => vec![0x1A, 0x06, u8::from(self.mode == Mode::UsbData), 0x01],
+                [0x1A, 0x06] => vec![0x1A, 0x06, u8::from(self.mode.is_data()), 0x01],
+                [0x05 | 0x06, ..] | [0x1A, 0x06, _, _] if self.refuse => vec![0xFA],
+                [0x1A, 0x06, _, _] if self.no_data_mode => vec![0xFA],
+                [0x05, digits @ ..] => match crate::civ::bcd_hz(digits) {
+                    Some(hz) if digits.len() == 5 => {
+                        self.hz = hz;
+                        vec![0xFB]
+                    }
+                    _ => vec![0xFA],
+                },
+                [0x06, code, _filter] => {
+                    // The mode changes; DATA mode stays as it was, if the new
+                    // mode has one.
+                    let base = crate::civ::mode_name(*code);
+                    let mode = Mode::parse(&base).map(|m| {
+                        m.with_data(self.mode.is_data() && !self.no_data_mode)
+                            .unwrap_or(m)
+                    });
+                    match mode {
+                        Some(mode) => {
+                            self.mode = mode;
+                            vec![0xFB]
+                        }
+                        None => vec![0xFA],
+                    }
+                }
+                [0x1A, 0x06, data @ (0 | 1), _filter] => match self.mode.with_data(*data == 1) {
+                    Some(mode) => {
+                        self.mode = mode;
+                        vec![0xFB]
+                    }
+                    None => vec![0xFA],
+                },
                 _ => vec![0xFA],
             };
             self.said.extend(frame(CONTROLLER, self.address, &answer));
@@ -226,15 +327,35 @@ impl State {
                 ),
                 "f" | "m" if self.unreadable => "RPRT -11\n".to_string(),
                 "f" => format!("{}\n", self.hz),
-                "m" => format!(
-                    "{}\n2400\n",
-                    match self.mode {
-                        Mode::Lsb => "LSB",
-                        Mode::Usb => "USB",
-                        Mode::UsbData => "PKTUSB",
-                        Mode::Fm => "FM",
-                    }
-                ),
+                "m" => format!("{}\n2400\n", crate::rigctl::hamlib_mode(self.mode.name())),
+                set if set.starts_with("F ") || set.starts_with("M ") => {
+                    let mut words = set.split_whitespace().skip(1);
+                    let said = if self.refuse {
+                        "RPRT -8"
+                    } else if set.starts_with("F ") {
+                        match words.next().and_then(|w| w.parse::<u64>().ok()) {
+                            Some(hz) => {
+                                self.hz = hz;
+                                "RPRT 0"
+                            }
+                            None => "RPRT -1",
+                        }
+                    } else {
+                        let named = words.next().and_then(|w| {
+                            Mode::NAMES
+                                .iter()
+                                .find(|(_, n)| crate::rigctl::hamlib_mode(n) == w)
+                        });
+                        match named {
+                            Some((mode, _)) => {
+                                self.mode = *mode;
+                                "RPRT 0"
+                            }
+                            None => "RPRT -1",
+                        }
+                    };
+                    format!("{said}\n")
+                }
                 "T 1" | "T 0" if self.refuse => "RPRT -8
 "
                 .to_string(),
@@ -271,13 +392,31 @@ impl State {
                 "FA;" => format!("FA{:09};", self.hz),
                 "MD0;" => format!(
                     "MD0{};",
-                    match self.mode {
-                        Mode::Lsb => '1',
-                        Mode::Usb => '2',
-                        Mode::UsbData => 'C',
-                        Mode::Fm => '4',
-                    }
+                    crate::yaesu::mode_char(self.mode.name()).unwrap_or('2')
                 ),
+                set if set.len() == 12 && set.starts_with("FA") => {
+                    // A command that sets is not answered, and not obeyed by a
+                    // rig told to refuse.
+                    if !self.refuse
+                        && let Ok(hz) = set[2..11].parse()
+                    {
+                        self.hz = hz;
+                    }
+                    continue;
+                }
+                set if set.len() == 5 && set.starts_with("MD0") => {
+                    let mode = set[3..4]
+                        .chars()
+                        .next()
+                        .map(crate::yaesu::mode_name)
+                        .and_then(|name| Mode::parse(&name));
+                    if !self.refuse
+                        && let Some(mode) = mode
+                    {
+                        self.mode = mode;
+                    }
+                    continue;
+                }
                 _ => "?;".into(),
             };
             self.said.extend(answer.as_bytes());
