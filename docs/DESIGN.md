@@ -115,7 +115,7 @@ Over the scrambler, the two families modulate differently:
   are modes for a clean, strong channel.
 - **CSK** — M-ary orthogonal code keying, as on the IS-95 uplink: a symbol
   sends one of the L Walsh–Hadamard codes of length L, so it carries log₂L
-  bits. L is in {32, 64, 128, 256}. Detection is noncoherent: one fast Walsh
+  bits. L is in {8, 16, 32, 64, 128, 256}. Detection is noncoherent: one fast Walsh
   transform of the descrambled chips gives all L correlations, the symbol is
   the largest, bit LLRs come by max-log from the correlation powers, and the
   rake adds the powers across paths, each descrambled at its own delay. No
@@ -145,6 +145,8 @@ The scrambler on top keeps the spectrum white whatever code is sent.
 | DS16 | 120 | 210 | 105 |
 | DS32 | 60 | 105 | 52.5 |
 | DS64 | 30 | 52.5 | 26.3 |
+| CSK8 | 240 | 720 | 360 |
+| CSK16 | 120 | 480 | 240 |
 | CSK32 | 60 | 300 | 150 |
 | CSK64 | 30 | 180 | 90 |
 | CSK128 | 15 | 105 | 52.5 |
@@ -198,7 +200,9 @@ A transmission is one or more *segments*; a segment is:
    every build reads the older ones. The payload type is 3 bits, codes 0 to 7; the
    types from code 8 up, Codec2 1600 speech the first, go in a version-1 header whose
    type field is one bit wider and whose session is one bit narrower (5 bits, 0 to
-   31). Every type that fits in 3 bits is still sent in the version-0 header, as
+   31). (The CSK alphabets likewise keep the original codes, 32 to 256 as 0 to 3,
+   and 16 and 8 took 4 and 5; an older build skips a header that names them.) Every
+   type that fits in 3 bits is still sent in the version-0 header, as
    before, and a build that predates version 1 skips a version-1 header, which is
    all it could do with a type it does not know.) (16 and 32 were measured too and never chosen, see Verification, so
    the receiver does not try them.) The receiver tries the alphabets shortest
@@ -897,6 +901,12 @@ modem is about 2 dB above its code.
 | | CSK256 ½ | 4.0 dB | −15.0 dB |
 | | CSK32 ¾ | 4.0 dB | −6.3 dB |
 | | CSK64 ¾ | 3.5 dB | −9.0 dB |
+| | CSK16 ½ | 4.5 dB | −5.5 dB |
+| | CSK16 ⅔ | 4.5 dB | −4.3 dB |
+| | CSK16 ¾ | 4.5 dB | −3.7 dB |
+| | CSK8 ½ | 5.0 dB | −3.2 dB |
+| | CSK8 ⅔ | 5.5 dB | −1.5 dB |
+| | CSK8 ¾ | 5.0 dB | −1.5 dB |
 | 3 kHz | DS8 ½ | 4.0 dB | −6.6 dB |
 | | CSK64 ½ | 4.0 dB | −10.3 dB |
 | | CSK256 ½ | 4.0 dB | −15.0 dB |
@@ -1241,6 +1251,76 @@ closed on its end frame, but not on the postamble. The question now stays open
 across such a block (`eot_pending`) and is answered when the samples are in. A block
 longer than the postamble and its lags never takes that path: the live streams that
 existed, DS4 ⅔ and DS4 ¾ from depth 1 up, have blocks of 1.1 s or more.
+
+### CSK16 and CSK8 (2026-10-20)
+
+CSK16 and CSK8 extend the CSK ladder at the fast end: 120 and 240 symbols a second
+of 4 and 3 bits on `2k4`, so 240 and 360 info bit/s at rate ½ and 540 at ¾ for CSK8
+(derived: 1920 / L symbols a second × log₂ L bits × the code rate; `decdsss modes`).
+Nothing else in the air interface changed: the receiver already did every alphabet,
+the header is CSK256 as for every CSK mode, and the header's alphabet code took two
+of the free codes.
+
+**AWGN** (table above; 24 transmissions a point, 0.5 dB steps): CSK16 needs 4.5 dB
+Eb/N0 at all three rates and CSK8 5.0 to 5.5 dB, against 4.0 dB for DS4 ½: the
+textbook trend, that noncoherent orthogonal signalling needs more Eb/N0 the smaller
+the alphabet and approaches the Shannon limit as it grows.
+
+**Moderate fading, frame loss (%)**, 2.4 kHz, depth 4, two blocks (8 frames), 128
+transmissions a point, carrier offset 5 Hz and clock 10 ppm around which the trials
+are spread (`decdsss sweep --mode csk8-3/4 --ebn0 6 30 4 --trials 128 --fading
+moderate --offset 5 --clock-ppm 10`):
+
+| Mode | 6 dB | 10 | 14 | 18 | 22 | 26 | 30 |
+|---|---|---|---|---|---|---|---|
+| CSK32 ½ (150 bit/s) | 69.5 | 2.0 | 0.8 | 0.2 | 0 | 0 | 0 |
+| CSK16 ½ (240) | 82.1 | 1.1 | 0 | 0 | 0 | 0 | 0 |
+| CSK8 ½ (360) | 94.9 | 15.2 | 0.8 | 0.8 | 0.8 | 0.8 | 0 |
+| DS4 ½ (420), from the DS2 and DS1 table | 48.4 | 2.7 | 1.1 | 0 | 0 | 0.8 | 1.6 |
+| CSK32 ¾ (225) | 91.5 | 3.3 | 1.2 | 0.4 | 0 | 0 | 0 |
+| CSK16 ¾ (360) | 96.4 | 13.9 | 0.8 | 0.4 | 0.4 | 0.4 | 0.4 |
+| CSK8 ¾ (540) | 99.9 | 61.7 | 7.9 | 1.7 | 0.7 | 1.0 | 0.9 |
+| DS4 ¾ (630), same table | 89.0 | 16.2 | 3.1 | 3.1 | 3.1 | 3.1 | 2.3 |
+
+CSK16 ½ has no floor to speak of from 14 dB and CSK8 ½ under one per cent; CSK8 ¾
+costs about 8 dB more Eb/N0 than DS4 ¾ to get there but then sits at under 1 % where
+DS4 ¾ stays at about 3 %. So at the rates between CSK32 and DS4 the fast CSK modes
+are floor-free options on a moderate HF path, at 0.5 to 1.5 dB more Eb/N0 on AWGN
+and several dB more on fading. They are not better on every channel: frame loss at
+14 / 26 dB Eb/N0 (the same sweep with `--depth 2 --trials 64`, ½ rate, 256 frames a
+point):
+
+| Channel | DS4 ½ | CSK32 ½ | CSK16 ½ | CSK8 ½ |
+|---|---|---|---|---|
+| moderate | 1.2 / 0.8 | 0 / 0 | 0 / 0 | 0 / 0 |
+| flutter | 0 / 0 | 1.6 / 0 | 3.1 / 0 | 1.6 / 1.6 |
+| poor | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| good | 6.6 / 2.3 | 2.3 / 0 | 3.5 / 1.6 | 10.2 / 0.8 |
+
+On flutter fading, the fast Doppler that noncoherent detection is meant for, DS4 ½
+is no worse than the CSK modes (measured above: the differences are a few frames of
+256); the case for CSK is the lower floor on moderate and good fading, not flutter.
+
+**The header stays CSK256.** A shorter header would save the start-up (the CSK64
+header is 2.9 s against 8.5 s, as for DS4), and was measured for the fast CSK modes
+(moderate fading, depth 2, 128 transmissions, Eb/N0 14 / 22 / 30 dB, frame loss %):
+CSK16 ½ with the CSK256 header 0 / 0 / 0, CSK128 2.2 / 0.4 / 0.4, CSK64 2.3 / 1.2 /
+1.2; CSK8 ½ 1.4 / 0 / 0, 5.1 / 3.1 / 3.1, 3.1 / 1.6 / 1.2. The shorter headers give
+the timing loop less to start from (as measured for DS8, above), and cost the very
+floor that is the point of these modes.
+
+**CSK4 was built and is not offered.** An alphabet of 4 (2 bits in 4 chips, 480 info
+bit/s at rate ½) decodes on AWGN from 6.0 dB Eb/N0, 2 dB above DS4 ½ for 14 % more
+rate, and on moderate fading (depth 4, ½ rate) lost 16 % of its frames at 14 dB, 8.6
+% at 18 dB and about 7 % from 22 dB up, against 0 to 1.6 % for CSK8 ½ and DS4 ½. A
+path delayed by two chips overlaps half of a 4-chip symbol, so the neighbouring
+symbol's Walsh code leaks into the decision (derived; not tested further). Its loss
+also depended oddly on the interleaver (26 dB, 64 transmissions: 1.6 / 0.8 / 8.2 /
+1.3 % at depth 1 / 2 / 4 / 8); that was not understood, and DS4 ½ beats it at nearly
+the same rate in any case. The header's alphabet code 6 is left for it.
+
+Not measured: `3k` and `500` for these modes (AWGN or fading), and what they do in
+the presence of interference.
 
 ### Not yet measured
 

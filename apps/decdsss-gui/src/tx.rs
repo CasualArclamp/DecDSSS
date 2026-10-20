@@ -1897,12 +1897,17 @@ mod tests {
             nearest_mode(Family::DsPsk, Some(m("csk256-1/2")), p),
             Some(m("ds64-1/2"))
         );
-        // Faster than any CSK mode: the fastest CSK mode.
+        // DS4 3/4 is 787.5 bit/s on 3k; csk8-3/4 is 675 (0.67 dB under).
         assert_eq!(
             nearest_mode(Family::Csk, Some(m("ds4-3/4")), p),
-            Some(m("csk32-3/4"))
+            Some(m("csk8-3/4"))
         );
-        assert_eq!(nearest_mode(Family::Csk, None, p), Some(m("csk32-3/4")));
+        // Faster than any CSK mode: the fastest CSK mode (DS1 3/4 is 3150 bit/s on 3k).
+        assert_eq!(
+            nearest_mode(Family::Csk, Some(m("ds1-3/4")), p),
+            Some(m("csk8-3/4"))
+        );
+        assert_eq!(nearest_mode(Family::Csk, None, p), Some(m("csk8-3/4")));
     }
 
     #[test]

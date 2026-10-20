@@ -14,8 +14,11 @@ pub const PILOT_INTERVAL: u32 = 8;
 /// left, so they want a clean channel (DESIGN.md, Verification).
 pub const DS_SPREADS: [u16; 7] = [1, 2, 4, 8, 16, 32, 64];
 
-/// Alphabet sizes (= chips a symbol) offered for CSK.
-pub const CSK_SIZES: [u16; 4] = [32, 64, 128, 256];
+/// Alphabet sizes (= chips a symbol) offered for CSK, fastest first. 16 and 8 are
+/// the fast end added on 2026-10-20: fewer chips a symbol, so fewer Walsh codes
+/// to tell the right one from and less spreading against multipath. (CSK 4 was
+/// built and measured and is not offered: DESIGN.md, *CSK16 and CSK8*.)
+pub const CSK_SIZES: [u16; 6] = [8, 16, 32, 64, 128, 256];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Family {
@@ -192,6 +195,10 @@ impl Mode {
             (Profile::W2400, DsPsk, 4, R3_4) => 5.0,
             (Profile::W2400, DsPsk, 16, R3_4) => 4.5,
             (Profile::W2400, Csk, 32 | 64 | 128 | 256, R1_2) => 4.0,
+            // CSK 16 and 8, measured 2026-10-20 the same way.
+            (Profile::W2400, Csk, 16, R1_2 | R2_3 | R3_4) => 4.5,
+            (Profile::W2400, Csk, 8, R1_2 | R3_4) => 5.0,
+            (Profile::W2400, Csk, 8, R2_3) => 5.5,
             (Profile::W2400, Csk, 32, R3_4) => 4.0,
             (Profile::W2400, Csk, 64, R3_4) => 3.5,
             (Profile::W3000, DsPsk, 8, R1_2) => 4.0,
@@ -287,6 +294,28 @@ mod tests {
     }
 
     #[test]
+    fn the_fast_csk_modes_are_the_ladders_next_rungs() {
+        // 1920 / L symbols a second × log2 L bits × the code rate.
+        let r = |s: &str| m(s).info_bit_rate(Profile::W2400);
+        assert_eq!(r("csk16-1/2"), 240.0);
+        assert_eq!(r("csk8-1/2"), 360.0);
+        assert_eq!(r("csk8-3/4"), 540.0);
+        // Each halving of the alphabet takes one bit off a symbol and half the chips:
+        // 5/32 → 4/16 → 3/8 bits a chip, so the rate goes up by 1.6 and 1.5.
+        assert!((r("csk16-1/2") / r("csk32-1/2") - 1.6).abs() < 1e-12);
+        assert!((r("csk8-1/2") / r("csk16-1/2") - 1.5).abs() < 1e-12);
+        // CSK 8 is still under DS4: 360 against 420 bit/s at rate 1/2.
+        assert!(r("csk8-1/2") < r("ds4-1/2"));
+        // Fastest first within the family.
+        let csk: Vec<Mode> = Mode::all()
+            .into_iter()
+            .filter(|x| x.family == Family::Csk)
+            .collect();
+        assert_eq!(csk[0], m("csk8-3/4"));
+        assert_eq!(csk.last().copied(), Some(m("csk256-1/2")));
+    }
+
+    #[test]
     fn csk_rates_on_2k4() {
         // 1920 / L × log2 L.
         assert_eq!(m("csk32").coded_bit_rate(Profile::W2400), 300.0);
@@ -330,6 +359,8 @@ mod tests {
         assert_eq!(m("ds8-1/2").ebn0_measured_db(Profile::W2400), Some(4.5));
         assert_eq!(m("csk64-1/2").ebn0_measured_db(Profile::N500), Some(6.0));
         assert_eq!(m("ds2-1/2").ebn0_measured_db(Profile::W2400), Some(3.0));
+        assert_eq!(m("csk8-2/3").ebn0_measured_db(Profile::W2400), Some(5.5));
+        assert_eq!(m("csk8-1/2").ebn0_measured_db(Profile::W3000), None);
         assert_eq!(m("ds1-3/4").ebn0_measured_db(Profile::W2400), Some(4.0));
         assert_eq!(m("ds1-3/4").ebn0_measured_db(Profile::W3000), None);
         assert_eq!(m("ds4-2/3").ebn0_measured_db(Profile::W2400), None);

@@ -221,13 +221,20 @@ mod tests {
     #[ignore]
     fn debug_ds4_floor() {
         let mode = std::env::var("DEBUG_MODE").unwrap_or_else(|_| "ds4-2/3".into());
+        // `DEBUG_DEPTH`, `DEBUG_NBLOCKS` and `DEBUG_EBN0` change what is hunted.
+        let env = |k: &str, d: f64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
         let base = Scenario {
             profile: Profile::W2400,
             mode: Mode::from_name(&mode).unwrap(),
-            depth: 2,
-            nblocks: 4,
+            depth: env("DEBUG_DEPTH", 2.0) as usize,
+            nblocks: env("DEBUG_NBLOCKS", 4.0) as u16,
             segments: 1,
-            ebn0_db: 30.0,
+            ebn0_db: env("DEBUG_EBN0", 30.0),
             fading: Some(Watterson::MODERATE),
             offset_hz: 5.0,
             clock_ppm: 10.0,
@@ -267,7 +274,7 @@ mod tests {
                 session: 1,
                 frame0: 0,
                 nblocks: sc.nblocks,
-                total_frames: 0,
+                total_frames: n as u16,
             },
             frames: frames(&layout, n),
         };

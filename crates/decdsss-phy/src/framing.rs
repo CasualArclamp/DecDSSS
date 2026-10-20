@@ -169,11 +169,16 @@ fn profile_index(p: Profile) -> u64 {
 /// ladder in `decdsss_core::mode` is in speed order, which is not this one.)
 const DS_WIRE: [u16; 7] = [4, 8, 16, 32, 64, 2, 1];
 
+/// The CSK alphabet sizes by their 3-bit code in the header: the original ladder's
+/// four in their old places, and two of the four that were free for the fast end
+/// (codes 6 and 7 are still free).
+const CSK_WIRE: [u16; 6] = [32, 64, 128, 256, 16, 8];
+
 /// The spreading factors or alphabet sizes of a family, in header-code order.
 fn wire_ladder(f: Family) -> &'static [u16] {
     match f {
         Family::DsPsk => &DS_WIRE,
-        Family::Csk => &decdsss_core::mode::CSK_SIZES,
+        Family::Csk => &CSK_WIRE,
     }
 }
 
@@ -397,6 +402,19 @@ mod tests {
             codes, ladder,
             "the header can name every mode on the ladder"
         );
+    }
+
+    #[test]
+    fn csk_alphabets_keep_their_header_codes() {
+        // The four of the original ladder, in their places; 16 and 8 took two of the
+        // four that were free.
+        assert_eq!(CSK_WIRE[..4], [32, 64, 128, 256]);
+        assert_eq!(CSK_WIRE[4..], [16, 8]);
+        let mut codes: Vec<u16> = CSK_WIRE.to_vec();
+        codes.sort_unstable();
+        let mut ladder = decdsss_core::mode::CSK_SIZES.to_vec();
+        ladder.sort_unstable();
+        assert_eq!(codes, ladder);
     }
 
     #[test]

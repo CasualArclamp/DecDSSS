@@ -2408,8 +2408,25 @@ mod tests {
 
     #[test]
     fn csk_blocks_decode_on_a_clean_channel() {
-        for mode in ["csk32-1/2", "csk64-2/3", "csk128-1/2", "csk256-3/4"] {
-            let ch = channel(Profile::W2400, 0.0);
+        for mode in [
+            "csk8-3/4",
+            "csk8-2/3",
+            "csk16-1/2",
+            "csk32-1/2",
+            "csk64-2/3",
+            "csk128-1/2",
+            "csk256-3/4",
+        ] {
+            // CSK 16 and 8 need up to -3.7 and -1.5 dB in-band (measured on AWGN, rates
+            // 1/2 to 3/4), so 0 dB is enough for them too; 10 dB is clear of both.
+            let ch = channel(
+                Profile::W2400,
+                if mode.starts_with("csk8") || mode.starts_with("csk16") {
+                    10.0
+                } else {
+                    0.0
+                },
+            );
             let (ok, total, note) = recover(Profile::W2400, mode, 1, 2, &ch);
             assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");
         }
