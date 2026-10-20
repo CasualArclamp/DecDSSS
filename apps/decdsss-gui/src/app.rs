@@ -821,6 +821,10 @@ impl App {
         if self.monitor_on {
             ui.add(
                 egui::Slider::new(&mut self.monitor_volume, 0.0..=4.0)
+                    // Log scale: equal slider travel is an equal dB step, so the
+                    // quiet end has room (0.002 to 4 is 66 dB; 0 is the far left).
+                    .logarithmic(true)
+                    .smallest_positive(0.002)
                     .show_value(false)
                     .text("vol"),
             );

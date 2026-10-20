@@ -11,6 +11,10 @@ use std::time::Duration;
 /// monitor does not fall behind the receiver.
 const MAX_BACKLOG: Duration = Duration::from_millis(400);
 
+/// A fixed 25 % cut (x0.75, about -2.5 dB) under the volume slider: the monitor
+/// was too loud at the old slider positions.
+const TRIM: f32 = 0.75;
+
 struct Open {
     stream: OutputStream,
     rate: u32,
@@ -87,7 +91,7 @@ impl Monitor {
         }
         let mut block = Vec::with_capacity(chunk.len() * o.channels);
         for &v in chunk {
-            let v = (v * self.volume).clamp(-1.0, 1.0);
+            let v = (v * self.volume * TRIM).clamp(-1.0, 1.0);
             block.extend(std::iter::repeat_n(v, o.channels));
         }
         let _ = o.stream.write(&block);
