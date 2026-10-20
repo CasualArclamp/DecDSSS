@@ -224,6 +224,8 @@ impl Receiver {
 
     /// The state for a display; cheap enough to take a few times a second.
     pub fn snapshot(&self, search_cols: usize) -> Snapshot {
+        // Chips in a preamble period, by which a header try may be moved.
+        let p = crate::codes::preamble_len(self.profile);
         Snapshot {
             profile: self.profile,
             band: self.band,
@@ -236,20 +238,22 @@ impl Receiver {
                     freq_hz: a.freq_hz,
                     header_stage: matches!(a.step, Step::Header(..)),
                     header_alphabet: match &a.step {
-                        Step::Header(_, i, _) => crate::tx::HEADER_ALPHABETS[*i],
+                        Step::Header(_, i, _) => header::header_try(*i).1,
                         Step::Preamble(_) => 0,
                     },
                     header_since_s: match &a.step {
-                        Step::Header(l, _, _) => {
-                            ((self.buf.end() as f64 - l.header_start) / self.rate).max(0.0)
+                        Step::Header(l, i, _) => {
+                            let start =
+                                header::shifted(l, header::header_try(*i).0, p).header_start;
+                            ((self.buf.end() as f64 - start) / self.rate).max(0.0)
                         }
                         Step::Preamble(_) => 0.0,
                     },
                     header_needs_s: match &a.step {
                         Step::Header(l, i, _) => {
-                            (header::header_need(l, crate::tx::HEADER_ALPHABETS[*i])
-                                - l.header_start)
-                                / self.rate
+                            let (shift, alphabet) = header::header_try(*i);
+                            let l = header::shifted(l, shift, p);
+                            (header::header_need(&l, alphabet) - l.header_start) / self.rate
                         }
                         Step::Preamble(_) => 0.0,
                     },
@@ -379,6 +383,7 @@ impl Receiver {
             Lock(Box<PreambleLock>),
             Open(Box<HeaderResult>),
         }
+        let p = crate::codes::preamble_len(self.profile);
         let mut k = 0;
         while k < self.attempts.len() {
             let next = match &mut self.attempts[k].step {
@@ -390,27 +395,39 @@ impl Receiver {
                     }
                     State::Locked(lock) => Next::Lock(Box::new(lock)),
                 },
-                Step::Header(lock, alpha, watch) => {
+                Step::Header(lock, try_, watch) => {
                     // The shortest alphabet first; one that does not decode gives way
-                    // to the next, and only the last one's failure ends the attempt.
-                    let alphabets = crate::tx::HEADER_ALPHABETS;
+                    // to the next, then the same a period earlier and a period later
+                    // (`header::HEADER_SHIFTS`), and only the last one's failure
+                    // ends the attempt.
                     let mut out = Next::Stay;
-                    while *alpha < alphabets.len() {
-                        match demod_header(&self.buf, lock, self.rate, alphabets[*alpha]) {
+                    while *try_ < header::HEADER_TRIES {
+                        let (shift, alphabet) = header::header_try(*try_);
+                        // Rust note: `Cow` borrows the lock where it is not moved and
+                        // owns a moved copy where it is, so the usual case clones
+                        // nothing.
+                        let at: std::borrow::Cow<PreambleLock> = if shift == 0 {
+                            std::borrow::Cow::Borrowed(&**lock)
+                        } else {
+                            std::borrow::Cow::Owned(header::shifted(lock, shift, p))
+                        };
+                        match demod_header(&self.buf, &at, self.rate, alphabet) {
                             HeaderOutcome::NeedMore(_) => break,
                             HeaderOutcome::Bad(why) => {
-                                *alpha += 1;
-                                if *alpha == alphabets.len() {
+                                *try_ += 1;
+                                if *try_ == header::HEADER_TRIES {
                                     self.pending.push_back(Event::Lost(why.into()));
                                     out = Next::Drop;
                                 } else {
+                                    let (shift, alphabet) = header::header_try(*try_);
+                                    let n = crate::tx::HEADER_ALPHABETS.len();
                                     // Rust note: `**watch` is the value inside the
                                     // box; assigning it drops the old watch in place.
                                     **watch = HeaderWatch::new(
-                                        lock,
+                                        &header::shifted(lock, shift, p),
                                         self.rate,
-                                        alphabets[*alpha],
-                                        alphabets[..*alpha].to_vec(),
+                                        alphabet,
+                                        crate::tx::HEADER_ALPHABETS[..*try_ % n].to_vec(),
                                     );
                                 }
                             }
@@ -451,7 +468,8 @@ impl Receiver {
         for a in &self.attempts {
             keep = keep.min(match &a.step {
                 Step::Preamble(t) => t.oldest_needed(),
-                Step::Header(l, _, _) => (l.header_start - 12.0 * l.step) as i64,
+                // A period more for the try a period earlier.
+                Step::Header(l, _, _) => (l.header_start - (12.0 + p as f64) * l.step) as i64,
             });
         }
         for ch in &self.channels {

@@ -328,11 +328,21 @@ of ±100 and ±300 ppm change nothing at 4 dB.
    alarm dies on its own and cannot block a real preamble. Each period of the
    preamble is correlated coherently with A and B at early, prompt and late
    timing; a loop follows the boundary, periods with no signal in them are
-   ignored (the search window starts early), the pattern A…A B B is found from a
-   per-period score that needs no noise estimate, and a line through the period
-   boundaries gives the clock and the header start.
+   ignored (the search window starts early), and the end of the preamble is the
+   period that best fits the whole pattern, twelve A then two B, weighed by each
+   period's correlation power over the noise (a generalized likelihood with each
+   period's fading gain unknown), so a period lost in a fade counts for nothing
+   rather than for a random answer. The B pair must show (2 nats of its own
+   evidence, B over A), the fit must beat the period before and the two after;
+   if no B pair ever stands out, the best-fitting period is taken anyway when the
+   pattern fits by 20 nats or more. A line through the period boundaries gives the
+   clock and the header start. (See *The 500 Hz header on fading* under
+   Verification for why, and the per-period ratio test it replaced.)
 3. **Header** — CSK symbols on the call code (alphabets above), the rake fingers from the
    preamble's delay profile, a log-Bessel noncoherent metric, de-interleave, LDPC.
+   If no alphabet decodes where the preamble put the header, each is tried again a
+   preamble period earlier, then a period later (`header::HEADER_SHIFTS`): a faded B
+   pair leaves the preamble's end a period out more often than any other way.
    Once decoded, its chips are known exactly, and they are used to refine timing,
    clock and carrier (a quarter second at a time over a fine lag grid, following
    the timing from segment to segment) and to place the fingers from the profile
@@ -1903,10 +1913,10 @@ not need the help there, its pilots come 30 a second.)
   says it cannot (above). DSC64 delivers, and from 15 dB every transmission whose
   header decoded was delivered whole (17 of 32 headers and 60 of 128 frames at 15 dB;
   19 and 76 at 18): what is left is the header. DSC32 the same from 15 dB (28 and 112,
-  27 and 108). The long CSK256 header's symbols are 0.64 s on `500`, longer than a
-  0.5 Hz channel holds still, and it decodes in 15 to 24 of 32 transmissions here
-  whichever the payload family. That is the next thing to fix on `500`, not the
-  payload.
+  27 and 108). The header decoded in 15 to 24 of 32 transmissions here whichever
+  the payload family. That was the next thing to fix on `500`, and it turned out to
+  be the preamble's end, not the header's alphabet: *The 500 Hz header on fading*
+  below has the cause, the fix and these sweeps again.
 - **Chunks.** The pilot chunks were 64 chips at first. On a genie start (AWGN,
   `2k4`, depth 2, two blocks, 24 transmissions, `debug_cdm_floor`), DSC64 ½ at 4.5 dB
   lost 22 of 96 frames with them, none with the carrier loop frozen
@@ -1986,13 +1996,164 @@ times; "of" is the same for the cells to its right in the row.) What it shows:
 test (DS8 and DSC8, 20 s, +30 ms, −3 Hz, the seed on which DS8 without the search
 lost all eight frames after the fade).
 
+### The 500 Hz header on fading (2026-10-20)
+
+The weak modes' header (CSK256, rate-¼ n = 512 LDPC) decoded in only 15 to 24 of 32
+moderate-fading transmissions on `500` (*A code-multiplexed pilot*), while DSC32 and
+DSC64 delivered every transmission whose header decoded. The brief was a header that
+decodes about as well as the payload without losing the weak modes' AWGN threshold.
+The candidates were a shorter alphabet on `500`, noncoherent combining of sub-symbol
+segments, and a repeated header. It turned out to be none of them: the header was not
+the problem, the end of the preamble was.
+
+**Measured first** (`rx::header::tests::header_alphabet_curve_500`, ignored: preamble and
+header alone through the receiver's acquisition, preamble tracker and header
+demodulator; 16 trials a point, in-band SNR; carrier offsets 1 ± 6 Hz and clocks 10 ±
+30 ppm as the sweeps spread them; built at ae62abf). Headers decoded, in each alphabet
+alone:
+
+| Channel | Alphabet | −16 | −13 | −10 | −7 | −4 | −1 | +2 dB |
+|---|---|---|---|---|---|---|---|---|
+| AWGN | 64 | 0 | 1 | 16 | 16 | 16 | 16 | 16 |
+| | 128 | 0 | 15 | 16 | 16 | 16 | 16 | 16 |
+| | 256 | 3 | 15 | 16 | 16 | 16 | 16 | 16 |
+| moderate | 64 | 0 | 0 | 7 | 11 | 13 | 13 | 15 |
+| | 128 | 0 | 4 | 7 | 13 | 11 | 13 | 14 |
+| | 256 | 0 | 5 | 8 | 12 | 11 | 15 | 15 |
+
+Every alphabet lost about the same share on fading, CSK64's 0.16 s symbols included,
+and kept losing it at +2 dB in-band, where a CSK256 symbol is about 27 dB over the noise
+(derived: SNR × 500 Hz × 0.64 s). So it was not the symbol length. The carrier the
+preamble handed over was within 0.25 Hz in every failure (a 0.25 Hz error costs a
+0.64 s symbol 0.4 dB, derived: sinc²(0.16) = 0.92), and the true carrier in its place changed
+nothing. The start was the problem: the failures' header starts were off by whole
+preamble periods, 127 chips, from 9 periods early to 4 late. With the true carrier and
+start, CSK256 decoded in 14 of 16 at −7 and −4 dB, against 12 and 11.
+
+**Why the preamble ended in the wrong place.** The end was the B pair found from a
+per-period ratio z = (p_B − p_A)/(p_B + p_A): the mean z over two periods, less the mean
+over the three before, had to exceed 0.7 at a local maximum. In a period lost in a fade
+both powers are noise, p_B/(p_A + p_B) of two equal exponentials is uniform, and so z
+is uniform on ±1. Two faded A periods after strong ones then pass for the B pair three
+times in four (derived: the pair's mean z need only exceed −0.3, and the sum of two
+uniforms on ±1 exceeds −0.6 with probability 1 − 1.4²/8 = 0.755). On `500` the fading
+is flat: the moderate channel's second path is 1 ms, 0.4 chip, away and gives no
+diversity. Each path fades 10 dB under its mean about every 4 s, for about 0.38 s
+(derived: Rayleigh level crossings at 2√π·σ_f·ρ·e^(−ρ²) a second, σ_f the RMS Doppler
+spread, 0.25 Hz, and ρ² = 0.1; the mean fade (1 − e^(−ρ²)) over that), 1.2 preamble
+periods of 0.32 s, and longer and deeper ones often enough. The 2.4 kHz profile has it
+too, less often.
+
+**The change** (receiver only; Receiver chain, items 2 and 3):
+
+- *End of the preamble.* The period that best fits the whole pattern, twelve A then two
+  B, by a generalized likelihood. Each period scores x − 1 − ln x for the template it is
+  given, where x is that template's correlation power over the noise, maximised over the
+  period's unknown fading gain, so a faded period scores nothing rather than a random
+  ±1. The noise is the median of the weaker template's power over the periods so far,
+  over ln 2. The B pair must score 2 nats of its own with B over A (noise alone passes a
+  period 1.1 % of the time, derived: e^−4.5), and the fit must be at least the period
+  before's and better than the two after. If no B pair ever stands out (it can fade away
+  whole), the best-fitting period is taken at the end of the tracker's reach, provided
+  the fit is 20 nats or more. Noise alone scores about 2 over the fourteen periods,
+  derived: E[x − 1 − ln x]⁺ = e⁻¹ − E₁(1) = 0.15 for an exponential of mean 1. A wrong
+  guess costs a header that fails its CRC, which a lost preamble costs anyway. The lock
+  comes one period later than before (two periods of look-ahead instead of one), which
+  delays nothing: the shortest header's chips are not all in until 2.9 s after its start
+  on `2k4` and 13.8 s on `500`. `DECDSSS_OLD_PREAMBLE_END` brings the old test back for
+  measurement.
+- *Header tries a period either way.* If no alphabet decodes where the preamble put the
+  header, all are tried again a period earlier, then a period later
+  (`header::HEADER_SHIFTS`). One period out is the commonest miss left. A failed header
+  then costs up to six more demodulations, and a header at the wrong start despreads to
+  noise, so only the LDPC and the CRC can accept one.
+- *The alphabets stay.* The weak modes keep CSK256 on every profile; its curve on fading
+  after the change is below. The air interface does not change, so every build reads
+  what this one sends and the reverse.
+
+**Preamble ends** (`rx::preamble::tests::end_of_preamble_curve`, ignored: preamble and a
+CSK256 header through acquisition and the tracker; 32 trials a point, the same offsets
+and clocks; the end on a path is −1 to +3 chips from the first, which takes in the
+second path at 1.9 chips on `2k4`; built at 960197e, main's slip-search fix 353a2db
+included, the old test by `DECDSSS_OLD_PREAMBLE_END`). Ends on a path / a whole number
+of periods out, old test → new:
+
+| Profile | Channel | −16 | −13 | −10 | −7 | −4 | −1 | +2 dB |
+|---|---|---|---|---|---|---|---|---|
+| 500 Hz | AWGN | 9/6 → 9/5 | 26/2 → 28/0 | 32/0 → 32/0 | 32/0 → 32/0 | 32/0 | 32/0 | 32/0 |
+| | moderate | 5/4 → 4/6 | 12/12 → 15/9 | 21/10 → 24/7 | 24/8 → 31/1 | 29/3 → 32/0 | 30/2 → 32/0 | 30/2 → 32/0 |
+| 2.4 kHz | AWGN | 32/0 | 32/0 | 32/0 | 32/0 | 32/0 | 32/0 | 32/0 |
+| | moderate | 15/12 → 18/5 | 23/8 → 28/3 | 24/8 → 31/1 | 25/7 → 32/0 | 29/3 → 32/0 | 30/2 → 32/0 | 32/0 → 32/0 |
+
+(The rest of each 32 had no lock or a lock off by a fraction of a period: 17 to 23 had no
+lock at −16 dB on `500` with either test, which is the acquisition's limit there. At
+−13 dB on 500 Hz AWGN, 4 locks with either test were off by a fraction of a period: the
+preamble slip search, which `DECDSSS_NO_PREAMBLE_SLIP` turns off. That search's issue,
+not this one's.)
+
+CSK256 on the moderate channel with the new end (the alphabet curve again, on the
+new end without the header tries, which the curve does not use): 0, 6, 15, 15, 16, 16 and 16 of 16 from −16 to +2 dB, against 0, 5, 8, 12, 11,
+15 and 15. CSK128 got 0, 5, 14, 16, 16, 16, 16 and CSK64 0, 0, 6, 14, 14, 15, 16. On
+AWGN, 256 was unchanged (3 at −16 dB, 15 at −13, 16 from −10), 128 was 15 at −13, and
+64 got none at −13. So CSK256 decodes on fading as well as either shorter alphabet or
+better, and holds the AWGN threshold that 64 cannot.
+
+**The whole receiver** (`decdsss sweep --profile 500 --mode dsc32-1/2` and `dsc64-1/2`,
+`--depth 2 --blocks 2 --fading moderate --ebn0 9 18 3 --trials 32 --offset 1 --clock-ppm
+10`; the same seeds in every column; ae62abf is the build the *A code-multiplexed pilot*
+table came from; "main" is main at ac25ed2, which has the slip recovery, measured as this
+branch's build with `DECDSSS_OLD_PREAMBLE_END`, which leaves it main's receiver; "new"
+is c996087). Headers decoded of 32, and frame loss:
+
+| Mode | Eb/N0 (in-band) | ae62abf | main | new |
+|---|---|---|---|---|
+| DSC32 ½ | 9 dB (−7.0) | 22, 37.5 % | 25, 32.0 % | 30, 17.2 % |
+| | 12 dB (−4.0) | 27, 15.6 % | 29, 9.4 % | **32, 0** |
+| | 15 dB (−1.0) | 28, 12.5 % | 30, 6.3 % | **32, 0** |
+| | 18 dB (+2.0) | 27, 15.6 % | 31, 3.1 % | **32, 0** |
+| DSC64 ½ | 9 dB (−10.0) | 15, 92.2 % | 20, 83.6 % | 29, 77.3 % |
+| | 12 dB (−7.0) | 12, 68.8 % | 20, 43.8 % | 29, 19.5 % |
+| | 15 dB (−4.0) | 17, 53.1 % | 24, 28.1 % | 29, 12.5 % |
+| | 18 dB (−1.0) | 19, 40.6 % | 26, 21.9 % | 30, 9.4 % |
+
+The new end alone, without the tries a period either way (the same build less them),
+gave DSC32 30, 32,
+30 and 32 headers and DSC64 24, 25, 27 and 29, so the tries add 1 to 5 headers a point on
+DSC64. Of the five DSC64 headers that build still lost at 15 dB
+(`sim::tests::debug_header_loss`), two locked a period out (one early from the fallback,
+one late), two locked right and failed the LDPC, and one was not traced.
+
+**AWGN and 2.4 kHz kept** (`decdsss sweep`, main against new as above):
+
+- DSC64 ½ on `2k4`, AWGN, depth 4, 24 transmissions: no frame lost at 3.5, 4.0 or
+  4.5 dB with either.
+- DSC64 ½ on `500`, AWGN, depth 2, 24 transmissions, 3.5 to 5 dB (−15.5 to −14 dB
+  in-band): headers 9, 9, 16 and 19 with main, 10, 10, 17 and 22 new; frame loss 87.5,
+  75.0, 44.8 and 35.4 % with main, 90.6, 70.8, 40.6 and 27.1 % new. The weakest mode on
+  `500` is limited at its AWGN threshold by acquisition and the header on both builds,
+  not by this change.
+- DSC16 ½ on `2k4`, moderate fading, depth 4, 32 transmissions, 6, 9 and 12 dB: the
+  same on both, every header and 4.69, 1.56 and 0 % frame loss.
+
+**Verdict.** The 500 Hz header problem was the end of the preamble, and the fix is in
+the receiver. From −4 dB in-band, DSC32's headers now decode in every moderate-fading
+transmission and it loses no frame. DSC64's headers decode in 29 or 30 of 32 at −7 to
+−1 dB, against 20 to 26 on main. There the header costs 2 or 3 transmissions in 32 and
+the payload, once the header is in, 1 to 3 more (in frames, four a transmission):
+about level, which was the aim. CSK256
+stays, measured on `500` as no worse than 64 or 128 on fading and the only one of the
+three that decodes at −13 dB on AWGN. No AWGN threshold was lost. The air interface is
+unchanged, so nothing breaks between builds; an older receiver keeps the old end test
+and simply loses more headers on fading. Limits of the evidence: the moderate channel
+only (not poor or flutter, nor 3 kHz), 16 to 32 trials a point, and at −10 dB on `500`
+the payload, not the header, is what is left.
+
 ### Not yet measured
 
 The 3 kHz profile for `dsc`, `dsc` at rates ⅔ and ¾, and the reacquisition on fading
-channels (only silence, slips and carrier steps on AWGN were measured); the 500 Hz
-header on fading (the long CSK256 header decodes in about half to three quarters of
-moderate-fading transmissions on `500`, see *A code-multiplexed pilot*);
-the 3 kHz and 500 Hz profiles on fading (DS2, DS1, CSK16, CSK8 and bi-orthogonal
+channels (only silence, slips and carrier steps on AWGN were measured); the new end
+of the preamble on poor and flutter fading and on the 3 kHz profile (only AWGN and
+the moderate channel were measured, *The 500 Hz header on fading*); the 3 kHz and 500 Hz profiles on fading (DS2, DS1, CSK16, CSK8 and bi-orthogonal
 CSK included); bi-orthogonal CSK at rates ⅔ and ¾; flutter fading beyond the
 points above; the voice modes on fading beyond the Codec2 1200 and 1600 points
 under *Faster voice*; the effect of in-band interference; two stations at once

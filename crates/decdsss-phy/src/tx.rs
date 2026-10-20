@@ -59,7 +59,13 @@ pub fn header_len(l: usize) -> usize {
 /// frames with the long header, 0.9 % with 64, 1.2 % with 128 and 2.8 % with 32 (a
 /// short header gives the timing loop less to start from); DS8 1/2 at 10 dB 2.3 %,
 /// 3.2 %, 3.2 % for 256, 128, 64. So the fast modes use 64 (DS4) and 128 (SF 8, 16);
-/// the slow ones keep the 256 they need.
+/// the slow ones keep the 256 they need. The same on every profile: on 500 Hz
+/// (`header_alphabet_curve_500`, 16 trials a point, preamble included), 256
+/// decoded on the moderate channel as well as 64 or 128 or better (15 of 16 from
+/// -10 dB in-band, 16 from -4; 64 got 6 of 16 at -10 dB) and on AWGN from -13 dB,
+/// where 64 got none, so a shorter symbol bought nothing against that channel's
+/// 0.5 Hz spread. (What lost 500 Hz headers on fading was the preamble's end,
+/// `rx::preamble`.)
 pub fn header_alphabet_for(mode: decdsss_core::Mode) -> usize {
     use decdsss_core::Family;
     match (mode.family, mode.spread) {
