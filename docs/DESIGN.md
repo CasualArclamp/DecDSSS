@@ -1340,6 +1340,13 @@ moderate fading at 20 dB, four seeds): BCSK64 gets 48 of 48 frames at every size
 both channels, as CSK64 does (the rewind's watch judges the decided code's power,
 which the sign does not touch).
 
+**A clash to settle before both ship.** The unmerged branch `csk-fast-modes` (338d716)
+puts CSK16 and CSK8 on header spread codes 4 and 5 of the same family bit, where this
+prototype puts BCSK32 to BCSK256 on 4 to 7. The header's mode field has eight codes in
+that family (3 bits) and six are then wanted by CSK, which leaves two for four BCSK
+sizes. The way out is a wider mode field in a version-2 header (the 2-bit version field
+has values 2 and 3 unused), read as the version-1 header is; not done here.
+
 **Round trip.** `rx::payload::tests::bi_orthogonal_csk_blocks_decode_on_a_clean_channel`
 (BCSK32 ½, BCSK64 ⅔, BCSK128 ½, BCSK256 ¾); `decdsss tx --mode bcsk64-1/2` through
 `decdsss channel` (−8.5 dB in the band with 3 Hz offset and 15 ppm; and −2 dB on
