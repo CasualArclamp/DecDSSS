@@ -25,6 +25,24 @@ pub const CSK_SIZES: [u16; 6] = [8, 16, 32, 64, 128, 256];
 /// `bcsk16` is not a mode.
 pub const BICSK_SIZES: [u16; 4] = [32, 64, 128, 256];
 
+/// Spreading factors offered for DS-PSK with a code-multiplexed pilot (`dsc`,
+/// added 2026-10-20): the deep end, where the time-multiplexed pilots are sparse in
+/// time (DS64 on 500 Hz has 0.78 a second). The data needs a Walsh code of SF chips
+/// other than the pilot's, so SF 1 cannot be one and SF 2 would leave one code.
+pub const CDM_SPREADS: [u16; 4] = [8, 16, 32, 64];
+
+/// The share of a `dsc` chip's power that goes to the pilot (Walsh code 0): 1/8,
+/// the same 10·log10(8/7) = 0.58 dB overhead as DS-PSK's one pilot symbol in eight
+/// (derived), so the two pilot schemes compare on equal terms.
+pub const CDM_PILOT_SHARE: f32 = 0.125;
+
+/// The Walsh code a `dsc` data symbol is spread by: code 1, the chips alternating
+/// in sign. Any code but 0 is orthogonal to the pilot over a symbol; this one has
+/// the most sign changes, so a carrier error leaks least of the pilot into it (the
+/// pilot then has a slow ramp across the symbol, which an alternating code sums
+/// nearly to zero).
+pub const CDM_DATA_CODE: usize = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Family {
     /// Direct sequence: a QPSK symbol held for SF chips, coherent, pilot-aided.
@@ -38,12 +56,24 @@ pub enum Family {
     /// so no pilots are needed and the first symbol of a block is the sign
     /// reference.
     BiCsk,
+    /// Direct sequence with a code-multiplexed pilot (`dsc`): every chip carries
+    /// the pilot (Walsh code 0, all ones, at [`CDM_PILOT_SHARE`] of the power) and
+    /// the data symbol spread by Walsh code [`CDM_DATA_CODE`], both under the
+    /// scrambler. QPSK on every symbol, coherent, with a channel estimate that never
+    /// stops.
+    DsCdm,
 }
 
 impl Family {
     /// Does a symbol pick a Walsh code (CSK and bi-orthogonal CSK)?
     pub const fn is_walsh(self) -> bool {
         matches!(self, Family::Csk | Family::BiCsk)
+    }
+
+    /// Is a symbol a coherent QPSK symbol held over its chips (DS-PSK, and DS-PSK
+    /// with a code-multiplexed pilot)?
+    pub const fn is_ds(self) -> bool {
+        matches!(self, Family::DsPsk | Family::DsCdm)
     }
 }
 
@@ -105,6 +135,7 @@ impl Mode {
             Family::DsPsk => &DS_SPREADS,
             Family::Csk => &CSK_SIZES,
             Family::BiCsk => &BICSK_SIZES,
+            Family::DsCdm => &CDM_SPREADS,
         };
         ladder.contains(&spread).then_some(Mode {
             family,
@@ -113,13 +144,15 @@ impl Mode {
         })
     }
 
-    /// Every valid mode, DS-PSK first, fastest first within a family.
+    /// Every valid mode, DS-PSK first and `dsc` last (after the CSK families, so the
+    /// older ladders keep their places), fastest first within a family.
     pub fn all() -> Vec<Mode> {
         let mut v = Vec::new();
         for (family, ladder) in [
             (Family::DsPsk, &DS_SPREADS[..]),
             (Family::Csk, &CSK_SIZES[..]),
             (Family::BiCsk, &BICSK_SIZES[..]),
+            (Family::DsCdm, &CDM_SPREADS[..]),
         ] {
             for &spread in ladder {
                 for rate in CodeRate::ALL.into_iter().rev() {
@@ -152,10 +185,12 @@ impl Mode {
     /// Coded bits a modulation symbol, averaged over the pilots: QPSK less one
     /// pilot in `PILOT_INTERVAL` for DS-PSK, log2(L) for CSK, log2(L) + 1 for
     /// bi-orthogonal CSK (the block's first symbol has no sign bit to send, a
-    /// share of 1 in a few hundred that this leaves out).
+    /// share of 1 in a few hundred that this leaves out); QPSK on every symbol for
+    /// `dsc`, whose pilot takes power, not symbols.
     pub fn coded_bits_per_symbol(self) -> f64 {
         match self.family {
             Family::DsPsk => 2.0 * f64::from(PILOT_INTERVAL - 1) / f64::from(PILOT_INTERVAL),
+            Family::DsCdm => 2.0,
             Family::Csk => f64::from(self.spread.trailing_zeros()),
             Family::BiCsk => f64::from(self.spread.trailing_zeros()) + 1.0,
         }
@@ -192,6 +227,8 @@ impl Mode {
 
     /// Eb/N0 (dB) from the Es/N0 of a data symbol: pilots carry the same
     /// energy as data symbols, so Eb/N0 = Es/N0 − 10·log10(info bits a symbol).
+    /// For `dsc`, Es is a symbol's whole energy, the pilot's share included (the
+    /// pilot counted as power where DS-PSK counts it as air time).
     pub fn ebn0_from_es_db(self, es_n0_db: f64) -> f64 {
         es_n0_db - 10.0 * self.info_bits_per_symbol().log10()
     }
@@ -245,7 +282,8 @@ impl Mode {
         }
     }
 
-    /// Parses `ds4-2/3`, `DS16 1/2`, `csk64-1/2`, `bcsk64-1/2`. The rate defaults to 1/2.
+    /// Parses `ds4-2/3`, `DS16 1/2`, `csk64-1/2`, `bcsk64-1/2`, `dsc16-1/2`. The rate
+    /// defaults to 1/2.
     pub fn from_name(s: &str) -> Option<Mode> {
         let s = s.trim().to_ascii_lowercase();
         let (head, rate) = match s.split_once(['-', ' ', '@']) {
@@ -255,6 +293,8 @@ impl Mode {
         // `?` on an Option returns None from the function when it is None.
         let (family, digits) = if let Some(d) = head.strip_prefix("bcsk") {
             (Family::BiCsk, d)
+        } else if let Some(d) = head.strip_prefix("dsc") {
+            (Family::DsCdm, d)
         } else if let Some(d) = head.strip_prefix("csk") {
             (Family::Csk, d)
         } else {
@@ -269,6 +309,7 @@ impl Mode {
             Family::DsPsk => "ds",
             Family::Csk => "csk",
             Family::BiCsk => "bcsk",
+            Family::DsCdm => "dsc",
         };
         format!("{f}{}-{}", self.spread, self.rate)
     }
@@ -280,6 +321,7 @@ impl fmt::Display for Mode {
             Family::DsPsk => "DS",
             Family::Csk => "CSK",
             Family::BiCsk => "BCSK",
+            Family::DsCdm => "DSC",
         };
         write!(f, "{fam}{} {}", self.spread, self.rate)
     }
@@ -379,6 +421,28 @@ mod tests {
         assert_eq!(m("bcsk64-2/3").name(), "bcsk64-2/3");
         assert_eq!(m("BCSK128 3/4").family, Family::BiCsk);
         assert_eq!(Mode::from_name("bcsk16"), None);
+    }
+
+    #[test]
+    fn dsc_sends_qpsk_on_every_symbol() {
+        // 1920 / SF symbols/s × 2 bits: 8/7 of DS-PSK's coded rate at the same SF,
+        // since the pilot takes power rather than one symbol in eight.
+        for sf in CDM_SPREADS {
+            let c = m(&format!("dsc{sf}-1/2"));
+            let d = m(&format!("ds{sf}-1/2"));
+            assert_eq!(
+                c.coded_bit_rate(Profile::W2400),
+                2.0 * 1920.0 / f64::from(sf)
+            );
+            let ratio = c.coded_bit_rate(Profile::W2400) / d.coded_bit_rate(Profile::W2400);
+            assert!((ratio - 8.0 / 7.0).abs() < 1e-12);
+        }
+        assert_eq!(m("dsc64-1/2").info_bit_rate(Profile::N500), 6.25);
+        assert_eq!(m("DSC16 2/3").family, Family::DsCdm);
+        assert_eq!(m("dsc16-2/3").name(), "dsc16-2/3");
+        assert_eq!(Mode::from_name("dsc4"), None);
+        assert_eq!(Mode::all().last().copied(), Some(m("dsc64-1/2")));
+        assert!(Family::DsCdm.is_ds() && !Family::DsCdm.is_walsh());
     }
 
     #[test]

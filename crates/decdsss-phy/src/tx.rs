@@ -13,7 +13,7 @@ use crate::codes::{
     walsh_chip,
 };
 use crate::framing::{Header, Layout, frame_bits};
-use decdsss_core::mode::PILOT_INTERVAL;
+use decdsss_core::mode::{CDM_DATA_CODE, CDM_PILOT_SHARE, PILOT_INTERVAL};
 use decdsss_core::{Band, Family, Profile, profile::ROLLOFF};
 use decdsss_dsp::Iq;
 use decdsss_dsp::shaper::Shaper;
@@ -64,7 +64,8 @@ pub fn header_alphabet_for(mode: decdsss_core::Mode) -> usize {
     use decdsss_core::Family;
     match (mode.family, mode.spread) {
         (Family::DsPsk, 0..=4) => 64,
-        (Family::DsPsk, 5..=16) => 128,
+        // `dsc` follows DS-PSK at the same SF (it was not measured on its own).
+        (Family::DsPsk | Family::DsCdm, 5..=16) => 128,
         _ => HEADER_CSK,
     }
 }
@@ -144,11 +145,11 @@ pub fn block_bits(layout: &Layout, frames: &[Vec<u8>]) -> Vec<u8> {
     Interleaver::new(coded.len()).apply(&coded)
 }
 
-/// The block's symbols from its transmit-order bits: for DS-PSK QPSK data
-/// symbols with pilots; for CSK the Walsh code numbers. Short groups are
-/// padded with zero bits.
+/// The block's symbols from its transmit-order bits: QPSK data symbols, with
+/// pilot symbols for DS-PSK and none for `dsc`. Short groups are padded with zero
+/// bits.
 pub fn block_symbols(layout: &Layout, bits: &[u8]) -> Vec<Iq> {
-    assert_eq!(layout.mode.family, Family::DsPsk);
+    assert!(layout.mode.family.is_ds());
     let mut out = Vec::with_capacity(layout.symbols());
     let mut it = bits.iter().copied().chain(std::iter::repeat(0));
     let mut pilot = 0;
@@ -224,8 +225,27 @@ pub fn block_chips(layout: &Layout, frames: &[Vec<u8>], scr: &Scrambler, chip0: 
                 }
             }
         }
+        Family::DsCdm => {
+            let (a, b) = cdm_amplitudes();
+            for (n, sym) in block_symbols(layout, &bits).into_iter().enumerate() {
+                for i in 0..l {
+                    let c = sym * (a * walsh_chip(CDM_DATA_CODE, i)) + Iq::new(b, 0.0);
+                    chips.push(scr.chip(chip0 + n * l + i) * c);
+                }
+            }
+        }
     }
     chips
+}
+
+/// The amplitudes of a `dsc` chip's data and pilot parts: √(1 − β) and √β, β the
+/// pilot's share of the power. The two codes are orthogonal over a symbol, so a
+/// symbol's energy is the chips' L either way; a single chip is not of unit power
+/// (|a·d ± b|² is 1 ± 2ab·Re d: 0.53 to 1.47 at β = 1/8, derived), which raises the
+/// peaks of the signal a little against DS-PSK's chips of constant amplitude.
+pub fn cdm_amplitudes() -> (f32, f32) {
+    let beta = CDM_PILOT_SHARE;
+    ((1.0 - beta).sqrt(), beta.sqrt())
 }
 
 /// A segment to send.

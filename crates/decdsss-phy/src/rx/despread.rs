@@ -66,6 +66,13 @@ pub fn walsh_correlate(u: &[Iq]) -> Vec<Iq> {
     w
 }
 
+/// A `dsc` symbol's data part: the despread chips correlated with the data's Walsh
+/// code ([`decdsss_core::mode::CDM_DATA_CODE`]) over L, as [`sum`] is the pilot's
+/// (code 0) over L. Both come out at the channel times the part's amplitude.
+pub fn cdm_data(u: &[Iq]) -> Iq {
+    walsh_one(u, decdsss_core::mode::CDM_DATA_CODE) / u.len() as f32
+}
+
 /// The correlation with one Walsh code only (for the early/late arms).
 pub fn walsh_one(u: &[Iq], m: usize) -> Iq {
     u.iter()

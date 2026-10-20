@@ -24,17 +24,20 @@ pub const VERSION: u8 = 0;
 /// it could do with a type it does not know.
 pub const VERSION_WIDE: u8 = 1;
 /// The version for the modes whose family does not fit the one family bit:
-/// bi-orthogonal CSK. Its family field is 2 bits (0 DS-PSK, 1 CSK, 2 bi-orthogonal
-/// CSK, 3 unused), its type field 4 bits as in version 1, and its session field 4
-/// bits (0 to 15) to pay for them. Every DS-PSK and CSK header is still version 0
-/// or 1, bit for bit as before, and a build that predates version 2 skips such a
-/// header, as it skips any version it does not know.
+/// bi-orthogonal CSK and DS-PSK with a code-multiplexed pilot. Its family field is 2
+/// bits (0 DS-PSK, 1 CSK, 2 bi-orthogonal CSK, 3 `dsc`), its type field 4 bits as in
+/// version 1, and its session field 4 bits (0 to 15) to pay for them. Every DS-PSK
+/// and CSK header is still version 0 or 1, bit for bit as before, and a build that
+/// predates version 2 skips such a header, as it skips any version it does not know.
+/// (`dsc` took the last family code on 2026-10-20; a build from before that reads a
+/// version-2 header with family 3 as no header, the same as an unknown version.)
 pub const VERSION_FAMILY: u8 = 2;
 
 /// The version a header for this mode and payload type is written in: 2 for
-/// bi-orthogonal CSK, otherwise the type's (0, or 1 for a type from code 8 up).
+/// bi-orthogonal CSK and `dsc`, otherwise the type's (0, or 1 for a type from code 8
+/// up).
 pub fn header_version(family: Family, ptype: PayloadType) -> u8 {
-    if family == Family::BiCsk {
+    if matches!(family, Family::BiCsk | Family::DsCdm) {
         VERSION_FAMILY
     } else {
         ptype.header_version()
@@ -177,12 +180,13 @@ impl BitReader<'_> {
 }
 
 /// The family's code in the header: one bit up to version 1 (0 DS-PSK, 1 CSK),
-/// two in version 2, where bi-orthogonal CSK is 2 and 3 is unused.
+/// two in version 2, where bi-orthogonal CSK is 2 and `dsc` 3.
 fn family_code(f: Family) -> u64 {
     match f {
         Family::DsPsk => 0,
         Family::Csk => 1,
         Family::BiCsk => 2,
+        Family::DsCdm => 3,
     }
 }
 
@@ -191,6 +195,7 @@ fn family_of(code: u64) -> Option<Family> {
         0 => Some(Family::DsPsk),
         1 => Some(Family::Csk),
         2 => Some(Family::BiCsk),
+        3 => Some(Family::DsCdm),
         _ => None,
     }
 }
@@ -215,12 +220,16 @@ const CSK_WIRE: [u16; 6] = [32, 64, 128, 256, 16, 8];
 /// codes 4 to 7, which CSK16 and CSK8 then took; no build shipped that.
 const BICSK_WIRE: [u16; 4] = [32, 64, 128, 256];
 
+/// The `dsc` spreading factors by their 3-bit code (codes 4 to 7 free).
+const CDM_WIRE: [u16; 4] = [8, 16, 32, 64];
+
 /// The spreading factors or alphabet sizes of a family, in header-code order.
 fn wire_ladder(f: Family) -> &'static [u16] {
     match f {
         Family::DsPsk => &DS_WIRE,
         Family::Csk => &CSK_WIRE,
         Family::BiCsk => &BICSK_WIRE,
+        Family::DsCdm => &CDM_WIRE,
     }
 }
 
@@ -354,11 +363,11 @@ impl Layout {
         self.code().k() / 8 - 4
     }
 
-    /// Coded bits one data symbol carries: 2 for DS-PSK (QPSK), log2 L for CSK,
-    /// log2 L + 1 for bi-orthogonal CSK (the code's number, then its sign).
+    /// Coded bits one data symbol carries: 2 for DS-PSK and `dsc` (QPSK), log2 L for
+    /// CSK, log2 L + 1 for bi-orthogonal CSK (the code's number, then its sign).
     pub fn bits_per_data_symbol(&self) -> usize {
         match self.mode.family {
-            Family::DsPsk => 2,
+            Family::DsPsk | Family::DsCdm => 2,
             Family::Csk => self.mode.spread.trailing_zeros() as usize,
             Family::BiCsk => self.mode.spread.trailing_zeros() as usize + 1,
         }
@@ -371,20 +380,21 @@ impl Layout {
         let per_group = (PILOT_INTERVAL as usize - 1) * self.bits_per_data_symbol();
         match self.mode.family {
             Family::DsPsk => self.coded_bits().div_ceil(per_group) * (PILOT_INTERVAL as usize - 1),
-            Family::Csk => self.coded_bits().div_ceil(self.bits_per_data_symbol()),
+            Family::Csk | Family::DsCdm => self.coded_bits().div_ceil(self.bits_per_data_symbol()),
             Family::BiCsk => (self.coded_bits() + 1).div_ceil(self.bits_per_data_symbol()),
         }
     }
 
     /// Symbols in a block: the data symbols plus, for DS-PSK, a pilot ahead
-    /// of every group of seven and one closing pilot.
+    /// of every group of seven and one closing pilot (`dsc`'s pilot is under every
+    /// symbol, so it adds none).
     pub fn symbols(&self) -> usize {
         match self.mode.family {
             Family::DsPsk => {
                 let groups = self.data_symbols() / (PILOT_INTERVAL as usize - 1);
                 groups * PILOT_INTERVAL as usize + 1
             }
-            Family::Csk | Family::BiCsk => self.data_symbols(),
+            Family::Csk | Family::BiCsk | Family::DsCdm => self.data_symbols(),
         }
     }
 
@@ -397,9 +407,11 @@ impl Layout {
         self.chips() as f64 / f64::from(self.profile.chip_rate())
     }
 
-    /// Is symbol `n` of a DS-PSK block a pilot?
+    /// Is symbol `n` of a block a pilot symbol? Only DS-PSK has them (a `dsc`
+    /// block's pilot is a code under every symbol, and CSK has none).
     pub fn is_pilot(&self, n: usize) -> bool {
-        n.is_multiple_of(PILOT_INTERVAL as usize) || n == self.symbols() - 1
+        self.mode.family == Family::DsPsk
+            && (n.is_multiple_of(PILOT_INTERVAL as usize) || n == self.symbols() - 1)
     }
 }
 
@@ -592,6 +604,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dsc_block_geometry() {
+        // QPSK on every symbol: 1152 coded bits a codeword, 576 symbols, no pilots.
+        let c = Layout::new(Profile::W2400, Mode::from_name("dsc16-1/2").unwrap(), 2);
+        assert_eq!(c.symbols(), 1152);
+        assert_eq!(c.data_symbols(), 1152);
+        assert_eq!(c.chips(), 1152 * 16);
+        assert!(!c.is_pilot(0) && !c.is_pilot(c.symbols() - 1));
+        // 8/7 of DS-PSK's air time is gone: DS16 needs 83 groups of 8 and a pilot.
+        let d = Layout::new(Profile::W2400, Mode::from_name("ds16-1/2").unwrap(), 2);
+        assert_eq!(d.symbols(), 165 * 8 + 1);
+    }
+
+    #[test]
+    fn dsc_modes_take_the_last_family_code() {
+        let field = |bits: &[u8], from: usize, n: usize| {
+            bits[from..from + n].iter().fold(0u8, |v, &b| v * 2 + b)
+        };
+        for (code, sf) in CDM_WIRE.iter().enumerate() {
+            let h = Header {
+                mode: Mode::from_name(&format!("dsc{sf}-2/3")).unwrap(),
+                session: 9,
+                ..header()
+            };
+            let bits = h.pack().unwrap();
+            assert_eq!(
+                (field(&bits, 0, 2), field(&bits, 4, 2), field(&bits, 6, 3)),
+                (2, 3, code as u8)
+            );
+            assert_eq!(h.version(), VERSION_FAMILY);
+            assert_eq!(Header::unpack(&bits), Some(h));
+        }
+        let mut codes = CDM_WIRE.to_vec();
+        codes.sort_unstable();
+        assert_eq!(codes, decdsss_core::mode::CDM_SPREADS);
     }
 
     #[test]

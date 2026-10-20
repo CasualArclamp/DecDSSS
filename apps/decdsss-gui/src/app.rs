@@ -1808,9 +1808,9 @@ impl Plot {
     fn label(self, family: Family) -> &'static str {
         match (self, family) {
             (Plot::Symbols, Family::Csk | Family::BiCsk) => "Walsh",
-            (Plot::Symbols, Family::DsPsk) => "Const",
+            (Plot::Symbols, Family::DsPsk | Family::DsCdm) => "Const",
             (Plot::Detail, Family::Csk | Family::BiCsk) => "Bars",
-            (Plot::Detail, Family::DsPsk) => "Sym×prev",
+            (Plot::Detail, Family::DsPsk | Family::DsCdm) => "Sym×prev",
             (Plot::Timing, _) => "Timing",
             (Plot::Delay, _) => "Delay",
             (Plot::Chips, _) => "Chips",
@@ -1973,7 +1973,7 @@ fn channel_card(
 /// Draws one of a station card's plots `size` big.
 fn plot(ui: &mut Ui, p: Plot, c: &ChannelView, size: egui::Vec2) {
     let live = &c.live;
-    let ds = c.header.mode.family == Family::DsPsk;
+    let ds = c.header.mode.family.is_ds();
     let cap = decdsss_phy::rx::payload::LIVE_STRIP;
     // Rust note: `Plot::Symbols if ds` is a match guard: the arm is taken only
     // when the pattern matches and the condition holds, else the next arm is
@@ -2272,10 +2272,12 @@ fn looks_like_call(word: &str) -> bool {
     if b.len() < 3 || b.len() > 7 || !b.iter().all(u8::is_ascii_alphanumeric) {
         return false;
     }
-    let letters = b.iter().rev().take_while(|c| c.is_ascii_alphabetic()).count();
-    (1..=3).contains(&letters)
-        && letters + 1 < b.len()
-        && b[b.len() - letters - 1].is_ascii_digit()
+    let letters = b
+        .iter()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .count();
+    (1..=3).contains(&letters) && letters + 1 < b.len() && b[b.len() - letters - 1].is_ascii_digit()
 }
 
 /// A message's text with callsigns picked out: yours as an orange chip, others as
@@ -2329,7 +2331,9 @@ mod tests {
         for c in ["VK2ABC", "W3DEF", "JA1QRS", "g4hij", "VK2ABC/P", "K1A"] {
             assert!(looks_like_call(c), "{c}");
         }
-        for w in ["73", "59", "CQ", "FT8", "5NN", "de", "hello", "2400", "VK2ABCDE"] {
+        for w in [
+            "73", "59", "CQ", "FT8", "5NN", "de", "hello", "2400", "VK2ABCDE",
+        ] {
             assert!(!looks_like_call(w), "{w}");
         }
         assert!(names_call("VK2ABC de W3DEF, good copy", "VK2ABC"));

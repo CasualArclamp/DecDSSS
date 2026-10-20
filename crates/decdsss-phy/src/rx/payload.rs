@@ -4,7 +4,8 @@
 //! A block is processed in two passes, and the first runs as the samples
 //! arrive. It walks the symbols once, despreading each rake finger and keeping
 //! what the second needs: for CSK the Walsh correlations, for DS-PSK the
-//! despread symbols and the pilot gains. At the end of the block the second
+//! despread symbols and the pilot gains (for `dsc`, the pilot code's and the data
+//! code's correlations of every symbol). At the end of the block the second
 //! turns that into bit LLRs (a noncoherent Bessel metric for CSK; for DS-PSK a
 //! G-RAKE, MMSE combining on a half-chip grid of delays, with pilot-aided
 //! maximal-ratio combining on the fingers as the fallback for any codeword it
@@ -26,7 +27,7 @@
 //! ([`rewind`]).
 
 use super::despread::{
-    Track, csk_bit_llrs, despread, ln_i0, sign_llr, sum, walsh_correlate, walsh_one,
+    Track, cdm_data, csk_bit_llrs, despread, ln_i0, sign_llr, sum, walsh_correlate, walsh_one,
 };
 use super::frontend::Buf;
 use super::grake;
@@ -36,9 +37,9 @@ use super::rewind::{self, Judged, Watch};
 use crate::codes::{Scrambler, own_code};
 use crate::eot;
 use crate::framing::{Header, Layout, check_frame};
-use crate::tx::{block_chips, pilot_symbol};
+use crate::tx::{block_chips, cdm_amplitudes, pilot_symbol};
 use decdsss_core::Family;
-use decdsss_core::mode::PILOT_INTERVAL;
+use decdsss_core::mode::{CDM_PILOT_SHARE, PILOT_INTERVAL};
 use decdsss_dsp::Iq;
 use decdsss_fec::interleave::Interleaver;
 use decdsss_fec::ldpc::Decoder;
@@ -196,6 +197,67 @@ fn smooth_gains(g: &[[Iq; SLOTS]], half: usize) -> Vec<[Iq; SLOTS]> {
         .collect()
 }
 
+/// Chips of a `dsc` pilot *chunk*, the pilot correlations summed coherently into
+/// one measurement for the carrier loop, the delay profile and the display: 64,
+/// SF 8's whole symbol. At β = 1/8 a chunk holds the pilot energy of one DS8 pilot
+/// symbol (64 × 1/8 = 8 chips' worth, derived), so the loops see measurements as
+/// good as DS8's pilots at every SF, and as often as DS8's pilots come: 30 a
+/// second on `2k4` and 6.25 on `500`, where DS64's pilots come 3.75 and 0.78 times
+/// a second.
+const CDM_CHUNK_CHIPS: usize = 64;
+
+/// Symbols in a `dsc` pilot chunk: 8 at SF 8, 1 at SF 64.
+fn cdm_chunk(sf: usize) -> usize {
+    (CDM_CHUNK_CHIPS / sf).max(1)
+}
+
+/// The half-widths (symbols) the `dsc` channel estimate may take: a triangle of
+/// weights `half + 1 − |i|`.
+const CDM_HALVES: [usize; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+/// The `dsc` channel estimate's half-width for a block, chosen by leave-one-out
+/// cross-validation: each symbol's raw estimate (its pilot correlation) is
+/// predicted from the others' by the triangle, and the width with the least
+/// squared error, summed over the `nf` fingers in use, is taken. The raw estimate
+/// is the channel plus noise independent of the others', so the error is that
+/// noise, the same for every width, plus the prediction's own error: the least is
+/// the width that estimates the channel best, whatever the fading rate and the SNR
+/// (a slow channel at a low SNR takes a long triangle, a fast one at a high SNR a
+/// short one). DS-PSK's pilots cannot be smoothed this way to any profit: they come
+/// one in eight symbols, so a fast channel aliases before any width is tried.
+fn cdm_half_width(raw: &[[Iq; SLOTS]], nf: usize, max_half: usize) -> usize {
+    let n = raw.len();
+    let mut best = (1usize, f64::MAX);
+    for &half in CDM_HALVES.iter().filter(|&&h| h <= max_half.max(1)) {
+        let mut err = 0.0f64;
+        for k in 0..n {
+            let (lo, hi) = (k.saturating_sub(half), (k + half).min(n - 1));
+            let mut acc = [Iq::new(0.0, 0.0); SLOTS];
+            let mut wsum = 0.0f32;
+            for (j, rj) in raw.iter().enumerate().take(hi + 1).skip(lo) {
+                if j == k {
+                    continue;
+                }
+                let w = (half + 1 - j.abs_diff(k)) as f32;
+                for (a, &z) in acc.iter_mut().zip(rj) {
+                    *a += z * w;
+                }
+                wsum += w;
+            }
+            if wsum <= 0.0 {
+                continue;
+            }
+            for fi in 0..nf.min(SLOTS) {
+                err += f64::from((raw[k][fi] - acc[fi] / wsum).norm_sqr());
+            }
+        }
+        if err < best.1 {
+            best = (half, err);
+        }
+    }
+    best.0
+}
+
 /// Where a block's known-chip refinement starts: after a slip the block's
 /// timing is one line only from the slip on, so there, on the track that symbol
 /// was taken on (moved onto the end's finger lags); otherwise the block's start.
@@ -288,6 +350,20 @@ pub struct Live {
     /// after the scrambler is taken off.
     pub raw_chips: Vec<Iq>,
     pub despread_chips: Vec<Iq>,
+    /// DS-PSK and `dsc`: the main finger's channel as the pilots measure it (one
+    /// point a pilot, or a `dsc` pilot chunk), scaled to the channel's own
+    /// amplitude, newest last: the phasor trace, and the Doppler spectrum's samples.
+    pub pilot_trace: Vec<Iq>,
+    /// Seconds between the trace's points.
+    pub trace_dt: f64,
+    /// Half the noise bandwidth of the channel estimate the last block was decoded
+    /// with, Hz (Σw²/(Σw)² of its smoothing, times the rate of what it smooths,
+    /// over two): the estimate follows a channel changing within about this.
+    pub est_band_hz: f32,
+    /// `dsc`: the main finger's despread power on the pilot's code, the data's code
+    /// and the mean of the other codes (noise and multipath leakage only), per symbol,
+    /// a running mean.
+    pub code_power: [f32; 3],
     /// The latest delay profile, power against lag, and the fingers it gave.
     pub profile: Vec<f32>,
     pub fingers: Vec<Finger>,
@@ -438,8 +514,11 @@ struct CskSnap {
     finger_age: Vec<u8>,
 }
 
-/// A DS-PSK block in progress.
+/// A DS-PSK or `dsc` block in progress.
 struct DsWork {
+    /// A `dsc` block: `y` holds each symbol's pilot correlation, `yd` its data's,
+    /// and `g` the pilot chunks' means.
+    cdm: bool,
     scr: Vec<Iq>,
     start: Track,
     step0: f64,
@@ -450,6 +529,11 @@ struct DsWork {
     y: Vec<[Iq; SLOTS]>,
     /// g[k][f]: pilot gain estimates.
     g: Vec<[Iq; SLOTS]>,
+    /// `dsc`: yd[s][f], the data code's correlation per finger slot.
+    yd: Vec<[Iq; SLOTS]>,
+    /// `dsc`: the pilot chunk being summed, and its symbols so far.
+    chunk_acc: [Iq; SLOTS],
+    chunk_n: usize,
     pilot_no: usize,
     freq_acc: Iq,
     freq_norm: f32,
@@ -493,6 +577,8 @@ struct DsSnap {
     s: usize,
     t: Track,
     pilot_no: usize,
+    chunk_acc: [Iq; SLOTS],
+    chunk_n: usize,
     freq_acc: Iq,
     freq_norm: f32,
     tc: Track,
@@ -754,7 +840,11 @@ impl PayloadRx {
             }
             Work::Ds(mut w) => {
                 if self.advance_ds(buf, &mut w) {
-                    let r = self.finish_ds(buf, *w);
+                    let r = if w.cdm {
+                        self.finish_cdm(buf, *w)
+                    } else {
+                        self.finish_ds(buf, *w)
+                    };
                     self.end_block(start, chip0);
                     Some(r)
                 } else {
@@ -836,13 +926,19 @@ impl PayloadRx {
                     self.work = Some(Work::Csk(w));
                 }
             }
-            Family::DsPsk => {
+            Family::DsPsk | Family::DsCdm => {
                 if prepass {
                     self.ds_prepass(buf, &scr);
                 }
                 let start = self.track;
-                let pilots = s_count / PILOT_INTERVAL as usize + 1;
+                let cdm = self.layout.mode.family == Family::DsCdm;
+                let pilots = if cdm {
+                    s_count.div_ceil(cdm_chunk(l)) + 1
+                } else {
+                    s_count / PILOT_INTERVAL as usize + 1
+                };
                 self.work = Some(Work::Ds(Box::new(DsWork {
+                    cdm,
                     scr,
                     start,
                     step0: start.step,
@@ -851,6 +947,13 @@ impl PayloadRx {
                     s_count,
                     y: vec![[Iq::new(0.0, 0.0); SLOTS]; s_count],
                     g: vec![[Iq::new(0.0, 0.0); SLOTS]; pilots],
+                    yd: if cdm {
+                        vec![[Iq::new(0.0, 0.0); SLOTS]; s_count]
+                    } else {
+                        Vec::new()
+                    },
+                    chunk_acc: [Iq::new(0.0, 0.0); SLOTS],
+                    chunk_n: 0,
                     pilot_no: 0,
                     freq_acc: Iq::new(0.0, 0.0),
                     freq_norm: 0.0,
@@ -1060,7 +1163,8 @@ impl PayloadRx {
     }
 
     /// The delay profile of the DS-PSK pilots in symbols `s_lo..s_hi`, where
-    /// `tc` is the track at symbol `s_lo` and `scr` the block's scrambler chips.
+    /// `tc` is the track at symbol `s_lo` and `scr` the block's scrambler chips. For
+    /// `dsc`, of the pilot code, a chunk at a time.
     fn profile_ds(
         &self,
         buf: &Buf,
@@ -1070,6 +1174,9 @@ impl PayloadRx {
         s_hi: usize,
     ) -> DelayProfile {
         let l = usize::from(self.header.mode.spread);
+        if self.layout.mode.family == Family::DsCdm {
+            return self.profile_cdm(buf, tc, scr, s_lo, s_hi);
+        }
         let per = PILOT_INTERVAL as usize;
         let dphi = tc.dphase();
         let mut power = vec![0.0f32; DelayProfile::LAGS];
@@ -1085,6 +1192,38 @@ impl PayloadRx {
                     acc += x * Iq::new(c as f32, -(s as f32)) * scr[n * l + k].conj() * p;
                 }
                 *pw += (acc / l as f32).norm_sqr();
+            }
+        }
+        DelayProfile { power }
+    }
+
+    /// The delay profile of a `dsc` block's pilot code in symbols `s_lo..s_hi`: at
+    /// each lag, every pilot chunk's chips summed coherently (the pilot is a real
+    /// constant under the scrambler), the chunks' powers added.
+    fn profile_cdm(
+        &self,
+        buf: &Buf,
+        tc: &Track,
+        scr: &[Iq],
+        s_lo: usize,
+        s_hi: usize,
+    ) -> DelayProfile {
+        let l = usize::from(self.header.mode.spread);
+        let c = cdm_chunk(l);
+        let dphi = tc.dphase();
+        let mut power = vec![0.0f32; DelayProfile::LAGS];
+        for (i, pw) in power.iter_mut().enumerate() {
+            let lag = DelayProfile::lag(i);
+            for n in (s_lo..s_hi).filter(|n| n % c == 0) {
+                let end = (n + c).min(s_hi);
+                let mut acc = Iq::new(0.0, 0.0);
+                for k in 0..(end - n) * l {
+                    let rel = (n - s_lo) * l + k;
+                    let (s, co) = (tc.phase + rel as f64 * dphi).sin_cos();
+                    let x = buf.at(tc.pos + (rel as f64 + lag) * tc.step);
+                    acc += x * Iq::new(co as f32, -(s as f32)) * scr[n * l + k].conj();
+                }
+                *pw += (acc / ((end - n) * l) as f32).norm_sqr();
             }
         }
         DelayProfile { power }
@@ -1177,17 +1316,27 @@ impl PayloadRx {
         }
     }
 
-    /// The DS-PSK block-start pre-pass: the profile of the first pilots.
+    /// The DS-PSK block-start pre-pass: the profile of the first pilots (`dsc`:
+    /// the first pilot chunks).
     fn ds_prepass(&mut self, buf: &Buf, scr: &[Iq]) {
         let l = usize::from(self.header.mode.spread);
-        let per = PILOT_INTERVAL as usize;
-        let all = self.layout.symbols() / per + 1;
+        let cdm = self.layout.mode.family == Family::DsCdm;
+        let per = if cdm {
+            cdm_chunk(l)
+        } else {
+            PILOT_INTERVAL as usize
+        };
+        let all = if cdm {
+            self.layout.symbols().div_ceil(per)
+        } else {
+            self.layout.symbols() / per + 1
+        };
         // Only the start of the block: a clock error left over from the start-up
         // estimates moves the later pilots by chips.
         let pilot_s = per as f64 * l as f64 / f64::from(self.header.profile.chip_rate());
         let pilots = all.min(((PREPASS_S / pilot_s).ceil() as usize).max(PREPASS_MIN));
         let t = self.track;
-        let profile = self.profile_ds(buf, &t, scr, 0, pilots * per);
+        let profile = self.profile_ds(buf, &t, scr, 0, (pilots * per).min(self.layout.symbols()));
         if let Some(shift) = self.adopt(&profile) {
             self.track.pos += shift * self.track.step;
         }
@@ -1549,7 +1698,14 @@ impl PayloadRx {
     /// block is done.
     fn advance_ds(&mut self, buf: &Buf, wk: &mut DsWork) -> bool {
         let l = usize::from(self.header.mode.spread);
-        let per = PILOT_INTERVAL as usize;
+        let cdm = wk.cdm;
+        // DS-PSK: symbols from one pilot to the next; `dsc`: in a pilot chunk.
+        let per = if cdm {
+            cdm_chunk(l)
+        } else {
+            PILOT_INTERVAL as usize
+        };
+        let (amp_d, amp_p) = cdm_amplitudes();
         let t_sym = l as f64 * wk.t.step / wk.t.rate;
         let t_pilot = per as f64 * t_sym;
         let freq_every = ((FREQ_UPDATE_S / t_pilot).ceil() as usize).max(3);
@@ -1588,17 +1744,40 @@ impl PayloadRx {
             wk.ts.push((wk.t, wk.shifted));
             let sc = &wk.scr[s * l..(s + 1) * l];
             let (mut e_sum, mut l_sum, mut p_sum) = (0.0f64, 0.0f64, 0.0f64);
+            // The magnitude a finger collects: the symbol's, or for `dsc` the pilot
+            // and data codes' together (the root of their summed power).
+            let mag = |u: &[Iq]| -> f64 {
+                if cdm {
+                    f64::from(sum(u).norm_sqr() + cdm_data(u).norm_sqr()).sqrt()
+                } else {
+                    f64::from(sum(u).norm())
+                }
+            };
             for (fi, f) in self.fingers.iter().enumerate().take(SLOTS) {
                 despread(buf, &wk.t, sc, f.lag, &mut wk.u);
                 wk.y[s][fi] = sum(&wk.u);
+                if cdm {
+                    wk.yd[s][fi] = cdm_data(&wk.u);
+                }
                 if fi == 0 {
                     self.live.despread_chips = wk.u.clone();
+                    if cdm {
+                        // The Walsh bank of the main finger: pilot, data, the rest.
+                        let w = walsh_correlate(&wk.u);
+                        let n2 = (l * l) as f32;
+                        let others = w.iter().skip(2).map(|z| z.norm_sqr()).sum::<f32>()
+                            / (l - 2).max(1) as f32;
+                        let now = [w[0].norm_sqr() / n2, w[1].norm_sqr() / n2, others / n2];
+                        for (c, x) in self.live.code_power.iter_mut().zip(now) {
+                            *c += 0.05 * (x - *c);
+                        }
+                    }
                 }
-                p_sum += f64::from(wk.y[s][fi].norm());
+                p_sum += mag(&wk.u);
                 despread(buf, &wk.t, sc, f.lag - 0.25, &mut wk.ue);
                 despread(buf, &wk.t, sc, f.lag + 0.25, &mut wk.ul);
-                e_sum += f64::from(sum(&wk.ue).norm());
-                l_sum += f64::from(sum(&wk.ul).norm());
+                e_sum += mag(&wk.ue);
+                l_sum += mag(&wk.ul);
             }
             if let Some(c) = self.dll.push(e_sum, l_sum) {
                 wk.t.pos += c * wk.t.step;
@@ -1624,6 +1803,12 @@ impl PayloadRx {
                     wk.freq_acc += a * b.conj();
                     wk.freq_norm += a.norm() * b.norm();
                 }
+                push_cap(
+                    &mut self.live.pilot_trace,
+                    wk.g[wk.pilot_no][0],
+                    LIVE_POINTS,
+                );
+                self.live.trace_dt = t_pilot;
                 wk.pilot_no += 1;
                 if wk.pilot_no.is_multiple_of(freq_every) {
                     wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, lag as f64 * t_pilot);
@@ -1633,31 +1818,45 @@ impl PayloadRx {
                     wk.freq_acc = Iq::new(0.0, 0.0);
                     wk.freq_norm = 0.0;
                 }
-            } else if wk.pilot_no > 0 {
-                // A data symbol for the display, rotated by the latest pilot's
-                // gain (the estimate the decoder will refine) and scaled to unit
-                // amplitude.
-                let mut z = Iq::new(0.0, 0.0);
-                let mut pw = 0.0f32;
-                for fi in 0..SLOTS {
-                    let h = wk.g[wk.pilot_no - 1][fi];
-                    z += h.conj() * wk.y[s][fi];
-                    pw += h.norm_sqr();
-                }
-                if pw > 0.0 {
-                    let z = z / pw;
-                    push_cap(&mut self.live.symbols, z, LIVE_POINTS);
-                    if let Some(p) = wk.prev_z {
-                        push_cap(&mut self.live.diffs, z * p.conj(), LIVE_POINTS);
+            } else {
+                if cdm {
+                    // The pilot code under every symbol, summed a chunk at a time:
+                    // the chunk's mean is the measurement the loops and the display
+                    // take, as DS-PSK takes a pilot symbol.
+                    for fi in 0..SLOTS {
+                        wk.chunk_acc[fi] += wk.y[s][fi];
                     }
-                    wk.prev_z = Some(z);
-                    // The error against the nearest QPSK point, averaged: its
-                    // inverse is the SNR of a symbol after combining.
-                    let k = std::f32::consts::FRAC_1_SQRT_2;
-                    let e = (z.re.abs() - k).powi(2) + (z.im.abs() - k).powi(2);
-                    wk.err2 += 0.02 * (e - wk.err2);
-                    // Unit-amplitude symbols: signal 1, noise the mean error.
-                    self.strip(1.0, wk.err2.max(1e-4), wk.t.freq, t_sym);
+                    wk.chunk_n += 1;
+                    if wk.chunk_n == per || s + 1 == wk.s_count {
+                        let k = wk.pilot_no;
+                        let whole = wk.chunk_n == per;
+                        for fi in 0..SLOTS {
+                            wk.g[k][fi] = wk.chunk_acc[fi] / wk.chunk_n as f32;
+                        }
+                        wk.chunk_acc = [Iq::new(0.0, 0.0); SLOTS];
+                        wk.chunk_n = 0;
+                        // The carrier from successive whole chunks, a chunk apart.
+                        if whole && k >= 1 {
+                            let (a, b) = (wk.g[k][0], wk.g[k - 1][0]);
+                            wk.freq_acc += a * b.conj();
+                            wk.freq_norm += a.norm() * b.norm();
+                        }
+                        push_cap(&mut self.live.pilot_trace, wk.g[k][0] / amp_p, LIVE_POINTS);
+                        self.live.trace_dt = t_pilot;
+                        wk.pilot_no += 1;
+                        if wk.pilot_no.is_multiple_of(freq_every) {
+                            wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, t_pilot);
+                            wk.t.freq = wk
+                                .t
+                                .freq
+                                .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
+                            wk.freq_acc = Iq::new(0.0, 0.0);
+                            wk.freq_norm = 0.0;
+                        }
+                    }
+                }
+                if wk.pilot_no > 0 {
+                    self.show_ds_symbol(wk, s, t_sym, (amp_d, amp_p));
                 }
             }
             if s.is_multiple_of(8) {
@@ -1686,14 +1885,23 @@ impl PayloadRx {
             wk.s += 1;
             self.live.symbol = wk.s;
             if wk.s > wk.replay_until && !no_rewind() {
-                let e: f64 = wk.y[s].iter().map(|y| f64::from(y.norm_sqr())).sum();
+                let mut e: f64 = wk.y[s].iter().map(|y| f64::from(y.norm_sqr())).sum();
+                if cdm {
+                    e += wk.yd[s]
+                        .iter()
+                        .map(|y| f64::from(y.norm_sqr()))
+                        .sum::<f64>();
+                }
                 // Noise: the same number of fingers where there is no path, eight
                 // chips past the last (beyond an HF delay spread at any profile).
                 let nf = self.fingers.len().min(SLOTS);
                 let off = self.fingers.iter().map(|f| f.lag).fold(0.0, f64::max) + 8.0;
                 let (t0, _) = wk.ts[s];
                 despread(buf, &t0, &wk.scr[s * l..(s + 1) * l], off, &mut wk.u);
-                let noise = nf as f64 * f64::from(sum(&wk.u).norm_sqr());
+                let mut noise = nf as f64 * f64::from(sum(&wk.u).norm_sqr());
+                if cdm {
+                    noise += nf as f64 * f64::from(cdm_data(&wk.u).norm_sqr());
+                }
                 match self.watch.push(e, noise, win, wk.s, max_windows) {
                     Some(Judged::Locked) => {
                         let snap = self.ds_snap(wk);
@@ -1711,12 +1919,57 @@ impl PayloadRx {
         true
     }
 
+    /// A data symbol for the display, rotated by the latest pilot's gain (the
+    /// estimate the decoder will refine) and scaled to unit amplitude; its error
+    /// against the nearest QPSK point feeds the SNR strip. `amps` are a `dsc` chip's
+    /// data and pilot amplitudes ([`cdm_amplitudes`]).
+    fn show_ds_symbol(&mut self, wk: &mut DsWork, s: usize, t_sym: f64, amps: (f32, f32)) {
+        let mut z = Iq::new(0.0, 0.0);
+        let mut pw = 0.0f32;
+        for fi in 0..SLOTS {
+            let h = wk.g[wk.pilot_no - 1][fi];
+            z += h.conj() * if wk.cdm { wk.yd[s][fi] } else { wk.y[s][fi] };
+            pw += h.norm_sqr();
+        }
+        if pw <= 0.0 {
+            return;
+        }
+        // For `dsc` the gain is the pilot's, which comes in at the pilot's amplitude,
+        // and the symbol the data's, at the data's.
+        let z = if wk.cdm {
+            z / pw * (amps.1 / amps.0)
+        } else {
+            z / pw
+        };
+        push_cap(&mut self.live.symbols, z, LIVE_POINTS);
+        if let Some(p) = wk.prev_z {
+            push_cap(&mut self.live.diffs, z * p.conj(), LIVE_POINTS);
+        }
+        wk.prev_z = Some(z);
+        // The error against the nearest QPSK point, averaged: its
+        // inverse is the SNR of a symbol after combining.
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        let e = (z.re.abs() - k).powi(2) + (z.im.abs() - k).powi(2);
+        wk.err2 += 0.02 * (e - wk.err2);
+        // Unit-amplitude symbols: signal 1, noise the mean error. A `dsc` data part
+        // has 1 − β of the symbol's energy, and the strip reads as a whole symbol's
+        // Es/N0 (Eb/N0 is taken from it), so it counts 1/(1 − β).
+        let signal = if wk.cdm {
+            1.0 / (1.0 - CDM_PILOT_SHARE)
+        } else {
+            1.0
+        };
+        self.strip(signal, wk.err2.max(1e-4), wk.t.freq, t_sym);
+    }
+
     /// The tracking state of a DS-PSK block as it stands, for a rewind.
     fn ds_snap(&self, wk: &DsWork) -> DsSnap {
         DsSnap {
             s: wk.s,
             t: wk.t,
             pilot_no: wk.pilot_no,
+            chunk_acc: wk.chunk_acc,
+            chunk_n: wk.chunk_n,
             freq_acc: wk.freq_acc,
             freq_norm: wk.freq_norm,
             tc: wk.tc,
@@ -1740,6 +1993,8 @@ impl PayloadRx {
         wk.s = n.s;
         wk.t = n.t;
         wk.pilot_no = n.pilot_no;
+        wk.chunk_acc = n.chunk_acc;
+        wk.chunk_n = n.chunk_n;
         wk.freq_acc = n.freq_acc;
         wk.freq_norm = n.freq_norm;
         wk.tc = n.tc;
@@ -1846,9 +2101,12 @@ impl PayloadRx {
         if wk.s == 0 {
             return false;
         }
-        let ds = |buf: &Buf, t: &Track, sc: &[Iq], lag: f64, u: &mut [Iq]| {
+        // Rust note: `move` copies `cdm` into the closure, which then borrows nothing.
+        let cdm = wk.cdm;
+        let ds = move |buf: &Buf, t: &Track, sc: &[Iq], lag: f64, u: &mut [Iq]| {
             despread(buf, t, sc, lag, u);
-            f64::from(sum(u).norm_sqr())
+            let p = sum(u).norm_sqr();
+            f64::from(if cdm { p + cdm_data(u).norm_sqr() } else { p })
         };
         let span = (lost.since.min(wk.s - 1), wk.s);
         let Some((k, d)) = self.find_slip(
@@ -1881,8 +2139,11 @@ impl PayloadRx {
 
         // Smooth the pilot gains (a triangle of `half` pilots either side, [1 2 1]/4
         // at SF 4; shorter at the ends) and interpolate linearly to the data symbols.
-        let half = smooth_half_width(usize::from(self.header.mode.spread));
+        let l = usize::from(self.header.mode.spread);
+        let half = smooth_half_width(l);
         let mut hs = smooth_gains(g, half);
+        let pilot_rate = f64::from(self.header.profile.chip_rate()) / (per * l) as f64;
+        self.live.est_band_hz = (smooth_noise_gain(half) * pilot_rate / 2.0) as f32;
         // Per finger, the noise in a pilot gain from the second difference (the
         // smooth channel cancels): var(g_k − (g_{k−1}+g_{k+1})/2) = 1.5 σ². A
         // smoothed estimate carries `smooth_noise_gain(half)` of σ² (0.375 for
@@ -1949,6 +2210,72 @@ impl PayloadRx {
             Some(g) => self.finish(buf, &g, Some(&llrs), snr, start, from),
             None => self.finish(buf, &llrs, None, snr, start, from),
         }
+    }
+
+    /// Pass two of a `dsc` block: each symbol's channel from its own pilot
+    /// correlation, smoothed by the triangle that cross-validates best
+    /// ([`cdm_half_width`]) and shrunk where a finger is not clearly above its noise,
+    /// then maximal-ratio combining of the data code's correlations, and the
+    /// decoder. (No G-RAKE: at SF 8 and above it gave DS-PSK nothing measurable,
+    /// DESIGN.md *G-RAKE against the rake*, and these are SF 8 to 64.)
+    fn finish_cdm(&mut self, buf: &Buf, wk: DsWork) -> BlockResult {
+        self.track = wk.t;
+        let (_, amp_p) = cdm_amplitudes();
+        let s_count = wk.s_count;
+        let nf = self.fingers.len().clamp(1, SLOTS);
+        // The raw channel at each symbol, on the scale of a whole symbol's amplitude.
+        let raw: Vec<[Iq; SLOTS]> = wk.y.iter().map(|y| y.map(|z| z / amp_p)).collect();
+        let half = cdm_half_width(&raw, nf, (s_count / 4).max(1));
+        let mut hs = smooth_gains(&raw, half);
+        let ng = smooth_noise_gain(half);
+        let sym_rate =
+            f64::from(self.header.profile.chip_rate()) / f64::from(self.header.mode.spread);
+        self.live.est_band_hz = (ng * sym_rate / 2.0) as f32;
+        // Per finger, a raw estimate's noise from the second difference (as for
+        // DS-PSK's pilot gains), and the power subtraction that cuts a finger which is
+        // not clearly above what its smoothed estimate carries of it.
+        let mut var0 = f64::NAN;
+        for fi in 0..SLOTS {
+            let (mut acc, mut cnt) = (0.0f64, 0usize);
+            for k in 1..s_count.saturating_sub(1) {
+                let d = raw[k][fi] - (raw[k - 1][fi] + raw[k + 1][fi]) * 0.5;
+                acc += f64::from(d.norm_sqr()) / 1.5;
+                cnt += 1;
+            }
+            if cnt == 0 {
+                continue;
+            }
+            let var_raw = acc / cnt as f64;
+            if fi == 0 {
+                var0 = var_raw;
+            }
+            let var = (ng * var_raw) as f32;
+            for h in hs.iter_mut() {
+                let p = h[fi].norm_sqr();
+                if p > 0.0 {
+                    h[fi] *= ((p - var).max(0.0) / p).sqrt();
+                }
+            }
+        }
+        // A whole symbol's Es/N0: the raw estimate is the pilot over its amplitude, so
+        // its SNR is β times the symbol's.
+        let p_main = hs.iter().map(|h| f64::from(h[0].norm_sqr())).sum::<f64>() / s_count as f64;
+        let snr = if var0 > 0.0 {
+            10.0 * (p_main / (var0 * f64::from(CDM_PILOT_SHARE))).log10()
+        } else {
+            f64::NAN
+        };
+        let mut llrs = Vec::with_capacity(s_count * 2);
+        // Rust note: `zip` walks the two per-symbol arrays side by side, here and
+        // across the finger slots.
+        for (h, yd) in hs.iter().zip(&wk.yd) {
+            let z: Iq = h.iter().zip(yd).map(|(h, y)| h.conj() * y).sum();
+            // As for DS-PSK, Σ conj(ĥ)·y with a readable scale.
+            llrs.push(4.0 * z.re);
+            llrs.push(4.0 * z.im);
+        }
+        let (start, from) = refine_from(&wk.ts, wk.shifted, wk.slipped_at, wk.start);
+        self.finish(buf, &llrs, None, snr, start, from)
     }
 
     /// The G-RAKE's LLRs for a DS-PSK block (see [`grake`]): at every pilot, the
@@ -2675,6 +3002,76 @@ mod tests {
             let (ok, total, note) = recover(Profile::W2400, mode, 1, 2, &ch);
             assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");
         }
+    }
+
+    #[test]
+    fn dsc_blocks_decode_on_a_clean_channel() {
+        for mode in ["dsc8-1/2", "dsc16-2/3", "dsc32-3/4", "dsc64-1/2"] {
+            let ch = channel(Profile::W2400, 0.0);
+            let (ok, total, note) = recover(Profile::W2400, mode, 1, 2, &ch);
+            assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");
+        }
+    }
+
+    #[test]
+    fn dsc_decodes_with_noise_offset_and_clock_error() {
+        // 5 dB over DS-PSK's measured need at the same SF, on both narrow profiles.
+        for (profile, mode) in [
+            (Profile::W2400, "dsc8-1/2"),
+            (Profile::W3000, "dsc16-3/4"),
+            (Profile::N500, "dsc8-1/2"),
+        ] {
+            let m = decdsss_core::Mode::from_name(mode).unwrap();
+            let mut ch = channel(profile, 9.5 + m.snr_offset_db(profile));
+            ch.offset_hz = 7.0;
+            ch.clock_ppm = 40.0;
+            let (ok, total, note) = recover(profile, mode, 2, 2, &ch);
+            assert_eq!(ok, total, "{profile:?} {mode}: {ok}/{total} {note:?}");
+        }
+    }
+
+    #[test]
+    fn dsc_chunks_hold_sf_8s_pilot_energy() {
+        // 64 chips a chunk at every SF; at β = 1/8 that is 8 chips at full power,
+        // an SF 8 pilot symbol.
+        for sf in decdsss_core::mode::CDM_SPREADS {
+            let sf = usize::from(sf);
+            assert_eq!(cdm_chunk(sf) * sf, 64);
+            assert_eq!(cdm_chunk(sf) as f32 * sf as f32 * CDM_PILOT_SHARE, 8.0);
+        }
+    }
+
+    #[test]
+    fn cross_validation_picks_a_long_triangle_for_a_still_channel_and_a_short_one_for_a_fast_one() {
+        use decdsss_dsp::rng::Rng;
+        let mut rng = Rng::new(5);
+        let n = 2000;
+        let noisy = |rng: &mut Rng, h: Iq, sigma: f32| {
+            h + Iq::new(rng.gauss() as f32, rng.gauss() as f32) * sigma
+        };
+        // A constant channel in noise as strong as it: the longest width allowed.
+        let still: Vec<[Iq; SLOTS]> = (0..n)
+            .map(|_| {
+                [
+                    noisy(&mut rng, Iq::new(1.0, 0.0), 1.0),
+                    Iq::new(0.0, 0.0),
+                    Iq::new(0.0, 0.0),
+                ]
+            })
+            .collect();
+        assert_eq!(cdm_half_width(&still, 1, 256), 256);
+        // A channel turning a full cycle every 20 symbols, nearly noiseless: short.
+        let fast: Vec<[Iq; SLOTS]> = (0..n)
+            .map(|k| {
+                let ph = std::f32::consts::TAU * k as f32 / 20.0;
+                [
+                    noisy(&mut rng, Iq::new(ph.cos(), ph.sin()), 0.01),
+                    Iq::new(0.0, 0.0),
+                    Iq::new(0.0, 0.0),
+                ]
+            })
+            .collect();
+        assert!(cdm_half_width(&fast, 1, 256) <= 2);
     }
 
     #[test]
