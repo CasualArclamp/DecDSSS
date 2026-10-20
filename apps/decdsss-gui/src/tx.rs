@@ -184,6 +184,12 @@ pub struct TxPanel {
     /// The message is a CQ packet (the callsign in a header-only transmission), not
     /// text: set by the CQ button, cleared as soon as the message is edited.
     cq_packet: bool,
+    /// Messages sent from the chat box, oldest first (shown above it).
+    sent: Vec<String>,
+    /// Put the cursor in the chat box next frame (a callsign was clicked).
+    focus_chat: bool,
+    /// `--tx-text` asked for the message to go out when the window plays by itself.
+    auto_text: bool,
     vp: VoicePanel,
     /// The Codec2 mode; `None` is the profile's own (450 on 2.4 kHz, 700C on 3 kHz).
     codec: Option<Codec>,
@@ -230,6 +236,9 @@ impl Default for TxPanel {
             text: false,
             message: String::new(),
             cq_packet: false,
+            sent: Vec::new(),
+            focus_chat: false,
+            auto_text: false,
             vp: VoicePanel::default(),
             codec: None,
             vox: false,
@@ -298,7 +307,10 @@ impl TxPanel {
             .position(|d| d.0.to_lowercase().contains(&hint.to_lowercase()))
             .map_or(0, |i| i + 1);
         let (device, rate) = self.output(devices_out);
-        match self.build(rate) {
+        self.text = self.auto_text;
+        let built = self.build(rate);
+        self.text = false;
+        match built {
             Ok(plan) => engine.send(Cmd::Transmit {
                 audio: plan.audio,
                 rate,
@@ -382,12 +394,32 @@ impl TxPanel {
         self.wfid = true;
     }
 
-    /// Switches to a text message (for `--tx-text`); `cq` writes a CQ call.
+    /// Your callsign as the modem would send it, or empty if none is set.
+    pub fn own_call(&self) -> String {
+        normalise_call(&self.call).unwrap_or_default()
+    }
+
+    /// A callsign was clicked in the received messages: start the chat message with
+    /// that call and put the cursor after it. Anything already typed stays (the call
+    /// goes in front) unless it was a CQ packet, which is replaced.
+    pub fn reply_to(&mut self, call: &str) {
+        if self.cq_packet {
+            self.message.clear();
+            self.cq_packet = false;
+        }
+        let prefix = format!("{call} ");
+        if !self.message.starts_with(&prefix) {
+            self.message.insert_str(0, &prefix);
+        }
+        self.focus_chat = true;
+    }
+
+    /// Puts a text message in the chat box (for `--tx-text`); `cq` writes a CQ call.
     pub fn preload_text(&mut self, msg: String) {
         if self.call.is_empty() {
             self.call = "VK2ABC".into();
         }
-        self.text = true;
+        self.auto_text = true;
         self.picture = false;
         self.voice = false;
         self.cq_packet = msg.eq_ignore_ascii_case("cq");
@@ -487,7 +519,7 @@ impl TxPanel {
     }
 
     /// Builds the transmission as set up and plays it on the output device.
-    fn send_transmission(&mut self, engine: &Engine, devices_out: &[(String, u32)]) {
+    fn send_transmission(&mut self, engine: &Engine, devices_out: &[(String, u32)]) -> bool {
         let rate = self.device_rate(devices_out);
         match self.build(rate) {
             Ok(plan) => {
@@ -515,69 +547,154 @@ impl TxPanel {
                     },
                     key: true,
                 });
+                true
             }
-            Err(e) => self.note = e,
+            Err(e) => {
+                self.note = e;
+                false
+            }
         }
     }
 
-    /// The message box with a CQ button that sets up a CQ packet from the callsign.
-    fn message_editor(&mut self, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
-            let edit = ui.add(
-                egui::TextEdit::multiline(&mut self.message)
-                    .desired_rows(3)
-                    // As wide as the grid's column leaves, up to 300.
-                    .desired_width(ui.available_width().clamp(160.0, 300.0))
-                    .hint_text("type a message, or press CQ"),
-            );
-            if edit.changed() {
-                // Typing over a CQ makes it an ordinary message again.
-                self.cq_packet = false;
+    /// Sends the chat box: a CQ packet if CQ was pressed, else the text as a message.
+    fn send_chat(&mut self, engine: &Engine, devices_out: &[(String, u32)]) {
+        if decdsss_link::text::tidy(&self.message).is_empty() {
+            self.note = "type a message, or press CQ".into();
+            return;
+        }
+        // `build` reads `text` to choose between a message and the file/picture/speech;
+        // it is set for this one send only.
+        self.text = true;
+        let sent = self.send_transmission(engine, devices_out);
+        self.text = false;
+        if sent {
+            self.sent.push(self.message.trim().to_string());
+            if self.sent.len() > 20 {
+                self.sent.remove(0);
             }
-            ui.horizontal(|ui| {
-                if ui
-                    .button("CQ")
-                    .on_hover_text(
-                        "A CQ packet: your callsign alone in the most robust header the modem \
-                         has, sent in two copies. It decodes far below the noise where a text \
-                         CQ would not.",
-                    )
-                    .clicked()
-                {
-                    match normalise_call(&self.call) {
-                        Some(call) => {
-                            self.message = cq_label(&call);
-                            self.cq_packet = true;
-                        }
-                        None => {
-                            self.note =
-                                "enter your callsign (letters, digits and /, up to 9)".into();
-                        }
+            self.message.clear();
+            self.cq_packet = false;
+        }
+    }
+
+    /// The chat box under the transmit controls: what you type goes out as a text
+    /// message (Send, or Enter; Shift+Enter is a new line), CQ writes a CQ packet,
+    /// and the last few things sent are listed above as bubbles.
+    fn chat_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        engine: &Engine,
+        state: &TxState,
+        devices_out: &[(String, u32)],
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Chat").strong().size(15.0));
+            ui.label(
+                RichText::new("a CQ call or a few lines; the receiver shows it under Messages")
+                    .weak()
+                    .size(11.0),
+            );
+        });
+        let bubble = ui.visuals().selection.bg_fill.gamma_multiply(0.6);
+        for line in &self.sent[self.sent.len().saturating_sub(4)..] {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                egui::Frame::new()
+                    .fill(bubble)
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::symmetric(9, 4))
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width() * 0.85);
+                        ui.label(line);
+                    });
+            });
+        }
+        // Enter sends. It is taken before the box sees it, and only while the box has
+        // the focus and Shift is up.
+        let id = ui.make_persistent_id("chat_edit");
+        let enter = ui.memory(|m| m.has_focus(id))
+            && ui.input_mut(|i| {
+                !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+            });
+        let edit = ui.add(
+            egui::TextEdit::multiline(&mut self.message)
+                .id(id)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .margin(egui::Margin::symmetric(8, 6))
+                .hint_text("type a message, or press CQ"),
+        );
+        if edit.changed() {
+            // Typing over a CQ makes it an ordinary message again.
+            self.cq_packet = false;
+        }
+        if std::mem::take(&mut self.focus_chat) {
+            edit.request_focus();
+            // The cursor goes after the call that was put in front.
+            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id) {
+                let end = egui::text::CCursor::new(self.message.chars().count());
+                st.cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                st.store(ui.ctx(), id);
+            }
+        }
+        let mut send = enter;
+        ui.horizontal(|ui| {
+            if ui
+                .button("CQ")
+                .on_hover_text(
+                    "A CQ packet: your callsign alone in the most robust header the modem \
+                     has, sent in two copies. It decodes far below the noise where a text \
+                     CQ would not.",
+                )
+                .clicked()
+            {
+                match normalise_call(&self.call) {
+                    Some(call) => {
+                        self.message = cq_label(&call);
+                        self.cq_packet = true;
+                    }
+                    None => {
+                        self.note = "enter your callsign (letters, digits and /, up to 9)".into();
                     }
                 }
-                if ui.button("Clear").clicked() {
-                    self.message.clear();
-                    self.cq_packet = false;
-                }
-                if self.cq_packet {
-                    ui.label(
-                        RichText::new("CQ packet: only the callsign is sent")
-                            .weak()
-                            .size(11.0),
-                    );
-                } else {
-                    let bytes = decdsss_link::text::tidy(&self.message).len();
-                    ui.label(
-                        RichText::new(format!(
-                            "{bytes} / {} bytes",
-                            decdsss_link::text::MAX_TEXT_BYTES
-                        ))
-                        .weak()
-                        .size(11.0),
-                    );
-                }
+            }
+            if ui.button("Clear").clicked() {
+                self.message.clear();
+                self.cq_packet = false;
+            }
+            let air = self.chat_timeline().ok().map(|t| {
+                let vox = if self.vox { VOX_TONE_S + VOX_GAP_S } else { 0.0 };
+                air_time(vox + self.wfid_seconds() + t.seconds())
+            });
+            let info = if self.cq_packet {
+                "CQ packet: only the callsign is sent".to_string()
+            } else {
+                let bytes = decdsss_link::text::tidy(&self.message).len();
+                format!("{bytes} / {} bytes", decdsss_link::text::MAX_TEXT_BYTES)
+            };
+            let info = match air {
+                Some(a) => format!("{info}  ·  {a} on air"),
+                None => info,
+            };
+            ui.label(RichText::new(info).weak().size(11.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let go = ui.add_enabled(
+                    !state.active,
+                    egui::Button::new(
+                        RichText::new("Send  ➤")
+                            .size(15.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(col::TRACE.gamma_multiply(0.7))
+                    .min_size(egui::vec2(96.0, 32.0)),
+                );
+                send |= go.clicked();
             });
         });
+        if send && !state.active {
+            self.send_chat(engine, devices_out);
+        }
     }
 
     /// Keys up and starts streaming the microphone.
@@ -656,7 +773,9 @@ impl TxPanel {
         let on_air = self.live.is_some();
         let play = self.vp.ui(ui, devices_in, self.live_mode, on_air);
         match play {
-            Play::Send => self.send_transmission(engine, devices_out),
+            Play::Send => {
+                self.send_transmission(engine, devices_out);
+            }
             Play::LiveStart => self.start_live(devices_out, devices_in),
             Play::LiveStop => {
                 if let Some(s) = &self.live {
@@ -1177,6 +1296,8 @@ impl TxPanel {
         }
         ui.separator();
         self.actions(ui, engine, state, devices_out);
+        ui.separator();
+        self.chat_section(ui, engine, state, devices_out);
     }
 
     /// What to send and how: the grid of settings, and the speech controls when
@@ -1190,18 +1311,8 @@ impl TxPanel {
         listen: &(Option<String>, u32),
     ) {
         egui::Grid::new("txgrid").num_columns(2).show(ui, |ui| {
-            ui.label(if self.voice {
-                "Speech"
-            } else if self.text {
-                "Message"
-            } else {
-                "File"
-            });
-            // The message box is taller than a line, so it is not inside a horizontal
-            // layout (which would size the row to one line and let it spill over the next).
-            if self.text {
-                self.message_editor(ui);
-            } else {
+            ui.label(if self.voice { "Speech" } else { "File" });
+            {
                 ui.horizontal(|ui| {
                 if self.voice {
                     ui.label(RichText::new("record, or choose a WAV, below").weak());
@@ -1230,8 +1341,6 @@ impl TxPanel {
             ui.horizontal(|ui| {
                 let mut kind = if self.voice {
                     2
-                } else if self.text {
-                    3
                 } else {
                     usize::from(self.picture)
                 };
@@ -1240,12 +1349,9 @@ impl TxPanel {
                     .on_hover_text("Scaled and compressed to the air time");
                 ui.radio_value(&mut kind, 2, "voice")
                     .on_hover_text("Speech, as Codec2");
-                ui.radio_value(&mut kind, 3, "text")
-                    .on_hover_text("A CQ call or a few lines of chat, shown as text on the receiver");
                 let was_voice = self.voice;
                 self.picture = kind == 1;
                 self.voice = kind == 2;
-                self.text = kind == 3;
                 if self.voice
                     && !was_voice
                     && let Some(vm) = self.suggested_voice_mode()
@@ -1439,15 +1545,43 @@ impl TxPanel {
         }
     }
 
-    /// The transmission as set up, worked out without building it.
-    fn timeline(&self) -> Result<Timeline, NoTimeline> {
+    /// The chat box's transmission (a CQ packet or a text message), worked out without
+    /// building it.
+    fn chat_timeline(&self) -> Result<Timeline, NoTimeline> {
         use NoTimeline::{Problem, Waiting};
-        if self.text && self.cq_packet {
+        if self.cq_packet {
             let call = normalise_call(&self.call).ok_or(Waiting("enter your callsign"))?;
             let copies = self.repeat.max(decdsss_link::cq::DEFAULT_COPIES);
             let segs =
                 decdsss_link::cq::plan_cq(self.profile, &call, 0, copies).map_err(Problem)?;
             return Timeline::of_segments(&segs).ok_or(Waiting("no copies to send"));
+        }
+        let mode = Mode::from_name(&self.mode).ok_or(Waiting("choose a mode"))?;
+        let text = decdsss_link::text::tidy(&self.message);
+        if text.is_empty() {
+            return Err(Waiting("type a message, or press CQ"));
+        }
+        let spec = SendSpec {
+            profile: self.profile,
+            mode,
+            depth: 1,
+            call: String::new(),
+            session: 0,
+            ptype: PayloadType::Text,
+            resync_s: self.resync,
+            parity: self.parity / 100.0,
+            passes: self.repeat.max(1),
+        };
+        // As `plan_text` sends it: at depth 1, in a container with no name.
+        let stream = container::pack("", text.as_bytes()).len();
+        timeline(&spec, stream).map_err(Problem)
+    }
+
+    /// The transmission as set up, worked out without building it.
+    fn timeline(&self) -> Result<Timeline, NoTimeline> {
+        use NoTimeline::{Problem, Waiting};
+        if self.text {
+            return self.chat_timeline();
         }
         if self.voice {
             if self.vp.clip.is_none() {
@@ -1472,15 +1606,6 @@ impl TxPanel {
             parity: self.parity / 100.0,
             passes: self.repeat.max(1),
         };
-        if self.text {
-            let text = decdsss_link::text::tidy(&self.message);
-            if text.is_empty() {
-                return Err(Waiting("type a message, or press CQ"));
-            }
-            // As `plan_text` sends it: at depth 1, in a container with no name.
-            let stream = container::pack("", text.as_bytes()).len();
-            return timeline(&spec(PayloadType::Text, 1), stream).map_err(Problem);
-        }
         let path = self.file.as_ref().ok_or(Waiting("choose a file"))?;
         let (stream, ptype) = if self.picture {
             match (&self.pic_result, self.wanted_key()) {
@@ -1650,7 +1775,20 @@ impl TxPanel {
     ) {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!state.active, |ui| {
-                if ui.button("▶ Play to the sound card").clicked() {
+                // As big and red as the voice panel's push to talk.
+                if ui
+                    .add_sized(
+                        [ui.available_width().min(300.0), 46.0],
+                        egui::Button::new(
+                            RichText::new("▶  TX: play to the sound card")
+                                .size(16.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(col::BAD),
+                    )
+                    .clicked()
+                {
                     self.send_transmission(engine, devices_out);
                 }
                 if ui.button("Save WAV…").clicked() {

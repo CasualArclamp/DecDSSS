@@ -442,7 +442,11 @@ CRC-16 (headers) and CRC-32 (payload frames).
   preambles and headers and the 1 s postamble; `cq::tests` checks the estimate against
   the real chips). The receiver reports it on the header event (`CQ from CALL` in the
   CLI and the GUI's Messages panel, once however many copies arrive). The GUI's CQ
-  button sets this up; `tx --cq` is the CLI. *Measured* (`tests/cq.rs::cq_curve`,
+  button (in the chat box under the transmit controls, with Send) sets this up; `tx --cq`
+  is the CLI. In the Messages panel a CQ row has a green tint and a CQ tag; a message
+  naming the operator's own callsign has an orange tint and the call in an orange chip;
+  any callsign (the sender's, or one in the text) is a link that starts a reply in the
+  chat box (`app.rs::message_text`). *Measured* (`tests/cq.rs::cq_curve`,
   ignored; 2.4 kHz, 24 trials a point, carrier offset and clock error, in-band SNR,
   number of trials in which the call was heard): on AWGN one copy was heard in 24 of
   24 down to −14 dB and in 24 of 24 for two copies down to −16 dB; on moderate fading

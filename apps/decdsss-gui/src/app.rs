@@ -1400,43 +1400,91 @@ impl App {
     }
 
     /// Received text, newest at the bottom, each line the time, who sent it, in which
-    /// band, and the message.
+    /// band, and the message. A CQ row has a green tint and a CQ tag; a message that
+    /// names you has an orange tint and your call in an orange chip. A callsign (the
+    /// sender's, or one in the text) is a link: clicking it starts a reply to that
+    /// station in the transmit panel's message box.
     fn messages_panel(
         &mut self,
         ui: &mut Ui,
         messages: &[crate::engine::Message],
         max_height: f32,
     ) {
+        let own = self.tx.own_call();
+        let mut reply: Option<String> = None;
         ui.label(RichText::new("Messages").strong());
         egui::ScrollArea::vertical()
             .max_height(max_height)
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for m in messages {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{:02}:{:02}",
-                                m.at_s as u64 / 60,
-                                m.at_s as u64 % 60
-                            ))
-                            .weak()
-                            .monospace(),
-                        );
-                        ui.label(RichText::new(&m.call).strong().color(col::LOCK))
-                            .on_hover_text(format!("session {}", m.session));
-                        ui.label(RichText::new(format!("({})", m.band)).weak().size(11.0));
-                        if m.partial {
-                            // Still arriving: the text so far, then a dimmed ellipsis.
-                            ui.label(&m.text);
-                            ui.label(RichText::new("…").weak())
-                                .on_hover_text("still arriving");
-                        } else {
-                            ui.label(&m.text);
-                        }
-                    });
+                    let for_me = !own.is_empty() && names_call(&m.text, &own);
+                    // Rust: `TRANSPARENT` paints nothing, so one frame serves the
+                    // tinted and the plain rows.
+                    let fill = if for_me {
+                        Color32::from_rgba_unmultiplied(232, 146, 58, 46)
+                    } else if m.packet {
+                        Color32::from_rgba_unmultiplied(98, 200, 140, 40)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    egui::Frame::new()
+                        .fill(fill)
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(4, 1))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:02}:{:02}",
+                                        m.at_s as u64 / 60,
+                                        m.at_s as u64 % 60
+                                    ))
+                                    .weak()
+                                    .monospace(),
+                                );
+                                if m.packet {
+                                    ui.label(
+                                        RichText::new(" CQ ")
+                                            .strong()
+                                            .color(Color32::from_rgb(242, 255, 246))
+                                            .background_color(Color32::from_rgb(63, 125, 82)),
+                                    )
+                                    .on_hover_text("A CQ packet");
+                                }
+                                if ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(&m.call).strong().color(col::LOCK),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text(format!(
+                                        "session {}. Click to reply to {}",
+                                        m.session, m.call
+                                    ))
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    reply = Some(m.call.clone());
+                                }
+                                ui.label(RichText::new(format!("({})", m.band)).weak().size(11.0));
+                                if let Some(c) = message_text(ui, &m.text, &own) {
+                                    reply = Some(c);
+                                }
+                                if m.partial {
+                                    // Still arriving: the text so far, then a dimmed ellipsis.
+                                    ui.label(RichText::new("…").weak())
+                                        .on_hover_text("still arriving");
+                                }
+                            });
+                        });
                 }
             });
+        if let Some(call) = reply {
+            self.tx.reply_to(&call);
+        }
     }
 
     /// The received files as links that open them, in a row that wraps.
@@ -2183,9 +2231,112 @@ impl eframe::App for App {
     }
 }
 
+/// Does `text` name `own` (as a word, with or without a `/P`-style suffix)?
+fn names_call(text: &str, own: &str) -> bool {
+    words(text).any(|(w, _)| base_call(w).eq_ignore_ascii_case(own))
+}
+
+/// `w` without any `/P`-style suffix.
+fn base_call(w: &str) -> &str {
+    w.split('/').next().unwrap_or(w)
+}
+
+/// The runs of letters, digits and `/` in `text`, each with where it starts. The gaps
+/// between them are not returned.
+fn words(text: &str) -> impl Iterator<Item = (&str, usize)> {
+    let mut start = None;
+    let mut out = Vec::new();
+    for (i, c) in text.char_indices() {
+        let part = c.is_ascii_alphanumeric() || c == '/';
+        match (start, part) {
+            (None, true) => start = Some(i),
+            (Some(s), false) => {
+                out.push((&text[s..i], s));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((&text[s..], s));
+    }
+    out.into_iter()
+}
+
+/// Does `word` look like an amateur callsign: a prefix, a digit, then 1 to 3 letters
+/// (VK2ABC, W3DEF, JA1QRS), optionally followed by `/P`-style suffixes? "73", "59",
+/// "CQ" and "FT8" are not.
+fn looks_like_call(word: &str) -> bool {
+    let base = base_call(word).to_ascii_uppercase();
+    let b = base.as_bytes();
+    if b.len() < 3 || b.len() > 7 || !b.iter().all(u8::is_ascii_alphanumeric) {
+        return false;
+    }
+    let letters = b.iter().rev().take_while(|c| c.is_ascii_alphabetic()).count();
+    (1..=3).contains(&letters)
+        && letters + 1 < b.len()
+        && b[b.len() - letters - 1].is_ascii_digit()
+}
+
+/// A message's text with callsigns picked out: yours as an orange chip, others as
+/// links. Returns the call that was clicked, if any. The text between calls is drawn
+/// as plain labels with no gap between the pieces, so punctuation stays attached.
+fn message_text(ui: &mut Ui, text: &str, own: &str) -> Option<String> {
+    let mut clicked = None;
+    let mut at = 0;
+    let gap = ui.spacing().item_spacing.x;
+    ui.spacing_mut().item_spacing.x = 0.0;
+    ui.add_space(gap);
+    for (w, s) in words(text) {
+        let mine = !own.is_empty() && base_call(w).eq_ignore_ascii_case(own);
+        if !mine && !looks_like_call(w) {
+            continue;
+        }
+        if s > at {
+            ui.label(&text[at..s]);
+        }
+        let call = base_call(w).to_ascii_uppercase();
+        let rich = if mine {
+            RichText::new(w)
+                .strong()
+                .color(Color32::from_rgb(43, 23, 0))
+                .background_color(Color32::from_rgb(232, 146, 58))
+        } else {
+            RichText::new(w).underline().color(col::TRACE)
+        };
+        let r = ui
+            .add(egui::Label::new(rich).sense(egui::Sense::click()))
+            .on_hover_text(format!("Click to reply to {call}"))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if r.clicked() {
+            clicked = Some(call);
+        }
+        at = s + w.len();
+    }
+    if at < text.len() {
+        ui.label(&text[at..]);
+    }
+    ui.spacing_mut().item_spacing.x = gap;
+    clicked
+}
+
 #[cfg(test)]
 mod tests {
-    use super::matching_device;
+    use super::{looks_like_call, matching_device, names_call};
+
+    #[test]
+    fn callsigns_are_picked_out_of_text() {
+        for c in ["VK2ABC", "W3DEF", "JA1QRS", "g4hij", "VK2ABC/P", "K1A"] {
+            assert!(looks_like_call(c), "{c}");
+        }
+        for w in ["73", "59", "CQ", "FT8", "5NN", "de", "hello", "2400", "VK2ABCDE"] {
+            assert!(!looks_like_call(w), "{w}");
+        }
+        assert!(names_call("VK2ABC de W3DEF, good copy", "VK2ABC"));
+        assert!(names_call("hi vk2abc/p!", "VK2ABC"));
+        assert!(!names_call("VK2ABCD de W3DEF", "VK2ABC"));
+        assert!(!names_call("CQ de W3DEF", "VK2ABC"));
+    }
 
     #[test]
     fn devices_are_found_across_audio_apis() {
