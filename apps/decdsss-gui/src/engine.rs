@@ -91,6 +91,9 @@ pub struct Message {
     pub text: String,
     /// A CQ packet (a header with the callsign), not a text message.
     pub packet: bool,
+    /// Still arriving: `text` is the front that has come without a gap, and the
+    /// finished message takes this entry's place.
+    pub partial: bool,
 }
 
 /// Messages kept for the display.
@@ -857,14 +860,20 @@ fn handle_event(
             }
             // Progress comes from the assembler: distinct frames in against the
             // frames needed (any that many rebuild the file).
-            if let Some(p) = r.asm.progress(&header.call, header.session) {
+            if let Some(prog) = r.asm.progress(&header.call, header.session) {
                 if let Some(tr) = r.transfers.get_mut(&(header.call.clone(), header.session)) {
-                    tr.have = p.have;
-                    tr.total = p.need;
-                    tr.map = p.data_held;
+                    tr.have = prog.have;
+                    tr.total = prog.need;
+                    tr.map = prog.data_held;
                 }
-                if p.ptype == PayloadType::Picture {
+                if prog.ptype == PayloadType::Picture {
                     update_picture(r, &header.call, header.session, finished.as_ref());
+                } else if prog.ptype == PayloadType::Text
+                    && finished.is_none()
+                    && !r.asm.is_done(&header.call, header.session)
+                {
+                    // The message so far, as the frames come in.
+                    update_text(shared, r, t, &p, &header.call, header.session);
                 }
             }
             if let Some(f) = finished {
@@ -961,8 +970,46 @@ fn save_text(shared: &Arc<Mutex<Shared>>, r: &Run, t: f64, band: &str, f: &Recei
         band: band.to_string(),
         text,
         packet: false,
+        partial: false,
     };
     push_message(shared, r, m);
+}
+
+/// Shows a message as far as it has arrived: the front of it without a gap (the data
+/// frames come first in a pass, so it grows frame by frame). One entry per
+/// (call, session), updated in place; [`push_message`] swaps in the finished text.
+fn update_text(shared: &Arc<Mutex<Shared>>, r: &Run, t: f64, band: &str, call: &str, session: u8) {
+    let Some(front) = r.asm.front(call, session) else {
+        return;
+    };
+    let text = decdsss_link::text::read_front(&front.data);
+    if text.is_empty() {
+        return;
+    }
+    let mut g = shared.lock().unwrap();
+    let at = g
+        .messages
+        .iter()
+        .position(|m| m.partial && m.call == call && m.session == session);
+    match at {
+        Some(i) if g.messages[i].text == text => return,
+        Some(i) => g.messages[i].text = text,
+        None => {
+            g.messages.push(Message {
+                at_s: t,
+                call: call.to_string(),
+                session,
+                band: band.to_string(),
+                text,
+                packet: false,
+                partial: true,
+            });
+            if g.messages.len() > MESSAGES_MAX {
+                g.messages.remove(0);
+            }
+        }
+    }
+    g.version += 1;
 }
 
 /// A CQ packet was heard: a message "CQ de CALL", once however many copies arrive
@@ -994,6 +1041,7 @@ fn heard_cq(
             band: band.to_string(),
             text,
             packet: true,
+            partial: false,
         };
         push_message(shared, r, m);
     }
@@ -1018,7 +1066,15 @@ fn push_message(shared: &Arc<Mutex<Shared>>, r: &Run, m: Message) {
         log(shared, format!("cannot write messages.log: {e}"));
     }
     let mut g = shared.lock().unwrap();
-    g.messages.push(m);
+    // A message that was showing as it arrived is finished in the same place.
+    let partial = g
+        .messages
+        .iter()
+        .position(|p| p.partial && !m.packet && p.call == m.call && p.session == m.session);
+    match partial {
+        Some(i) => g.messages[i] = m,
+        None => g.messages.push(m),
+    }
     if g.messages.len() > MESSAGES_MAX {
         g.messages.remove(0);
     }

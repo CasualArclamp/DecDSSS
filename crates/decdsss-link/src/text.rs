@@ -60,6 +60,19 @@ pub fn read(f: &ReceivedFile) -> Option<String> {
     (f.ptype == PayloadType::Text).then(|| tidy(&String::from_utf8_lossy(&f.data)))
 }
 
+/// The message so far, from the front of its bytes that has arrived without a gap
+/// ([`crate::assemble::Assembler::front`]). A frame can end inside a multi-byte
+/// character, so the text stops at the last whole one; the rest shows when the next
+/// frame brings it.
+pub fn read_front(data: &[u8]) -> String {
+    // `valid_up_to` is the length of the longest valid UTF-8 prefix.
+    let whole = match std::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&data[..e.valid_up_to()]).unwrap_or_default(),
+    };
+    tidy(whole)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +104,54 @@ mod tests {
         let t = tidy(&long);
         assert!(t.len() <= MAX_TEXT_BYTES && t.len() >= MAX_TEXT_BYTES - 1);
         assert!(t.chars().all(|c| c == 'é'), "cut on a character boundary");
+    }
+
+    #[test]
+    fn a_front_cut_inside_a_character_stops_before_it() {
+        let bytes = "café".as_bytes(); // the é is two bytes
+        assert_eq!(read_front(&bytes[..4]), "caf");
+        assert_eq!(read_front(bytes), "café");
+        assert_eq!(read_front(&[]), "");
+    }
+
+    #[test]
+    fn a_message_reads_out_frame_by_frame_as_it_arrives() {
+        use crate::assemble::Assembler;
+        use decdsss_phy::rx::payload::BlockResult;
+
+        let msg: String = (0..40).map(|i| format!("word{i} ")).collect();
+        let msg = tidy(&msg);
+        let p = plan_text(&spec(), &msg).unwrap();
+        assert!(p.data_frames > 2, "long enough to take several frames");
+        let header = &p.segments[0].header;
+        let mut asm = Assembler::new();
+        let mut shown = Vec::new();
+        for f in p.segments.iter().flat_map(|s| s.frames.iter()) {
+            let block = BlockResult {
+                index: 0,
+                first_frame: 0,
+                frames: vec![Some(f.clone())],
+                iterations: vec![],
+                fingers: vec![],
+                freq_hz: 0.0,
+                snr_db: 0.0,
+            };
+            let done = asm.push(header, &block);
+            if done.is_some() {
+                break;
+            }
+            if let Some(front) = asm.front("VK2ABC", 5) {
+                shown.push(read_front(&front.data));
+            }
+        }
+        assert!(shown.len() >= 2, "{shown:?}");
+        // Each look is the start of the message and none is shorter than the last.
+        for s in &shown {
+            assert!(msg.starts_with(s.as_str()), "{s:?}");
+        }
+        assert!(shown.windows(2).all(|w| w[0].len() <= w[1].len()));
+        assert!(shown.last().unwrap().len() > shown[0].len());
+        assert!(shown.last().unwrap().len() < msg.len());
     }
 
     #[test]

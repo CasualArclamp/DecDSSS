@@ -1375,7 +1375,14 @@ impl App {
                         ui.label(RichText::new(&m.call).strong().color(col::LOCK))
                             .on_hover_text(format!("session {}", m.session));
                         ui.label(RichText::new(format!("({})", m.band)).weak().size(11.0));
-                        ui.label(&m.text);
+                        if m.partial {
+                            // Still arriving: the text so far, then a dimmed ellipsis.
+                            ui.label(&m.text);
+                            ui.label(RichText::new("…").weak())
+                                .on_hover_text("still arriving");
+                        } else {
+                            ui.label(&m.text);
+                        }
                     });
                 }
             });
