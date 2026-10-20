@@ -171,6 +171,12 @@ pub struct App {
     card_plots: [Plot; 2],
     /// The texture of each picture on show and the version it was made from.
     pictures: std::collections::BTreeMap<(String, u8), (u64, TextureHandle)>,
+    /// The picture opened in the zoom window (call, session), if any.
+    zoomed: Option<(String, u8)>,
+    /// How the zoom window shows it: magnification over fitting the window, and the
+    /// shift of the picture's centre from the window's centre, in screen points.
+    zoom: f32,
+    pan: egui::Vec2,
 }
 
 /// How long a station's card stays after its channel closes with the transfer
@@ -352,6 +358,9 @@ impl App {
             hidden: Default::default(),
             card_plots,
             pictures: Default::default(),
+            zoomed: None,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
         };
         if app.auto.open_cat {
             let radio = app.radio.clone();
@@ -1194,7 +1203,7 @@ impl App {
                     img,
                     TextureOptions::LINEAR,
                 );
-                self.pictures.insert(key, (p.version, t.clone()));
+                self.pictures.insert(key.clone(), (p.version, t.clone()));
                 t
             }
         };
@@ -1209,7 +1218,15 @@ impl App {
                 let (bw, bh) = (300.0f32, 200.0f32);
                 let scale = (bw / p.width as f32).min(bh / p.height as f32).min(8.0);
                 let size = vec2(p.width as f32 * scale, p.height as f32 * scale);
-                let (rect, _) = ui.allocate_exact_size(vec2(bw, bh), Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(vec2(bw, bh), Sense::click());
+                let resp = resp
+                    .on_hover_cursor(egui::CursorIcon::ZoomIn)
+                    .on_hover_text("Click to open larger");
+                if resp.clicked() {
+                    self.zoomed = Some(key);
+                    self.zoom = 1.0;
+                    self.pan = egui::Vec2::ZERO;
+                }
                 ui.painter().rect_filled(rect, 2.0, Color32::from_gray(24));
                 let image_rect = egui::Rect::from_center_size(rect.center(), size);
                 ui.painter().image(
@@ -1242,6 +1259,93 @@ impl App {
                 );
             });
         });
+    }
+
+    /// The window a clicked picture opens in: scroll to zoom about the pointer, drag
+    /// to move it, double-click (or *Fit*) to fit it to the window again. It shows
+    /// the same texture as the card, so a picture still arriving fills in live.
+    fn picture_viewer(&mut self, ctx: &egui::Context, pictures: &[Arc<PictureView>]) {
+        let Some(key) = self.zoomed.clone() else {
+            return;
+        };
+        let (Some(p), Some((_, tex))) = (
+            pictures
+                .iter()
+                .find(|p| (p.call.as_str(), p.session) == (key.0.as_str(), key.1)),
+            self.pictures.get(&key),
+        ) else {
+            // The picture has gone (decoders cleared): nothing to show.
+            self.zoomed = None;
+            return;
+        };
+        let tex = tex.clone();
+        let mut open = true;
+        let screen = ctx.content_rect();
+        egui::Window::new(format!("{}  ·  {}", p.call, p.name))
+            .id(egui::Id::new("picture-viewer"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(screen.size() * 0.8)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(screen.center())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Fit").clicked() {
+                        self.zoom = 1.0;
+                        self.pan = egui::Vec2::ZERO;
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{}×{}  ·  {:.0}%  ·  scroll to zoom, drag to move, double-click to fit",
+                            p.width,
+                            p.height,
+                            0.0f32.max(self.zoom * 100.0)
+                        ))
+                        .weak(),
+                    );
+                });
+                let avail = ui.available_size().max(vec2(64.0, 64.0));
+                let (rect, resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
+                let fit = (rect.width() / p.width as f32).min(rect.height() / p.height as f32);
+                let scale = |zoom: f32| fit * zoom;
+                if resp.hovered() {
+                    // Scroll wheel and pinch both arrive as a zoom factor or a scroll.
+                    let (scroll, pinch) =
+                        ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+                    let factor = (scroll * 0.004).exp() * pinch;
+                    if factor != 1.0 {
+                        // Zoom about the pointer: the image point under it stays put.
+                        let new = (self.zoom * factor).clamp(0.25, 64.0);
+                        if let Some(ptr) = resp.hover_pos() {
+                            let from_centre = ptr - rect.center();
+                            let k = new / self.zoom;
+                            self.pan = from_centre - (from_centre - self.pan) * k;
+                        }
+                        self.zoom = new;
+                    }
+                }
+                if resp.dragged() {
+                    self.pan += resp.drag_delta();
+                }
+                if resp.double_clicked() {
+                    self.zoom = 1.0;
+                    self.pan = egui::Vec2::ZERO;
+                }
+                let size = vec2(p.width as f32, p.height as f32) * scale(self.zoom);
+                let image_rect = egui::Rect::from_center_size(rect.center() + self.pan, size);
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 2.0, Color32::from_gray(24));
+                painter.image(
+                    tex.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            });
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.zoomed = None;
+        }
     }
 
     /// Received text, newest at the bottom, each line the time, who sent it, in which
@@ -2017,6 +2121,7 @@ impl eframe::App for App {
                     self.band_view(ui, &sh);
                 }
             });
+        self.picture_viewer(ui.ctx(), &sh.pictures);
     }
 }
 
