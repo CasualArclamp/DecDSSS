@@ -154,6 +154,10 @@ The scrambler on top keeps the spectrum white whatever code is sent.
 | CSK64 | 30 | 180 | 90 |
 | CSK128 | 15 | 105 | 52.5 |
 | CSK256 | 7.5 | 60 | 30 |
+| BCSK32 (prototype) | 60 | 360 | 180 |
+| BCSK64 (prototype) | 30 | 210 | 105 |
+| BCSK128 (prototype) | 15 | 120 | 60 |
+| BCSK256 (prototype) | 7.5 | 67.5 | 33.75 |
 
 `3k` is 1.25× these rates and `500` is 0.208×. FEC rates are ½, ⅔ and ¾. The
 in-band SNR a mode needs is `Eb/N0 + 10·log₁₀(Rb / B)`, where B is the profile's
@@ -205,7 +209,10 @@ A transmission is one or more *segments*; a segment is:
    type field is one bit wider and whose session is one bit narrower (5 bits, 0 to
    31). Every type that fits in 3 bits is still sent in the version-0 header, as
    before, and a build that predates version 1 skips a version-1 header, which is
-   all it could do with a type it does not know.) (16 and 32 were measured too and never chosen, see Verification, so
+   all it could do with a type it does not know. Bi-orthogonal CSK (below) is the
+   family bit 1 with the spread codes 4 to 7, which CSK left free, for 32 to 256; a
+   build without it finds no CSK size for the code and skips the header, and its
+   header is the long CSK256 one, as for every CSK mode.) (16 and 32 were measured too and never chosen, see Verification, so
    the receiver does not try them.) The receiver tries the alphabets shortest
    first, each as soon as its chips are in, so it starts as early as the
    transmitter allows. A longer header seen in a shorter alphabet despreads to
@@ -218,7 +225,8 @@ A transmission is one or more *segments*; a segment is:
 3. **Payload blocks** — `nblocks` blocks on the station's own code, each
    `depth` LDPC codewords interleaved together. DS-PSK blocks carry a known
    pilot every eighth symbol and a closing pilot, so each block decodes alone.
-   Each frame is data bytes plus a CRC-32.
+   A bi-orthogonal CSK block's first symbol is the sign reference (it carries
+   no sign bit and is sent positive). Each frame is data bytes plus a CRC-32.
 4. **Resync** — a long transmission is cut into segments, each a fresh preamble
    and header with its first frame number, so late joiners can start and a
    receiver that lost the signal can find its place. How often is the sender's
@@ -826,6 +834,10 @@ modem is about 2 dB above its code.
 | | CSK256 ½ | 4.0 dB | −15.0 dB |
 | | CSK32 ¾ | 4.0 dB | −6.3 dB |
 | | CSK64 ¾ | 3.5 dB | −9.0 dB |
+| | BCSK32 ½ | 3.5 dB (prototype) | −7.7 dB |
+| | BCSK64 ½ | 3.5 dB (prototype) | −10.1 dB |
+| | BCSK128 ½ | 3.5 dB (prototype) | −12.5 dB |
+| | BCSK256 ½ | 3.5 dB (prototype) | −15.0 dB |
 | 3 kHz | DS8 ½ | 4.0 dB | −6.6 dB |
 | | CSK64 ½ | 4.0 dB | −10.3 dB |
 | | CSK256 ½ | 4.0 dB | −15.0 dB |
@@ -1170,6 +1182,186 @@ closed on its end frame, but not on the postamble. The question now stays open
 across such a block (`eot_pending`) and is answered when the samples are in. A block
 longer than the postamble and its lags never takes that path: the live streams that
 existed, DS4 ⅔ and DS4 ¾ from depth 1 up, have blocks of 1.1 s or more.
+
+### Bi-orthogonal CSK (2026-10-20, prototype, not decided to ship)
+
+CSK has no high-SNR floor and its detector already follows successive peak phases, so
+the bit CSK leaves unused is the sign of the Walsh code: BPSK on the code, detected
+against the symbol before. `bcsk32` to `bcsk256` (`Family::BiCsk`, `decdsss modes`
+lists them; the code is on branch `claude/nice-pare-3d4f08`).
+
+**The mode.** A symbol takes log₂L bits for the code number (most significant first)
+and then one bit for the sign: 0 keeps the sign of the symbol before, 1 turns it
+over. A block's first symbol takes no sign bit and is sent positive, the reference
+the second is judged against (so a block holds one bit fewer than whole symbols
+and each block still decodes alone). Same symbol rate as CSK, one more bit a symbol, no
+pilots. Rates on `2k4` at rate ½ (derived, `mode::tests`): BCSK32 180, BCSK64 105,
+BCSK128 60, BCSK256 33.75 info bit/s against CSK's 150, 90, 52.5, 30; that is (log₂L +
+1)/log₂L times the rate, 1.20, 1.17, 1.14 and 1.125. The same bits a symbol as the
+next alphabet up at twice its rate (BCSK64 and CSK128: 7 bits, 105 against 52.5 bit/s).
+It sits in the header's mode field as family bit 1 with spread code 4 to 7.
+
+**The receiver.** The code bits are CSK's, unchanged (the log-Bessel metric and
+max-log). Three things are new, all in `rx/payload.rs` and `rx/despread.rs`:
+
+- *The sign bit's LLR* (`despread::sign_llr`) is taken from the two symbols' whole
+  Walsh outputs, not from their decided codes. *Derived* (comment on the function):
+  with the same channel gain h in two successive symbols the likelihood of a sign
+  change d against noise is exp(−κA)·I0(κ|y₁ + d·y₂|) per finger for codes a and b; the
+  posterior of d is the sum over all L² pairs. The pairs of the six largest codes of
+  each symbol are summed outright; the rest of the pairs, where neither correlation is
+  the signal, do not depend on d and sum to the product of the two single-symbol sums
+  of exp(Λ) less the six-by-six block (Graf's addition theorem averages the Bessel
+  function over the relative phase to a product of two). A symbol whose code is in
+  doubt then has a sign LLR near zero instead of a confidently wrong one.
+- *The carrier loop* cannot take the plain CSK product y[n]·conj(y[n−1]), whose phase
+  the sign turns by π about half the time. It takes the product summed over the rake
+  fingers (the fingers' own channel phases cancel in it) with the sign wiped by
+  squaring: Σ z²/|z| has twice the phase step and no sign, and the angle is halved when
+  it is applied. A decision-directed wipe (z times the sign of Re z) was the first idea
+  and was not built: it turns every noise product into the right half-plane, where
+  their sum looks 64 % coherent (derived: the mean of |cos| over a half turn is 2/π
+  ≈ 0.64), above `FREQ_COHERENCE` (0.4), so the loop would take random steps at low
+  SNR; a square has a random phase for noise and the existing gate turns it away.
+  *Derived:* the squared phase wraps at ±π, so the step the loop can follow is ±π/2,
+  half of CSK's ±π: the capture range is ±1/(4T) for a symbol time T = L/1920 s,
+  ±15, ±7.5, ±3.75 and ±1.9 Hz for L = 32 to 256 (CSK: twice that).
+- *A wrong code* (the question of the "previous index"): the sign is differential
+  between neighbours, so a wrong code in symbol n spoils the signs of n and n+1 and no
+  more, with no run of errors after it. Measured below. In the loop, a wrong code makes
+  z noise, which the squaring turns away.
+
+**AWGN, full receiver** (`decdsss sweep --mode … --ebn0 1.5 5.5 0.5 --trials 14
+--offset 0 --clock-ppm 0`, 2.4 kHz, rate ½, depth 4, two blocks, 14 transmissions
+(112 frames) a point, offset ±6 Hz and clock ±30 ppm spread over the trials; *measured*).
+Frames delivered of 112:
+
+| Eb/N0 | 2.5 dB | 3.0 | 3.5 | 4.0 |
+|---|---|---|---|---|
+| CSK32 / BCSK32 | 0 / 3 | 0 / 86 | 58 / 112 | 112 / 112 |
+| CSK64 / BCSK64 | 0 / 10 | 4 / 106 | 105 / 112 | 112 / 112 |
+| CSK128 / BCSK128 | 0 / 32 | 26 / 111 | 112 / 112 | 112 / 112 |
+| CSK256 / BCSK256 | 0 / 25 | 17 / 104 | 94 / 112 | 112 / 112 |
+
+Every BCSK size delivers everything from 3.5 dB; CSK from 4.0 dB (CSK128 also from
+3.5 here, where the table above has 4.0 for it from the earlier run; one 0.5 dB step
+and 14 transmissions do not tell them apart). The Eb/N0 at which half the frames are
+lost, by straight lines between the points (*measured*, to about 0.1 dB): CSK 3.48,
+3.26, 3.17, 3.25 dB and BCSK 2.82, 2.74, 2.65, 2.70 dB for L = 32, 64, 128, 256, so
+BCSK needs 0.66, 0.52, 0.52 and 0.55 dB less Eb/N0 than the same L. *Derived:* a bit
+that costs no energy lowers Eb/N0 by 10·log₁₀((log₂L + 1)/log₂L) = 0.79, 0.67, 0.58
+and 0.51 dB at the same symbol energy; the measured gain is that less 0.13, 0.15,
+0.06 and −0.04 dB. So the sign bit's own cost, against a free bit, is under 0.15 dB
+at threshold; it is not a penalty on top of CSK. In the in-band SNR a mode needs the
+two are about the same (BCSK −7.7, −10.1, −12.5, −15.0 dB at 3.5 dB against CSK's
+−8.0, −10.3, −12.6, −15.0 at 4.0), so what BCSK buys is the 12.5 to 20 % more bit rate.
+Against the equal-bits mode: BCSK64 (7 bits a symbol, 105 bit/s) needs 2.74 dB against
+CSK128's 3.17 (7 bits, 52.5 bit/s), 0.43 dB less Eb/N0 for twice the rate; CSK128 is
+3 dB more sensitive in the band (−13.1 against −10.1 dB at 3.5 dB) for half the rate,
+which is the ordinary trade of chips for bits, not an advantage of either.
+
+**Why the sign LLR must be soft** (genie start, payload only, 24 blocks a point,
+frame loss; `DECDSSS_BICSK_SIGN`, a test-only switch; *measured*): BCSK64 at 3.0 / 3.5
+dB, full rule 5.2 / 0 %, the decided pair plus the closed-form rest 8.3 / 0 %, the
+decided pair alone (`naive`, no allowance for a wrong code) 100 / 96.9 %; BCSK256 2.1 / 0,
+2.1 / 0 and 100 / 91.7 %. The sign decided from the decided codes alone is confidently
+wrong whenever either code is, and the LDPC decoder is lost; summing the six largest
+codes instead of one is worth a little (BCSK64, 3.0 dB). What a wrong code does to the
+sign (genie, AWGN, BCSK64, six blocks of depth 4; hard errors of the sign bit, mean
+|LLR| in brackets):
+
+| Eb/N0 | codes right | both codes right | previous wrong | this wrong | both wrong |
+|---|---|---|---|---|---|
+| 2 dB | 65.5 % | 2.8 % (2.7) | 41.2 % (1.1) | 38.7 % (1.1) | 51.3 % (0.7) |
+| 3 dB | 77.5 % | 2.3 % (3.8) | 37.5 % (1.4) | 36.4 % (1.4) | 53.9 % (0.8) |
+| 4 dB | 88.2 % | 1.0 % (5.3) | 34.5 % (1.9) | 34.2 % (1.9) | 38.1 % (0.9) |
+
+At threshold one symbol in five has a wrong code, and a sign next to one is wrong
+about 35 to 40 % of the time (not 50 %: the true code is often the runner-up, which
+the soft sum uses), with an LLR a third the size of a good one's, which is why the
+decoder copes.
+
+**Fading, full receiver** (`decdsss sweep --fading moderate --offset 5 --clock-ppm 10
+--ebn0 6 22 4 --trials 32`, 256 frames a point; frame loss %; *measured*, CSK / BCSK):
+
+| L | 6 dB | 10 | 14 | 18 | 22 |
+|---|---|---|---|---|---|
+| 32 | 64.8 / 40.2 | 0 / 1.2 | 0 / 0 | 0 / 0 | 0 / 0 |
+| 64 | 58.6 / 21.5 | 0 / 1.2 | 0 / 0 | 0 / 0 | 0 / 0 |
+| 128 | 61.7 / 43.0 | 6.2 / 1.6 | 7.8 / 0 | 3.1 / 0 | 3.1 / 0 |
+| 256 | 84.8 / 50.0 | 7.8 / 15.6 | 0 / 0 | 0 / 0 | 0 / 0 |
+
+The knee, with twice the transmissions (`--ebn0 8 12 2 --trials 64`, 512 frames a
+point, CSK / BCSK):
+
+| L | 8 dB | 10 | 12 |
+|---|---|---|---|
+| 32 | 8.6 / 6.5 | 0.8 / 3.7 | 0.8 / 0 |
+| 64 | 5.7 / 1.6 | 2.3 / 0.6 | 0 / 0 |
+| 128 | 10.9 / 6.3 | 4.7 / 2.3 | 5.5 / 0 |
+| 256 | 28.9 / 23.4 | 8.6 / 10.2 | 3.1 / 3.1 |
+
+Loss comes mostly in whole blocks of four frames (0.8 % of 512), so a difference of a
+few points is a few blocks and not a result: at 10 dB BCSK32 (3.7 %) and BCSK256 (10.2 %)
+read worse than CSK and BCSK64 and BCSK128 read better. Read as a whole BCSK is as
+good as CSK at the knee and better below it, and showed no floor on moderate fading;
+plain CSK128 did (3 to 8 % from 10 to 22 dB, in both runs), which was not looked into
+and is not BCSK's to claim. Good fading, 32 transmissions (6, 10,
+14, 18, 22 dB; slow fades take whole blocks, so this is noisy): CSK64 81.3, 18.4, 6.2,
+0, 0 against BCSK64 79.7, 32.8, 0, 0, 0; CSK128 94.5, 26.6, 6.2, 3.1, 3.1 against BCSK128
+78.5, 28.9, 4.7, 0, 0. Flutter fading (10 Hz spread, so the phase of neighbouring
+symbols is largely unrelated and the sign bits carry little; 32 transmissions, 6, 8, 10,
+12 dB): CSK32 93.8, 3.1, 3.1, 0 against BCSK32 55.5, 4.3, 0, 0; CSK64 93.0, 13.3, 3.1, 0
+against BCSK64 66.8, 7.4, 6.2, 6.2. From 14 to 26 dB all four lose nothing. So BCSK is
+better at 6 dB, level at 8 and, for BCSK64, a few blocks worse at 10 and 12 dB (6.2 %
+against 3.1 and 0): noise-level, not a win. The sign LLR's size under flutter was not
+looked at; the presumption is that it is near zero there, an erased bit that costs the
+others nothing.
+
+**The carrier** (genie start with the carrier `err` Hz off, AWGN, depth 2, two blocks,
+frame loss; *measured*). At 8 dB Eb/N0 (six trials) BCSK256 loses nothing up to 1.5 Hz
+and everything at 2.0 Hz, BCSK128 nothing up to 2.0 Hz and half at 3.0 Hz, CSK256 nothing
+up to 2.0 Hz and half at 3.0 Hz, CSK128 nothing up to 3.0 Hz; at 4 dB BCSK256 loses
+nothing up to 1.4 Hz and 20 % at 1.8 Hz (ten trials). That is the halving of the capture
+range in the derived figures above, showing in the measurement (±1.9 Hz against ±3.75
+Hz for L = 256; the half-loss points sit a little inside the derived ones). A start
+error inside the range needs no loop: the sign bits are a ninth of the coded bits, a
+wrong sign is a small error for the LDPC code, and the known-chip refinement after the
+first decoded block re-learns the carrier for the rest, so with the loop switched off
+(`DEBUG_FREEZE=bicsk_loop`, test only) the results are the same (at 4 dB and 1.8 Hz 20 %
+lost with the loop and 5 % without, ten trials: nothing to choose). The loop matters
+for a carrier that moves within a block: at 0.1 Hz/s of drift (1.9 Hz across a BCSK128
+block of depth 2, derived), 8 dB, eight trials, BCSK128 loses nothing with the loop and
+half its frames without it; BCSK256 loses half with it and half without (3.4 Hz across
+its block, beyond ±1.9 Hz), and so does CSK256 (near its ±3.75 Hz).
+
+**Slips** (`sync_slip_curve`, 1 to 50 ms cut or repeated in block 2, AWGN at 10 dB and
+moderate fading at 20 dB, four seeds): BCSK64 gets 48 of 48 frames at every size on
+both channels, as CSK64 does (the rewind's watch judges the decided code's power,
+which the sign does not touch).
+
+**Round trip.** `rx::payload::tests::bi_orthogonal_csk_blocks_decode_on_a_clean_channel`
+(BCSK32 ½, BCSK64 ⅔, BCSK128 ½, BCSK256 ¾); `decdsss tx --mode bcsk64-1/2` through
+`decdsss channel` (−8.5 dB in the band with 3 Hz offset and 15 ppm; and −2 dB on
+moderate fading) and `decdsss rx` gave a 300-byte file back byte for byte.
+
+**Verdict.** Worth keeping, as a rung and on the merits. On every channel measured BCSK
+did at least as well as CSK of the same L within the noise of 32 to 64 transmissions,
+and below the knee clearly better; on AWGN it needs 0.5 to 0.65 dB less Eb/N0, the
+same in-band SNR, for 12.5 to 20 % more bit rate. The sign bit has no measurable penalty:
+what it costs against a free bit is under 0.15 dB at threshold, and a wrong code or an
+unrelated phase turns it into an erasure instead of an error. The prices: about 230
+lines of code and comment outside the tests (the soft sign LLR is the real work; the decided-code version of it fails
+outright), a new header code (older builds skip the headers, which is also the
+backward-compatible answer), the capture range of the carrier halved (BCSK256 tolerates
+1.9 Hz of start error, so a header carrier estimate off by a hertz is the limit), a
+phase that has to hold between symbols (fine here up to 10 Hz of Doppler spread), twelve
+more entries in `Mode::all()` (the GUI's family buttons do not offer it). Limits of the
+evidence: simulator channels only (Watterson), no recording off air, 14 transmissions a
+point on AWGN and 32 to 64 on fading, rate ½ and `2k4` only. Not tried: using the
+sign reference to improve the code decision itself (the first symbol's phase is a
+coherent reference for the second, which a noncoherent code metric throws away), the 3 kHz
+and 500 Hz profiles, rates ⅔ and ¾, and the CPU cost against CSK.
 
 ### Not yet measured
 

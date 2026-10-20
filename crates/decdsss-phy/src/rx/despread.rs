@@ -127,11 +127,19 @@ fn log_sum_exp(x: impl Iterator<Item = f64> + Clone) -> f64 {
     top + x.map(|v| (v - top).exp()).sum::<f64>().ln()
 }
 
-/// Test-only switch (environment `DECDSSS_BICSK_HARD`, any value): the sign change is
-/// judged on the two decided codes alone, as a decision-directed receiver would, to
-/// measure what summing over the other pairs gives.
-fn hard_sign() -> bool {
-    cfg!(test) && std::env::var_os("DECDSSS_BICSK_HARD").is_some()
+/// Test-only switch (environment `DECDSSS_BICSK_SIGN`) for measuring what the sign
+/// change metric gains from summing over the codes: `naive` judges it on the two
+/// decided codes alone, as a decision-directed receiver would, with no allowance for
+/// either being wrong; `top1` sums the decided pair and the closed-form rest.
+fn sign_ablation() -> Option<&'static str> {
+    if !cfg!(test) {
+        return None;
+    }
+    match std::env::var("DECDSSS_BICSK_SIGN").as_deref() {
+        Ok("naive") => Some("naive"),
+        Ok("top1") => Some("top1"),
+        _ => None,
+    }
 }
 
 /// Codes of each side that the sign-change metric sums over exactly; the rest of
@@ -181,8 +189,8 @@ pub fn sign_llr(
     kappa: &[f64],
 ) -> f32 {
     let nf = prev.len() / l;
-    let hard = hard_sign();
-    let k = if hard { 1 } else { SIGN_TOP };
+    let ablation = sign_ablation();
+    let k = if ablation.is_some() { 1 } else { SIGN_TOP };
     let (ta, tb) = (top_codes(prev_metric, k), top_codes(metric, k));
     let (mut plus, mut minus, mut indep) = (Vec::new(), Vec::new(), Vec::new());
     for &a in &ta {
@@ -198,7 +206,7 @@ pub fn sign_llr(
             indep.push(prev_metric[a] + metric[b]);
         }
     }
-    if hard {
+    if ablation == Some("naive") {
         // The decided codes taken as right, the rest of the pairs left out.
         return (plus[0] - minus[0]) as f32;
     }

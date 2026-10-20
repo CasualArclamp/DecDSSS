@@ -2598,7 +2598,7 @@ mod tests {
     /// How far off the carrier the demodulator may start and still decode: the
     /// block's first frames start `BICSK_ERR` Hz off (the loop has to pull it in),
     /// AWGN at `BICSK_EBN0` dB, two blocks. `BICSK_MODES`, `BICSK_TRIALS`, `BICSK_ERRS`
-    /// (comma-separated Hz) as for the curves.
+    /// (comma-separated Hz) as for the curves; `BICSK_DRIFT` drifts the carrier (Hz a second).
     #[test]
     #[ignore]
     fn bicsk_carrier_error_curve() {
@@ -2613,6 +2613,7 @@ mod tests {
         );
         let trials: usize = env("BICSK_TRIALS").map_or(6, |v| v.parse().unwrap());
         let ebn0: f64 = env("BICSK_EBN0").map_or(8.0, |v| v.parse().unwrap());
+        let drift: f64 = env("BICSK_DRIFT").map_or(0.0, |v| v.parse().unwrap());
         let profile = Profile::W2400;
         for mode in &modes {
             let m = decdsss_core::Mode::from_name(mode).unwrap();
@@ -2624,6 +2625,7 @@ mod tests {
                     let mut ch = channel(profile, ebn0 + m.snr_offset_db(profile));
                     ch.seed = 4000 + trial as u64;
                     ch.offset_hz = -4.0 + trial as f64;
+                    ch.drift_hz_per_s = drift;
                     let audio = through(&seg, &ch);
                     let (mut rx, buf) = genie(&seg, &ch, &audio);
                     rx.track.freq += if trial % 2 == 0 { err } else { -err };

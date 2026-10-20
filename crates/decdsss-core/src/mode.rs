@@ -209,6 +209,8 @@ impl Mode {
             (Profile::W2400, DsPsk, 4, R3_4) => 5.0,
             (Profile::W2400, DsPsk, 16, R3_4) => 4.5,
             (Profile::W2400, Csk, 32 | 64 | 128 | 256, R1_2) => 4.0,
+            // Bi-orthogonal CSK, measured 2026-10-20 (14 transmissions a point).
+            (Profile::W2400, BiCsk, 32 | 64 | 128 | 256, R1_2) => 3.5,
             (Profile::W2400, Csk, 32, R3_4) => 4.0,
             (Profile::W2400, Csk, 64, R3_4) => 3.5,
             (Profile::W3000, DsPsk, 8, R1_2) => 4.0,
@@ -382,6 +384,8 @@ mod tests {
         assert_eq!(m("csk64-1/2").ebn0_measured_db(Profile::N500), Some(6.0));
         assert_eq!(m("ds2-1/2").ebn0_measured_db(Profile::W2400), Some(3.0));
         assert_eq!(m("ds1-3/4").ebn0_measured_db(Profile::W2400), Some(4.0));
+        assert_eq!(m("bcsk64-1/2").ebn0_measured_db(Profile::W2400), Some(3.5));
+        assert_eq!(m("bcsk64-2/3").ebn0_measured_db(Profile::W2400), None);
         assert_eq!(m("ds1-3/4").ebn0_measured_db(Profile::W3000), None);
         assert_eq!(m("ds4-2/3").ebn0_measured_db(Profile::W2400), None);
         assert_eq!(m("ds4-2/3").ebn0_needed_db(Profile::W2400), (4.0, false));
