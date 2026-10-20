@@ -571,6 +571,204 @@ pub fn rake(ui: &mut Ui, profile: &[f32], fingers: &[Finger], size: Vec2) {
     }
 }
 
+/// The main finger's channel as the pilots measure it, drawn as a path through the
+/// I/Q plane (the phasor trace), scaled so the circle is its RMS: a fade is the path
+/// swinging through the middle, a carrier error a steady turn. Older points fade.
+/// The reading is the newest point's power against the RMS.
+pub fn channel_trace(ui: &mut Ui, trace: &[Iq], dt: f64, size: Vec2) {
+    const FULL: f32 = 2.2;
+    let rms = (trace.iter().map(|z| z.norm_sqr()).sum::<f32>() / trace.len().max(1) as f32).sqrt();
+    let reading = match trace.last() {
+        Some(z) if rms > 0.0 && trace.len() >= 4 => format!(
+            "{:+.1} dB  ·  {:.0} s",
+            10.0 * (z.norm_sqr() / (rms * rms)).max(1e-6).log10(),
+            trace.len() as f64 * dt
+        ),
+        _ => String::new(),
+    };
+    let (painter, area) = panel(ui, size, "Channel (pilots)", &reading);
+    if rms <= 0.0 || trace.len() < 2 {
+        return;
+    }
+    let r = area.width().min(area.height()) / 2.0;
+    let o = area.center();
+    let k = r / FULL;
+    let at = |z: &Iq| {
+        let (x, y) = (z.re / rms, z.im / rms);
+        pos2(
+            o.x + x.clamp(-FULL, FULL) * k,
+            o.y - y.clamp(-FULL, FULL) * k,
+        )
+    };
+    painter.line_segment([pos2(o.x - r, o.y), pos2(o.x + r, o.y)], (1.0, col::AXIS));
+    painter.line_segment([pos2(o.x, o.y - r), pos2(o.x, o.y + r)], (1.0, col::AXIS));
+    painter.circle_stroke(o, k, (1.0, col::GRID));
+    let n = trace.len();
+    for (i, w) in trace.windows(2).enumerate() {
+        let age = (i + 2) as f32 / n as f32;
+        painter.line_segment(
+            [at(&w[0]), at(&w[1])],
+            (1.4, col::TRACE.gamma_multiply(0.1 + 0.9 * age * age)),
+        );
+    }
+    painter.circle_filled(at(&trace[n - 1]), 3.0, Color32::WHITE);
+}
+
+/// The Doppler spectrum of the channel the pilots measure: the power spectrum of
+/// the newest points of the trace (a power of two of them, Hann window), in dB from
+/// its peak, over the trace's own Nyquist range (±1/(2·dt): for DS-PSK the pilots',
+/// so a channel faster than that folds back in, which is what the plot is for). The
+/// estimate's band (`band_hz`, half its noise bandwidth) is marked. The reading is
+/// the spread 2σ of what stands above the floor, Watterson's measure.
+pub fn doppler(ui: &mut Ui, trace: &[Iq], dt: f64, band_hz: f32, size: Vec2) {
+    // The largest power of two not over the points there are, at most 256.
+    let have = trace.len().min(256);
+    let n = if have == 0 {
+        0
+    } else {
+        1usize << (usize::BITS - 1 - have.leading_zeros())
+    };
+    if n < 16 || dt <= 0.0 {
+        let _ = panel(ui, size, "Doppler", "");
+        return;
+    }
+    let x = &trace[trace.len() - n..];
+    let hann = |k: usize| 0.5 - 0.5 * (std::f32::consts::TAU * k as f32 / n as f32).cos();
+    // A plain DFT: n is at most 256.
+    let mut p = vec![0.0f32; n];
+    for (m, pm) in p.iter_mut().enumerate() {
+        let mut acc = Iq::new(0.0, 0.0);
+        for (k, z) in x.iter().enumerate() {
+            let a = -std::f32::consts::TAU * (m * k % n) as f32 / n as f32;
+            acc += z * Iq::new(a.cos(), a.sin()) * hann(k);
+        }
+        *pm = acc.norm_sqr();
+    }
+    // Centred: bin m is frequency (m − n/2)/(n·dt).
+    p.rotate_right(n / 2);
+    let df = 1.0 / (n as f64 * dt);
+    let freq = |m: usize| (m as f64 - (n / 2) as f64) * df;
+    let peak = p.iter().copied().fold(1e-30f32, f32::max);
+    let reading = match doppler_spread(x, dt) {
+        Some(s) => format!("spread ≈ {s:.2} Hz"),
+        None => String::new(),
+    };
+    let (painter, area) = panel(ui, size, "Doppler", &reading);
+    let nyq = 0.5 / dt;
+    const DB: f32 = 30.0;
+    let fx = |f: f64| area.left() + ((f + nyq) / (2.0 * nyq)) as f32 * area.width();
+    let fy = |v: f32| {
+        let d = (10.0 * (v / peak).max(1e-6).log10()).max(-DB);
+        area.top() + (-d / DB) * (area.height() - 12.0)
+    };
+    painter.line_segment(
+        [
+            pos2(fx(0.0), area.top()),
+            pos2(fx(0.0), area.bottom() - 12.0),
+        ],
+        (1.0, col::AXIS),
+    );
+    if band_hz > 0.0 {
+        for s in [-1.0, 1.0] {
+            let x = fx(s * f64::from(band_hz).min(nyq));
+            painter.line_segment(
+                [pos2(x, area.top()), pos2(x, area.bottom() - 12.0)],
+                (1.0, col::MARK.gamma_multiply(0.7)),
+            );
+        }
+    }
+    let pts: Vec<Pos2> = (0..n).map(|m| pos2(fx(freq(m)), fy(p[m]))).collect();
+    painter.add(eframe::egui::Shape::line(pts, Stroke::new(1.4, col::TRACE)));
+    small(
+        &painter,
+        pos2(area.left(), area.bottom()),
+        Align2::LEFT_BOTTOM,
+        &format!("−{nyq:.1} Hz"),
+        col::REF,
+    );
+    small(
+        &painter,
+        pos2(area.right(), area.bottom()),
+        Align2::RIGHT_BOTTOM,
+        &format!("+{nyq:.1} Hz"),
+        col::REF,
+    );
+    if band_hz > 0.0 {
+        small(
+            &painter,
+            pos2(area.center().x, area.bottom()),
+            Align2::CENTER_BOTTOM,
+            &format!("estimate ±{band_hz:.2} Hz"),
+            col::MARK,
+        );
+    }
+}
+
+/// The Doppler spread (Watterson's 2σ, Hz) of a channel sampled every `dt` seconds,
+/// from the trace's autocorrelation at one and two samples: for a Gaussian Doppler
+/// spectrum of standard deviation σ, |R(τ)| = P·exp(−2π²σ²τ²), so
+/// |R(2dt)|/|R(dt)| = exp(−6π²σ²dt²) and σ = √(−ln r / 6π²) / dt (derived). White
+/// noise in the trace adds to R(0) only, and a carrier offset turns R without
+/// changing its size, so neither biases it. `None` where the ratio says nothing (a
+/// channel too slow for the trace's length to show, or too fast for its rate).
+pub fn doppler_spread(x: &[Iq], dt: f64) -> Option<f64> {
+    let r = |k: usize| -> f64 {
+        let n = x.len().saturating_sub(k);
+        if n == 0 {
+            return 0.0;
+        }
+        let s: Iq = (0..n).map(|i| x[i + k] * x[i].conj()).sum();
+        f64::from(s.norm()) / n as f64
+    };
+    let (r1, r2) = (r(1), r(2));
+    if r1 <= 0.0 || r2 <= 0.0 || r2 > r1 || r2 < 0.05 * r1 {
+        return None;
+    }
+    let sigma = (-(r2 / r1).ln() / (6.0 * std::f64::consts::PI.powi(2))).sqrt() / dt;
+    Some(2.0 * sigma)
+}
+
+/// `dsc`: the main finger's despread power on the pilot's Walsh code, the data's,
+/// and the mean of the others (noise and multipath leakage), each as a bar in dB
+/// over the others. On one clean path the others hold noise only.
+pub fn code_powers(ui: &mut Ui, p: [f32; 3], size: Vec2) {
+    let noise = p[2].max(1e-12);
+    let db = |v: f32| 10.0 * (v / noise).max(1e-6).log10();
+    let reading = if p[2] > 0.0 {
+        format!("pilot {:+.1} dB · data {:+.1} dB", db(p[0]), db(p[1]))
+    } else {
+        String::new()
+    };
+    let (painter, area) = panel(ui, size, "Walsh codes", &reading);
+    let rows = [
+        ("pilot (code 0)", db(p[0]), col::LOCK),
+        ("data (code 1)", db(p[1]), col::TRACE),
+        ("other codes", 0.0, col::REF),
+    ];
+    let top = rows.iter().map(|r| r.1).fold(10.0f32, f32::max);
+    let h = area.height() / 3.0;
+    let label_w = 86.0;
+    for (i, (name, v, c)) in rows.iter().enumerate() {
+        let y = area.top() + i as f32 * h;
+        small(
+            &painter,
+            pos2(area.left(), y + h * 0.5),
+            Align2::LEFT_CENTER,
+            name,
+            col::REF,
+        );
+        let w = (area.width() - label_w) * (v.max(0.0) / top).max(0.01);
+        painter.rect_filled(
+            Rect::from_min_max(
+                pos2(area.left() + label_w, y + h * 0.25),
+                pos2(area.left() + label_w + w, y + h * 0.75),
+            ),
+            1.0,
+            *c,
+        );
+    }
+}
+
 /// The chips of the last symbol: as received (the real part as a trace, the
 /// carrier off and the scrambler still on) above, after the scrambler is taken
 /// off as a scatter, below.
@@ -887,5 +1085,27 @@ impl HeatTexture {
             &format!("{:+.0} Hz", s.freq0_hz + s.rows as f64 * s.freq_step_hz),
             col::REF,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use decdsss_dsp::rng::Rng;
+
+    #[test]
+    fn the_doppler_reading_finds_the_watterson_spread_through_noise() {
+        // A Gaussian tap of 0.5 Hz spread (moderate), sampled 15 times a second as a
+        // DS16 `dsc` chunk is on 2k4, with noise as strong as the tap: about 0.5 Hz.
+        let mut rng = Rng::new(7);
+        for spread in [0.5, 1.0] {
+            let tap = decdsss_chan::tap_process(4000, 15.0, spread, &mut rng);
+            let noisy: Vec<Iq> = tap.iter().map(|z| z + rng.cgauss()).collect();
+            let s = doppler_spread(&noisy, 1.0 / 15.0).unwrap();
+            assert!(
+                (s - spread).abs() < 0.2 * spread,
+                "{spread} Hz read as {s:.3}"
+            );
+        }
     }
 }

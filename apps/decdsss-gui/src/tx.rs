@@ -40,7 +40,7 @@ const VOX_TONE_S: f64 = 0.4;
 const VOX_GAP_S: f64 = 0.3;
 
 /// The families the Spreading buttons offer, and what each is.
-const FAMILIES: [(Family, &str, &str); 3] = [
+const FAMILIES: [(Family, &str, &str); 4] = [
     (
         Family::DsPsk,
         "DS-PSK",
@@ -56,6 +56,11 @@ const FAMILIES: [(Family, &str, &str); 3] = [
         Family::BiCsk,
         "BCSK",
         "Bi-orthogonal CSK: CSK plus the code's sign as one more bit a symbol, read against the symbol before; 12 to 20 % more rate for the same signal",
+    ),
+    (
+        Family::DsCdm,
+        "DSC",
+        "DS-PSK with a code-multiplexed pilot: the pilot is a Walsh code under every symbol at 1/8 of the power, so the channel is measured all the time rather than one symbol in eight; SF 8 to 64",
     ),
 ];
 
@@ -663,7 +668,11 @@ impl TxPanel {
                 self.cq_packet = false;
             }
             let air = self.chat_timeline().ok().map(|t| {
-                let vox = if self.vox { VOX_TONE_S + VOX_GAP_S } else { 0.0 };
+                let vox = if self.vox {
+                    VOX_TONE_S + VOX_GAP_S
+                } else {
+                    0.0
+                };
                 air_time(vox + self.wfid_seconds() + t.seconds())
             });
             let info = if self.cq_packet {

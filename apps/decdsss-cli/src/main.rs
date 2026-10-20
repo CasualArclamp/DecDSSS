@@ -204,6 +204,10 @@ enum Command {
         /// With --kiwi: its password, if it needs one.
         #[arg(long, default_value = "")]
         kiwi_password: String,
+        /// With --kiwi: also write the audio to this WAV (at the Kiwi's rate,
+        /// rounded to a whole Hz), to decode again later.
+        #[arg(long)]
+        save: Option<PathBuf>,
         /// Profiles to listen on: all, or a comma-separated list of 500, 2k4, 3k.
         /// 500 listens on all three of its slots; 500@-500, 500@0 or 500@+500 on one.
         #[arg(long, default_value = "all")]
@@ -395,6 +399,7 @@ fn main() -> Result<()> {
             freq,
             lsb,
             kiwi_password,
+            save,
             profile,
             out_dir,
             verbose,
@@ -404,6 +409,7 @@ fn main() -> Result<()> {
                 freq.context("--kiwi needs --freq KHZ, the dial frequency")?,
                 lsb,
                 &kiwi_password,
+                save.as_deref(),
                 duration,
                 &profile,
                 &out_dir,
@@ -1240,6 +1246,7 @@ fn rx_kiwi(
     freq_khz: f64,
     lsb: bool,
     password: &str,
+    save: Option<&Path>,
     duration: Option<f64>,
     profile: &str,
     out_dir: &Path,
@@ -1247,6 +1254,7 @@ fn rx_kiwi(
 ) -> Result<()> {
     let bands = parse_bands(profile)?;
     std::fs::create_dir_all(out_dir)?;
+    let mut kept: Vec<f32> = Vec::new();
     let mut cfg = decdsss_kiwi::Config::new(address, freq_khz)?;
     cfg.lsb = lsb;
     cfg.password = password.to_string();
@@ -1261,7 +1269,7 @@ fn rx_kiwi(
     );
     let mut run = RxRun::new(&bands, kiwi.sample_rate(), out_dir, verbose);
     let started = std::time::Instant::now();
-    let (mut notes, mut gaps) = (0usize, 0u64);
+    let (mut notes, mut gaps, mut samples) = (0usize, 0u64, 0usize);
     while duration.is_none_or(|d| started.elapsed().as_secs_f64() < d) {
         let st = kiwi.status();
         for n in &st.notes[notes..] {
@@ -1287,8 +1295,24 @@ fn rx_kiwi(
             std::thread::sleep(std::time::Duration::from_millis(10));
             continue;
         }
+        samples += audio.len();
         run.push(&audio);
+        if save.is_some() {
+            kept.extend_from_slice(&audio);
+        }
     }
+    if let Some(p) = save {
+        wav::write(p, &kept, kiwi.sample_rate().round() as u32)?;
+        println!("wrote {}", p.display());
+    }
+    let st = kiwi.status();
+    println!(
+        "{:.1} s of audio from the KiwiSDR ({} frames, {:.0} ms missing), S-meter {:.1} dBm",
+        samples as f64 / kiwi.sample_rate(),
+        st.frames,
+        1e3 * st.gap_samples as f64 / kiwi.sample_rate(),
+        st.smeter_dbm
+    );
     run.summary();
     Ok(())
 }

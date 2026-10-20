@@ -20,6 +20,8 @@ cargo run --release -p decdsss-cli -- tx file.bin --call VK2ABC --profile 500 --
 cargo run --release -p decdsss-cli -- tx --cq --call VK2ABC -o cq.wav   # a CQ packet: the callsign alone in a header, two copies (--copies N); or --text "message"
 cargo run --release -p decdsss-cli -- tx file.bin --call VK2ABC --wfid -o f.wav   # --wfid: the call and mode written on the waterfall ahead of the signal
 cargo run --release -p decdsss-cli -- sweep --mode ds8-1/2 --ebn0 2 6 1   # frame loss vs Eb/N0, whole receiver
+cargo run --release -p decdsss-cli -- sweep --mode ds8-1/2 --ebn0 14 14 1 --slip-every 3   # audio that slips (browser into a virtual cable: 1-3 blocks of 128 dropped or silent)
+cargo run --release -p decdsss-cli -- rx --kiwi HOST[:PORT] --freq 7074 --duration 30   # a KiwiSDR off the network; a Kiwi may refuse programs (too_busy): its owner's limit, respect it
 powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1   # portable exes into exe\ (git-ignored), named with the version: decdsss-gui-v0.0.1.exe
 cargo run --release -p decdsss-gui -- --demo   # the window; --screenshot OUT.png --after 20 for pictures
 ```

@@ -13,8 +13,8 @@
 //! **Slips.** A live stream through a browser and a virtual cable drops or
 //! repeats whole blocks of audio, which moves everything after by that much:
 //! the loop, a quarter chip a period at most, cannot follow. When a strong
-//! preamble drops out, the next period is searched over ±[`SLIP_S`] for the
-//! sequences; a lag that holds at least half the strongest period's power, with
+//! preamble drops out, that period, then the next, is searched over ±[`SLIP_S`]
+//! for the sequences; a lag that holds at least half the strongest period's power, with
 //! the old lag empty after it and the new lag empty in the period before (a
 //! fade of one path onto another fails this), is a slip. The track moves by it,
 //! the period it happened in is left out of the clock line and the delay
@@ -165,9 +165,9 @@ pub struct PreambleTracker {
     dom: Vec<f64>,
     pmax: f64,
     fresh: bool,
-    /// Per period: the slips before its boundary, summed, and whether a slip
-    /// fell inside it (then it is in neither the line nor the profile, nor a
-    /// carrier step).
+    /// Per period: the slips before its boundary, summed (a carrier step across
+    /// a change of it is not taken), and whether a slip fell inside it (then it
+    /// is in neither the line nor the profile, nor a carrier step).
     shift: Vec<f64>,
     split: Vec<bool>,
     /// All the slips so far, samples.
@@ -325,7 +325,6 @@ impl PreambleTracker {
                     self.slips += 1;
                 }
             }
-
             let (pa, pb) = (ca[1].norm_sqr(), cb[1].norm_sqr());
             let a_dom = pa >= pb;
             let c = if a_dom { ca } else { cb };
@@ -374,7 +373,6 @@ impl PreambleTracker {
             // learns the clock error as a change of the period length.
             self.period += ki * err;
             self.pos += self.period + kp * err;
-
             self.count += 1;
 
             // Pattern: B at m−1, m; A at m−2 … m−1−LOOKBACK_A.
@@ -446,7 +444,7 @@ impl PreambleTracker {
             let (c1, d1) = self.prompt[m - 1];
             let (c2, d2) = self.prompt[m];
             // A slip between them turns the carrier phase too.
-            let slipped = self.split[m - 1] || self.split[m];
+            let slipped = self.split[m - 1] || self.split[m] || self.shift[m] != self.shift[m - 1];
             if d1 == d2 && !slipped {
                 s += c2 * c1.conj();
             }

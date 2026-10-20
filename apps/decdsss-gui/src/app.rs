@@ -104,6 +104,9 @@ pub struct Automation {
     pub ptt_for: Option<f64>,
     /// Like `ptt_for`, but live: stream from the microphone for this long.
     pub live_for: Option<f64>,
+    /// The station cards' two plots, by their saved names (`channel,doppler`), for
+    /// this run only.
+    pub plots: Option<String>,
     pub requested_at: Option<Instant>,
 }
 
@@ -314,15 +317,28 @@ impl App {
             .get("monitor_volume")
             .and_then(|v| v.parse().ok())
             .map_or(1.0, |v: f32| v.clamp(0.0, 4.0));
+        let asked: Vec<Plot> = auto
+            .plots
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|k| Plot::from_key(k.trim()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let card_plots = [
-            prefs
-                .get("card_left")
-                .and_then(Plot::from_key)
-                .unwrap_or(Plot::Symbols),
-            prefs
-                .get("card_right")
-                .and_then(Plot::from_key)
-                .unwrap_or(Plot::Delay),
+            asked.first().copied().unwrap_or_else(|| {
+                prefs
+                    .get("card_left")
+                    .and_then(Plot::from_key)
+                    .unwrap_or(Plot::Symbols)
+            }),
+            asked.get(1).copied().unwrap_or_else(|| {
+                prefs
+                    .get("card_right")
+                    .and_then(Plot::from_key)
+                    .unwrap_or(Plot::Delay)
+            }),
         ];
         let kiwi_addr = auto
             .kiwi
@@ -1865,10 +1881,16 @@ enum Plot {
     Soft,
     Snr,
     Carrier,
+    /// DS-PSK and `dsc`: the channel the pilots measure, as a phasor trace.
+    Channel,
+    /// DS-PSK and `dsc`: its Doppler spectrum.
+    Doppler,
+    /// `dsc`: the power on the pilot's, the data's and the other Walsh codes.
+    Codes,
 }
 
 impl Plot {
-    const ALL: [Plot; 8] = [
+    const ALL: [Plot; 11] = [
         Plot::Symbols,
         Plot::Detail,
         Plot::Timing,
@@ -1877,21 +1899,36 @@ impl Plot {
         Plot::Soft,
         Plot::Snr,
         Plot::Carrier,
+        Plot::Channel,
+        Plot::Doppler,
+        Plot::Codes,
     ];
+
+    /// Whether the plot has anything to show for a family (its tab is offered).
+    fn applies(self, family: Family) -> bool {
+        match self {
+            Plot::Channel | Plot::Doppler => family.is_ds(),
+            Plot::Codes => family == Family::DsCdm,
+            _ => true,
+        }
+    }
 
     /// The tab's name.
     fn label(self, family: Family) -> &'static str {
         match (self, family) {
             (Plot::Symbols, Family::Csk | Family::BiCsk) => "Walsh",
-            (Plot::Symbols, Family::DsPsk) => "Const",
+            (Plot::Symbols, Family::DsPsk | Family::DsCdm) => "Const",
             (Plot::Detail, Family::Csk | Family::BiCsk) => "Bars",
-            (Plot::Detail, Family::DsPsk) => "Sym×prev",
+            (Plot::Detail, Family::DsPsk | Family::DsCdm) => "Sym×prev",
             (Plot::Timing, _) => "Timing",
             (Plot::Delay, _) => "Delay",
             (Plot::Chips, _) => "Chips",
             (Plot::Soft, _) => "LLR",
             (Plot::Snr, _) => "SNR",
             (Plot::Carrier, _) => "Carrier",
+            (Plot::Channel, _) => "Channel",
+            (Plot::Doppler, _) => "Doppler",
+            (Plot::Codes, _) => "Codes",
         }
     }
 
@@ -1906,6 +1943,9 @@ impl Plot {
             Plot::Soft => "soft",
             Plot::Snr => "snr",
             Plot::Carrier => "carrier",
+            Plot::Channel => "channel",
+            Plot::Doppler => "doppler",
+            Plot::Codes => "codes",
         }
     }
 
@@ -2015,6 +2055,15 @@ fn channel_card(
             }
             kpi(ui, "Carrier", format!("{:+.2} Hz", c.carrier_hz));
             kpi(ui, "E−L", format!("{disc:+.2}"));
+            if live.searching {
+                ui.label(RichText::new("searching").strong().color(col::MARK))
+                    .on_hover_text(
+                        "The station was lost; the reacquisition search is looking for it over lag and carrier",
+                    );
+            }
+            if live.reacquired > 0 {
+                kpi(ui, "Reacquired", format!("{}", live.reacquired));
+            }
         });
 
         // The two plots, each under its own row of tabs.
@@ -2028,7 +2077,7 @@ fn channel_card(
                     ui.set_width(half);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        for p in Plot::ALL {
+                        for p in Plot::ALL.into_iter().filter(|p| p.applies(family)) {
                             let text = RichText::new(p.label(family)).size(11.0);
                             if ui.selectable_label(*slot == p, text).clicked() {
                                 *slot = p;
@@ -2048,7 +2097,7 @@ fn channel_card(
 /// Draws one of a station card's plots `size` big.
 fn plot(ui: &mut Ui, p: Plot, c: &ChannelView, size: egui::Vec2) {
     let live = &c.live;
-    let ds = c.header.mode.family == Family::DsPsk;
+    let ds = c.header.mode.family.is_ds();
     let cap = decdsss_phy::rx::payload::LIVE_STRIP;
     // Rust note: `Plot::Symbols if ds` is a match guard: the arm is taken only
     // when the pattern matches and the condition holds, else the next arm is
@@ -2091,6 +2140,11 @@ fn plot(ui: &mut Ui, p: Plot, c: &ChannelView, size: egui::Vec2) {
                 size,
             );
         }
+        Plot::Channel => scope::channel_trace(ui, &live.pilot_trace, live.trace_dt, size),
+        Plot::Doppler => {
+            scope::doppler(ui, &live.pilot_trace, live.trace_dt, live.est_band_hz, size)
+        }
+        Plot::Codes => scope::code_powers(ui, live.code_power, size),
         Plot::Carrier => {
             let f = live.freq_hz.last().copied().unwrap_or(f32::NAN);
             scope::strip(
@@ -2347,10 +2401,12 @@ fn looks_like_call(word: &str) -> bool {
     if b.len() < 3 || b.len() > 7 || !b.iter().all(u8::is_ascii_alphanumeric) {
         return false;
     }
-    let letters = b.iter().rev().take_while(|c| c.is_ascii_alphabetic()).count();
-    (1..=3).contains(&letters)
-        && letters + 1 < b.len()
-        && b[b.len() - letters - 1].is_ascii_digit()
+    let letters = b
+        .iter()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .count();
+    (1..=3).contains(&letters) && letters + 1 < b.len() && b[b.len() - letters - 1].is_ascii_digit()
 }
 
 /// A message's text with callsigns picked out: yours as an orange chip, others as
@@ -2404,7 +2460,9 @@ mod tests {
         for c in ["VK2ABC", "W3DEF", "JA1QRS", "g4hij", "VK2ABC/P", "K1A"] {
             assert!(looks_like_call(c), "{c}");
         }
-        for w in ["73", "59", "CQ", "FT8", "5NN", "de", "hello", "2400", "VK2ABCDE"] {
+        for w in [
+            "73", "59", "CQ", "FT8", "5NN", "de", "hello", "2400", "VK2ABCDE",
+        ] {
             assert!(!looks_like_call(w), "{w}");
         }
         assert!(names_call("VK2ABC de W3DEF, good copy", "VK2ABC"));

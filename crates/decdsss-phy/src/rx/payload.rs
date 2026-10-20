@@ -4,7 +4,8 @@
 //! A block is processed in two passes, and the first runs as the samples
 //! arrive. It walks the symbols once, despreading each rake finger and keeping
 //! what the second needs: for CSK the Walsh correlations, for DS-PSK the
-//! despread symbols and the pilot gains. At the end of the block the second
+//! despread symbols and the pilot gains (for `dsc`, the pilot code's and the data
+//! code's correlations of every symbol). At the end of the block the second
 //! turns that into bit LLRs (a noncoherent Bessel metric for CSK; for DS-PSK a
 //! G-RAKE, MMSE combining on a half-chip grid of delays, with pilot-aided
 //! maximal-ratio combining on the fingers as the fallback for any codeword it
@@ -23,27 +24,35 @@
 //! of the audio, or a fade); a wide search on the samples kept tells a slip from
 //! a fade, and after a slip the tracking state goes back to a snapshot from
 //! before it and the symbols are despread again from there on the moved track
-//! ([`rewind`]).
+//! ([`rewind`]). When the search finds no slip, a second one looks for the station
+//! over lag and carrier on what is known of its signal, for as long as a minute, and
+//! puts the track where it finds it ([`reacq`]).
 
 use super::despread::{
-    Track, csk_bit_llrs, despread, ln_i0, sign_llr, sum, walsh_correlate, walsh_one,
+    Track, cdm_data, csk_bit_llrs, despread, ln_i0, sign_llr, sum, walsh_correlate, walsh_one,
 };
 use super::frontend::Buf;
 use super::grake;
 use super::header::{Finger, HeaderResult};
 use super::preamble::DelayProfile;
+use super::reacq;
 use super::rewind::{self, Judged, Watch};
-use crate::codes::{Scrambler, own_code};
+use crate::codes::{Scrambler, fwht, own_code};
 use crate::eot;
 use crate::framing::{Header, Layout, check_frame};
-use crate::tx::{block_chips, pilot_symbol};
+use crate::tx::{block_chips, cdm_amplitudes, pilot_symbol};
 use decdsss_core::Family;
-use decdsss_core::mode::PILOT_INTERVAL;
+use decdsss_core::mode::{CDM_PILOT_SHARE, PILOT_INTERVAL};
 use decdsss_dsp::Iq;
 use decdsss_fec::interleave::Interleaver;
 use decdsss_fec::ldpc::Decoder;
 use num_complex::Complex64;
 use std::f64::consts::TAU;
+
+/// The block's known-chip refinement is tried from the carrier the loop ended the
+/// block on as well as from the one it started with when the two differ by this
+/// much, Hz (see [`PayloadRx::refresh_fingers`]).
+const REFINE_RETRY_HZ: f64 = 0.5;
 
 /// Rake fingers kept (the header's pick is limited the same way).
 const SLOTS: usize = 3;
@@ -196,6 +205,87 @@ fn smooth_gains(g: &[[Iq; SLOTS]], half: usize) -> Vec<[Iq; SLOTS]> {
         .collect()
 }
 
+/// Symbols in a `dsc` pilot *chunk*, the pilot correlations summed coherently into
+/// one measurement for the carrier loop, the delay profile and the display: eight,
+/// DS-PSK's pilot interval. At β = 1/8 a chunk then holds the energy of one DS-PSK
+/// pilot symbol at the same SF (8 × L × 1/8 = L chips' worth, derived) and comes as
+/// often, so the loops see what DS-PSK's see. (The channel estimate the decoder
+/// uses is not taken from chunks but from every symbol, [`PayloadRx::finish_cdm`].)
+/// A chunk of 64 chips (SF 8's symbol) was tried first: at SF 64 that is one symbol
+/// holding an eighth of a DS64 pilot's energy, and the carrier loop, which takes the
+/// product of successive chunks, went wrong at low SNR. Measured (genie start, AWGN,
+/// 2.4 kHz, depth 2, two blocks, 24 transmissions): DSC64 1/2 at 4.5 dB Eb/N0 lost
+/// 22 of 96 frames with it, none with the carrier loop frozen and none with chunks
+/// of 512 chips; at 3.5 dB none with 512, where DS64 1/2 lost 14.
+const CDM_CHUNK_SYMBOLS: usize = PILOT_INTERVAL as usize;
+
+/// Symbols in a `dsc` pilot chunk ([`CDM_CHUNK_SYMBOLS`]; `DEBUG_CDM_CHUNK=chips`
+/// sets another length for a measurement).
+fn cdm_chunk(sf: usize) -> usize {
+    debug_usize("DEBUG_CDM_CHUNK").map_or(CDM_CHUNK_SYMBOLS, |c| (c / sf).max(1))
+}
+
+/// A measurement knob: the environment variable `name` as a number, read once a
+/// name (tests and measurements only; unset in use).
+fn debug_usize(name: &'static str) -> Option<usize> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, Option<usize>>>> = OnceLock::new();
+    let mut m = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    *m.entry(name)
+        .or_insert_with(|| std::env::var(name).ok().and_then(|v| v.parse().ok()))
+}
+
+/// The half-widths (symbols) the `dsc` channel estimate may take: a triangle of
+/// weights `half + 1 − |i|`.
+const CDM_HALVES: [usize; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+/// The `dsc` channel estimate's half-width for a block, chosen by leave-one-out
+/// cross-validation: each symbol's raw estimate (its pilot correlation) is
+/// predicted from the others' by the triangle, and the width with the least
+/// squared error, summed over the `nf` fingers in use, is taken. The raw estimate
+/// is the channel plus noise independent of the others', so the error is that
+/// noise, the same for every width, plus the prediction's own error: the least is
+/// the width that estimates the channel best, whatever the fading rate and the SNR
+/// (a slow channel at a low SNR takes a long triangle, a fast one at a high SNR a
+/// short one). DS-PSK's pilots cannot be smoothed this way to any profit: they come
+/// one in eight symbols, so a fast channel aliases before any width is tried.
+fn cdm_half_width(raw: &[[Iq; SLOTS]], nf: usize, max_half: usize) -> usize {
+    let n = raw.len();
+    let mut best = (1usize, f64::MAX);
+    for &half in CDM_HALVES.iter().filter(|&&h| h <= max_half.max(1)) {
+        let mut err = 0.0f64;
+        for k in 0..n {
+            let (lo, hi) = (k.saturating_sub(half), (k + half).min(n - 1));
+            let mut acc = [Iq::new(0.0, 0.0); SLOTS];
+            let mut wsum = 0.0f32;
+            for (j, rj) in raw.iter().enumerate().take(hi + 1).skip(lo) {
+                if j == k {
+                    continue;
+                }
+                let w = (half + 1 - j.abs_diff(k)) as f32;
+                for (a, &z) in acc.iter_mut().zip(rj) {
+                    *a += z * w;
+                }
+                wsum += w;
+            }
+            if wsum <= 0.0 {
+                continue;
+            }
+            for fi in 0..nf.min(SLOTS) {
+                err += f64::from((raw[k][fi] - acc[fi] / wsum).norm_sqr());
+            }
+        }
+        if err < best.1 {
+            best = (half, err);
+        }
+    }
+    best.0
+}
+
 /// Where a block's known-chip refinement starts: after a slip the block's
 /// timing is one line only from the slip on, so there, on the track that symbol
 /// was taken on (moved onto the end's finger lags); otherwise the block's start.
@@ -242,6 +332,17 @@ pub(crate) fn no_start_slip() -> bool {
     *V.get_or_init(|| std::env::var_os("DECDSSS_NO_START_SLIP").is_some())
 }
 
+/// How long the watch stays lost before it gives up and takes what there is as the
+/// new level: a minute while the reacquisition search can still find the station,
+/// four seconds without it.
+fn lost_max_s() -> f64 {
+    if reacq::disabled() {
+        rewind::LOST_MAX_S
+    } else {
+        reacq::LOST_MAX_S
+    }
+}
+
 /// The carrier correction from `acc`, a sum of successive-measurement
 /// products (`norm` the sum of their magnitudes) taken `interval_s` apart;
 /// zero when the products do not agree (a fade).
@@ -276,6 +377,11 @@ pub struct BlockResult {
 pub struct Live {
     /// Slips of the signal the rewind found and followed.
     pub slips: usize,
+    /// Times the reacquisition search found the station somewhere else after it was
+    /// lost, and moved the track there.
+    pub reacquired: usize,
+    /// The reacquisition search is running (the channel is lost).
+    pub searching: bool,
     /// DS-PSK: recent data symbols after rake combining, scaled to unit
     /// amplitude (the constellation).
     pub symbols: Vec<Iq>,
@@ -295,6 +401,20 @@ pub struct Live {
     /// after the scrambler is taken off.
     pub raw_chips: Vec<Iq>,
     pub despread_chips: Vec<Iq>,
+    /// DS-PSK and `dsc`: the main finger's channel as the pilots measure it (one
+    /// point a pilot, or a `dsc` pilot chunk), scaled to the channel's own
+    /// amplitude, newest last: the phasor trace, and the Doppler spectrum's samples.
+    pub pilot_trace: Vec<Iq>,
+    /// Seconds between the trace's points.
+    pub trace_dt: f64,
+    /// Half the noise bandwidth of the channel estimate the last block was decoded
+    /// with, Hz (Σw²/(Σw)² of its smoothing, times the rate of what it smooths,
+    /// over two): the estimate follows a channel changing within about this.
+    pub est_band_hz: f32,
+    /// `dsc`: the main finger's despread power on the pilot's code, the data's code
+    /// and the mean of the other codes (noise and multipath leakage only), per symbol,
+    /// a running mean.
+    pub code_power: [f32; 3],
     /// The latest delay profile, power against lag, and the fingers it gave.
     pub profile: Vec<f32>,
     pub fingers: Vec<Finger>,
@@ -424,7 +544,11 @@ struct CskWork {
     snaps: Vec<CskSnap>,
     search: bool,
     replay_until: usize,
-    slip: Option<(usize, f64)>,
+    /// A slip or a reacquisition: from this symbol the signal is this many chips away
+    /// and this many hertz off the carrier.
+    slip: Option<(usize, f64, f64)>,
+    /// The reacquisition search, while the channel is lost.
+    reacq: Option<reacq::Search>,
     slipped_at: Option<usize>,
 }
 
@@ -445,8 +569,11 @@ struct CskSnap {
     finger_age: Vec<u8>,
 }
 
-/// A DS-PSK block in progress.
+/// A DS-PSK or `dsc` block in progress.
 struct DsWork {
+    /// A `dsc` block: `y` holds each symbol's pilot correlation, `yd` its data's,
+    /// and `g` the pilot chunks' means.
+    cdm: bool,
     scr: Vec<Iq>,
     start: Track,
     step0: f64,
@@ -457,6 +584,11 @@ struct DsWork {
     y: Vec<[Iq; SLOTS]>,
     /// g[k][f]: pilot gain estimates.
     g: Vec<[Iq; SLOTS]>,
+    /// `dsc`: yd[s][f], the data code's correlation per finger slot.
+    yd: Vec<[Iq; SLOTS]>,
+    /// `dsc`: the pilot chunk being summed, and its symbols so far.
+    chunk_acc: [Iq; SLOTS],
+    chunk_n: usize,
     pilot_no: usize,
     freq_acc: Iq,
     freq_norm: f32,
@@ -486,8 +618,10 @@ struct DsWork {
     /// not judge them a second time.
     replay_until: usize,
     /// A slip the search found: from this symbol the signal is this many chips
-    /// away.
-    slip: Option<(usize, f64)>,
+    /// away (and, after a reacquisition, this many hertz off the carrier).
+    slip: Option<(usize, f64, f64)>,
+    /// The reacquisition search, while the channel is lost.
+    reacq: Option<reacq::Search>,
     /// The symbol of the last slip followed: the block's timing is one line
     /// only from there, so the known-chip refinement starts there.
     slipped_at: Option<usize>,
@@ -500,6 +634,8 @@ struct DsSnap {
     s: usize,
     t: Track,
     pilot_no: usize,
+    chunk_acc: [Iq; SLOTS],
+    chunk_n: usize,
     freq_acc: Iq,
     freq_norm: f32,
     tc: Track,
@@ -561,8 +697,10 @@ pub struct PayloadRx {
     /// in the header's last symbols or between it and the payload leaves the
     /// whole payload at the wrong lag) and a block's after one that failed.
     check_start: bool,
-    /// That search is under way (it is not a loss the watch saw).
+    /// That search is under way (it is not a loss the watch saw): it looks
+    /// for a slip only, and the reacquisition is not started from it.
     start_search: bool,
+    probing_start: bool,
     /// The last block's interleaved LLRs (kept for the tests).
     #[cfg(test)]
     pub last_llrs: Vec<f32>,
@@ -600,6 +738,7 @@ impl PayloadRx {
             watch: Watch::default(),
             check_start: true,
             start_search: false,
+            probing_start: false,
             #[cfg(test)]
             last_llrs: Vec::new(),
         })
@@ -770,7 +909,11 @@ impl PayloadRx {
             }
             Work::Ds(mut w) => {
                 if self.advance_ds(buf, &mut w) {
-                    let r = self.finish_ds(buf, *w);
+                    let r = if w.cdm {
+                        self.finish_cdm(buf, *w)
+                    } else {
+                        self.finish_ds(buf, *w)
+                    };
                     self.end_block(start, chip0);
                     Some(r)
                 } else {
@@ -798,6 +941,23 @@ impl PayloadRx {
     }
 
     fn begin_block(&mut self, buf: &Buf, prepass: bool) {
+        if debug_usize("DEBUG_REACQ").is_some() {
+            let nominal = self.rate
+                / super::frontend::SPS as f64
+                / f64::from(self.header.profile.chip_rate());
+            eprintln!(
+                "block {} starts: clock {:+.0} ppm, carrier {:+.2} Hz, fresh {}, lost {:?}, fingers {:?}",
+                self.next_block,
+                (self.track.step / nominal - 1.0) * 1e6,
+                self.track.freq,
+                self.fresh,
+                self.watch.lost,
+                self.fingers
+                    .iter()
+                    .map(|f| (f.lag * 100.0).round() / 100.0)
+                    .collect::<Vec<_>>()
+            );
+        }
         self.eot_probed = false;
         self.check_start = (self.next_block == 0 || prepass) && !no_start_slip();
         self.start_search = false;
@@ -846,6 +1006,7 @@ impl PayloadRx {
                     search: false,
                     replay_until: 0,
                     slip: None,
+                    reacq: None,
                     slipped_at: None,
                 })));
                 if let Some(Work::Csk(mut w)) = self.work.take() {
@@ -854,13 +1015,19 @@ impl PayloadRx {
                     self.work = Some(Work::Csk(w));
                 }
             }
-            Family::DsPsk => {
+            Family::DsPsk | Family::DsCdm => {
                 if prepass {
                     self.ds_prepass(buf, &scr);
                 }
                 let start = self.track;
-                let pilots = s_count / PILOT_INTERVAL as usize + 1;
+                let cdm = self.layout.mode.family == Family::DsCdm;
+                let pilots = if cdm {
+                    s_count.div_ceil(cdm_chunk(l)) + 1
+                } else {
+                    s_count / PILOT_INTERVAL as usize + 1
+                };
                 self.work = Some(Work::Ds(Box::new(DsWork {
+                    cdm,
                     scr,
                     start,
                     step0: start.step,
@@ -869,6 +1036,13 @@ impl PayloadRx {
                     s_count,
                     y: vec![[Iq::new(0.0, 0.0); SLOTS]; s_count],
                     g: vec![[Iq::new(0.0, 0.0); SLOTS]; pilots],
+                    yd: if cdm {
+                        vec![[Iq::new(0.0, 0.0); SLOTS]; s_count]
+                    } else {
+                        Vec::new()
+                    },
+                    chunk_acc: [Iq::new(0.0, 0.0); SLOTS],
+                    chunk_n: 0,
                     pilot_no: 0,
                     freq_acc: Iq::new(0.0, 0.0),
                     freq_norm: 0.0,
@@ -885,6 +1059,7 @@ impl PayloadRx {
                     search: false,
                     replay_until: 0,
                     slip: None,
+                    reacq: None,
                     slipped_at: None,
                 })));
                 // The block's start is the first snapshot. (`take` moves the
@@ -988,7 +1163,26 @@ impl PayloadRx {
         let main_lag = self.fingers.first().map_or(0.0, |f| f.lag);
         let cr = self.rate / super::frontend::SPS as f64;
         let seg = super::refine::segment_chips(cr);
-        let refined = super::refine::refine(buf, &start, chips, main_lag, seg, 60e-6);
+        let mut refined = super::refine::refine(buf, &start, chips, main_lag, seg, 60e-6);
+        // The refinement takes the carrier from the block's start and measures the
+        // error over quarter-second segments, so an error near a multiple of 4 Hz
+        // looks like none (a whole turn a segment) and the fit, which then finds
+        // little, sets the carrier back to where the block began, undoing what the
+        // carrier loop learnt in it (seen after a fade in which the carrier moved
+        // 3 Hz: DS8 sat 4 Hz off for block after block, and the timing fitted on it
+        // walked chips a block). So where the loop ended somewhere else, the fit is
+        // tried from there too, and the one that finds the chips better is kept.
+        let mut start = start;
+        let end_freq = self.track.freq;
+        if (end_freq - start.freq).abs() > REFINE_RETRY_HZ {
+            let mut t2 = start;
+            t2.freq = end_freq;
+            let r2 = super::refine::refine(buf, &t2, chips, main_lag, seg, 60e-6);
+            if r2.is_some_and(|b| refined.is_none_or(|a| b.energy > a.energy)) {
+                refined = r2;
+                start = t2;
+            }
+        }
         let (fingers, shift) = match &refined {
             Some(r) => super::refine::tail_fingers(buf, r, &start, chips, seg),
             None => {
@@ -996,6 +1190,17 @@ impl PayloadRx {
                 super::refine::fingers_from_profile(&p)
             }
         };
+        if debug_usize("DEBUG_REACQ").is_some() {
+            eprintln!(
+                "block {} refined from symbol {from}: {} shift {shift:+.2}, end moved {:+.2} chips",
+                self.next_block,
+                if refined.is_some() { "fit" } else { "no fit," },
+                refined
+                    .as_ref()
+                    .map_or(shift, |r| (r.pos_end + shift * r.step - self.track.pos)
+                        / r.step)
+            );
+        }
         if !debug_frozen("track") {
             match refined {
                 Some(r) => {
@@ -1078,7 +1283,8 @@ impl PayloadRx {
     }
 
     /// The delay profile of the DS-PSK pilots in symbols `s_lo..s_hi`, where
-    /// `tc` is the track at symbol `s_lo` and `scr` the block's scrambler chips.
+    /// `tc` is the track at symbol `s_lo` and `scr` the block's scrambler chips. For
+    /// `dsc`, of the pilot code, a chunk at a time.
     fn profile_ds(
         &self,
         buf: &Buf,
@@ -1088,6 +1294,9 @@ impl PayloadRx {
         s_hi: usize,
     ) -> DelayProfile {
         let l = usize::from(self.header.mode.spread);
+        if self.layout.mode.family == Family::DsCdm {
+            return self.profile_cdm(buf, tc, scr, s_lo, s_hi);
+        }
         let per = PILOT_INTERVAL as usize;
         let dphi = tc.dphase();
         let mut power = vec![0.0f32; DelayProfile::LAGS];
@@ -1103,6 +1312,38 @@ impl PayloadRx {
                     acc += x * Iq::new(c as f32, -(s as f32)) * scr[n * l + k].conj() * p;
                 }
                 *pw += (acc / l as f32).norm_sqr();
+            }
+        }
+        DelayProfile { power }
+    }
+
+    /// The delay profile of a `dsc` block's pilot code in symbols `s_lo..s_hi`: at
+    /// each lag, every pilot chunk's chips summed coherently (the pilot is a real
+    /// constant under the scrambler), the chunks' powers added.
+    fn profile_cdm(
+        &self,
+        buf: &Buf,
+        tc: &Track,
+        scr: &[Iq],
+        s_lo: usize,
+        s_hi: usize,
+    ) -> DelayProfile {
+        let l = usize::from(self.header.mode.spread);
+        let c = cdm_chunk(l);
+        let dphi = tc.dphase();
+        let mut power = vec![0.0f32; DelayProfile::LAGS];
+        for (i, pw) in power.iter_mut().enumerate() {
+            let lag = DelayProfile::lag(i);
+            for n in (s_lo..s_hi).filter(|n| n % c == 0) {
+                let end = (n + c).min(s_hi);
+                let mut acc = Iq::new(0.0, 0.0);
+                for k in 0..(end - n) * l {
+                    let rel = (n - s_lo) * l + k;
+                    let (s, co) = (tc.phase + rel as f64 * dphi).sin_cos();
+                    let x = buf.at(tc.pos + (rel as f64 + lag) * tc.step);
+                    acc += x * Iq::new(co as f32, -(s as f32)) * scr[n * l + k].conj();
+                }
+                *pw += (acc / ((end - n) * l) as f32).norm_sqr();
             }
         }
         DelayProfile { power }
@@ -1195,17 +1436,27 @@ impl PayloadRx {
         }
     }
 
-    /// The DS-PSK block-start pre-pass: the profile of the first pilots.
+    /// The DS-PSK block-start pre-pass: the profile of the first pilots (`dsc`:
+    /// the first pilot chunks).
     fn ds_prepass(&mut self, buf: &Buf, scr: &[Iq]) {
         let l = usize::from(self.header.mode.spread);
-        let per = PILOT_INTERVAL as usize;
-        let all = self.layout.symbols() / per + 1;
+        let cdm = self.layout.mode.family == Family::DsCdm;
+        let per = if cdm {
+            cdm_chunk(l)
+        } else {
+            PILOT_INTERVAL as usize
+        };
+        let all = if cdm {
+            self.layout.symbols().div_ceil(per)
+        } else {
+            self.layout.symbols() / per + 1
+        };
         // Only the start of the block: a clock error left over from the start-up
         // estimates moves the later pilots by chips.
         let pilot_s = per as f64 * l as f64 / f64::from(self.header.profile.chip_rate());
         let pilots = all.min(((PREPASS_S / pilot_s).ceil() as usize).max(PREPASS_MIN));
         let t = self.track;
-        let profile = self.profile_ds(buf, &t, scr, 0, pilots * per);
+        let profile = self.profile_ds(buf, &t, scr, 0, (pilots * per).min(self.layout.symbols()));
         if let Some(shift) = self.adopt(&profile) {
             self.track.pos += shift * self.track.step;
         }
@@ -1239,7 +1490,7 @@ impl PayloadRx {
         let freq_every = ((FREQ_UPDATE_S / t_sym).ceil() as usize).max(4);
         let chunk = (((SEARCH_S / t_sym).ceil() as usize).max(SEARCH_MIN_SYMBOLS)).min(wk.s_count);
         let win = ((rewind::WATCH_S / t_sym).ceil() as usize).max(rewind::WATCH_MIN_SYMBOLS);
-        let max_windows = ((rewind::LOST_MAX_S / (win as f64 * t_sym)).ceil() as usize).max(2);
+        let max_windows = ((lost_max_s() / (win as f64 * t_sym)).ceil() as usize).max(2);
         let reach = rewind::SLIP_REACH_S * f64::from(self.header.profile.chip_rate());
         let h_l = harmonic(l);
         let bicsk = self.header.mode.family == Family::BiCsk;
@@ -1255,7 +1506,10 @@ impl PayloadRx {
                 }
                 wk.search = false;
                 let at_start = std::mem::take(&mut self.start_search);
-                if self.resync_csk(buf, wk, win) {
+                self.probing_start = at_start;
+                let rewound = self.resync_csk(buf, wk, win);
+                self.probing_start = false;
+                if rewound {
                     if at_start {
                         // What the watch settled to was the wrong lag's.
                         self.watch.settled = None;
@@ -1266,10 +1520,11 @@ impl PayloadRx {
                     self.watch.lost = None;
                 }
             }
-            if let Some((at, d)) = wk.slip
+            if let Some((at, d, df)) = wk.slip
                 && at == wk.s
             {
                 wk.t.pos += d * wk.t.step;
+                wk.t.freq += df;
                 wk.slip = None;
                 wk.slipped_at = Some(wk.s);
                 // The searcher's chunk starts again here: a chunk that straddles
@@ -1433,12 +1688,6 @@ impl PayloadRx {
                 let judged = self
                     .watch
                     .push(e - h_l * others, 0.0, win, wk.s, max_windows);
-                if judged.is_some() && std::env::var("DECDSSS_DEBUG_SLIP").is_ok() {
-                    eprintln!(
-                        "DBG csk watch s {} {:?} settled {:?} noise {:?} pos {:.1}",
-                        wk.s, judged, self.watch.settled, self.watch.noise, wk.t.pos
-                    );
-                }
                 match judged {
                     Some(Judged::Locked) => {
                         if std::mem::take(&mut self.check_start) {
@@ -1456,7 +1705,12 @@ impl PayloadRx {
                         wk.snaps.push(snap);
                     }
                     Some(Judged::Lost | Judged::StillLost) => wk.search = true,
-                    Some(Judged::Recovered | Judged::GiveUp) | None => {}
+                    Some(Judged::Recovered | Judged::GiveUp) => {
+                        // Back where the loops are, or given up: the search is over.
+                        wk.reacq = None;
+                        self.live.searching = false;
+                    }
+                    None => {}
                 }
             }
         }
@@ -1528,8 +1782,8 @@ impl PayloadRx {
             despread(buf, t, sc, lag, u);
             rewind::csk_excess(&walsh_correlate(u), h_l)
         };
-        let span = (lost.since.min(wk.s - 1), wk.s);
-        let Some((k, d)) = self.find_slip(
+        let span = (self.slip_span_from(lost.since, wk.s, win), wk.s);
+        if let Some((k, d)) = self.find_slip(
             buf,
             &wk.ts,
             wk.shifted,
@@ -1539,14 +1793,256 @@ impl PayloadRx {
             win,
             &csk,
             true,
-        ) else {
+        ) {
+            self.csk_rewind(wk, k);
+            wk.slip = Some((k, d, 0.0));
+            wk.reacq = None;
+            self.watch.lost = None;
+            self.live.slips += 1;
+            return true;
+        }
+        if reacq::disabled() || self.probing_start {
             return false;
-        };
-        self.csk_rewind(wk, k);
-        wk.slip = Some((k, d));
+        }
+        let found = self.reacquire(
+            buf,
+            &wk.ts,
+            wk.shifted,
+            &wk.scr,
+            (lost.since, wk.s),
+            win,
+            &mut wk.reacq,
+        );
+        if let Some(f) = found
+            && debug_usize("DEBUG_REACQ").is_some()
+        {
+            eprintln!(
+                "block {} symbol {} lost since {}: {f:?} (track {:+.2} Hz)",
+                self.next_block, wk.s, lost.since, wk.t.freq
+            );
+        }
+        match found {
+            Some(f) if f.here => {
+                wk.reacq = None;
+                self.relocked_here();
+                false
+            }
+            Some(f) => {
+                wk.reacq = None;
+                let k = f.from.max(wk.snaps[0].s);
+                self.csk_rewind(wk, k);
+                wk.slip = Some((k, f.delta, f.freq));
+                self.watch.lost = None;
+                self.live.reacquired += 1;
+                self.live.searching = false;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Where the slip search starts: at the loss, but no more than the watch's four
+    /// seconds back (the slip search sums every symbol it covers at every lag each
+    /// window, and the reacquisition looks further).
+    fn slip_span_from(&self, since: usize, s: usize, win: usize) -> usize {
+        let t_sym = f64::from(self.header.mode.spread) / f64::from(self.header.profile.chip_rate());
+        let cap = ((rewind::LOST_MAX_S / t_sym).ceil() as usize).max(win);
+        since.max(s.saturating_sub(cap)).min(s - 1)
+    }
+
+    /// The reacquisition found the station where the loops are: it was only weaker.
+    /// The watch starts again from the level there is (its next window settles it).
+    fn relocked_here(&mut self) {
         self.watch.lost = None;
-        self.live.slips += 1;
-        true
+        self.watch.settled = None;
+        self.live.searching = false;
+    }
+
+    /// The reacquisition search (see [`reacq`]) on a block lost since symbol
+    /// `since`, with the symbols up to `s` taken: the windows not yet searched, then
+    /// the verdict over the last few. `ts`, `shifted` and `scr` as for
+    /// [`PayloadRx::find_slip`].
+    #[allow(clippy::too_many_arguments)]
+    fn reacquire(
+        &mut self,
+        buf: &Buf,
+        ts: &[(Track, f64)],
+        shifted: f64,
+        scr: &[Iq],
+        (since, s): (usize, usize),
+        win: usize,
+        search: &mut Option<reacq::Search>,
+    ) -> Option<reacq::Found> {
+        let nf = self.fingers.len().min(SLOTS);
+        if nf == 0 {
+            return None;
+        }
+        self.live.searching = true;
+        let l = usize::from(self.header.mode.spread);
+        let cr = f64::from(self.header.profile.chip_rate());
+        let t_sym = l as f64 / cr;
+        let family = self.layout.mode.family;
+        // A unit is what is correlated coherently: a DS-PSK pilot symbol, a quarter
+        // second of `dsc` symbols, a CSK symbol.
+        let (kind, unit) = match family {
+            Family::DsPsk => (reacq::Kind::Coherent, 1),
+            Family::DsCdm => (
+                reacq::Kind::Coherent,
+                ((reacq::COHERENT_S / t_sym).floor() as usize).max(1),
+            ),
+            Family::Csk | Family::BiCsk => (reacq::Kind::Walsh, 1),
+        };
+        let lags: Vec<f64> = self.fingers[..nf].iter().map(|f| f.lag).collect();
+        if search.is_none() {
+            let freq = ts
+                .get(s.saturating_sub(1))
+                .map_or(self.track.freq, |t| t.0.freq);
+            let room = (
+                freq - (self.f0 - FREQ_MAX_EXCURSION),
+                self.f0 + FREQ_MAX_EXCURSION - freq,
+            );
+            let grid = reacq::Grid::new(reacq::REACH_S * cr, unit as f64 * t_sym, room);
+            let span = (reacq::SPAN_S / (win as f64 * t_sym)).ceil() as usize;
+            *search = Some(reacq::Search::new(grid, kind, since, span));
+        }
+        let srch = search.as_mut()?;
+        while srch.next + win <= s {
+            let from = srch.next;
+            let (cells, terms) = self.reacq_window(
+                buf,
+                ts,
+                shifted,
+                scr,
+                (from, from + win),
+                &srch.grid,
+                &lags,
+                unit,
+            );
+            srch.push(from, cells, terms);
+            srch.next = from + win;
+        }
+        srch.detect()
+    }
+
+    /// One window of the reacquisition search: symbols `from..to`, every unit
+    /// correlated at every lag of the fingers' pattern moved over the grid's shifts
+    /// and at each of its carrier offsets, the powers summed over the units and the
+    /// fingers. Returns the cells and the exponential terms a cell sums (units ×
+    /// fingers; the Walsh statistic ignores it).
+    #[allow(clippy::too_many_arguments)]
+    fn reacq_window(
+        &self,
+        buf: &Buf,
+        ts: &[(Track, f64)],
+        shifted: f64,
+        scr: &[Iq],
+        (from, to): (usize, usize),
+        grid: &reacq::Grid,
+        lags: &[f64],
+        unit: usize,
+    ) -> (Vec<f64>, usize) {
+        let l = usize::from(self.header.mode.spread);
+        let cr = f64::from(self.header.profile.chip_rate());
+        let family = self.layout.mode.family;
+        let step = reacq::STEP_CHIPS;
+        let reach = grid.deltas.last().copied().unwrap_or(0.0);
+        let (lmin, lmax) = lags
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        let lag0 = lmin - reach;
+        let nabs = ((lmax + reach - lag0) / step).round() as usize + 1;
+        let nb = grid.freqs.len();
+        // e^{-j2π f t} for each offset over a unit's chips.
+        let rot: Vec<Vec<Iq>> = grid
+            .freqs
+            .iter()
+            .map(|&f| {
+                (0..unit * l)
+                    .map(|k| {
+                        let (s, c) = (-TAU * f * k as f64 / cr).sin_cos();
+                        Iq::new(c as f32, s as f32)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut pabs = vec![0.0f64; nabs * nb];
+        let mut u = vec![Iq::new(0.0, 0.0); l];
+        let mut acc = vec![Iq::new(0.0, 0.0); nb];
+        let mut units = 0usize;
+        // Symbol `s` despread at absolute lag `lag`, on the fingers' present scale.
+        let take = |s: usize, lag: f64, u: &mut [Iq]| {
+            let (t, moved) = ts[s];
+            despread(buf, &t, &scr[s * l..(s + 1) * l], lag + shifted - moved, u);
+        };
+        let mut s0 = from;
+        while s0 < to {
+            let s1 = match family {
+                Family::DsCdm => (s0 + unit).min(to),
+                _ => s0 + 1,
+            };
+            if family == Family::DsPsk && !self.layout.is_pilot(s0) {
+                s0 = s1;
+                continue;
+            }
+            units += 1;
+            for i in 0..nabs {
+                let lag = lag0 + i as f64 * step;
+                match family {
+                    Family::DsPsk => {
+                        take(s0, lag, &mut u);
+                        let p = pilot_symbol(s0 / PILOT_INTERVAL as usize).conj();
+                        for (b, r) in rot.iter().enumerate() {
+                            let c: Iq = u.iter().zip(r).map(|(z, w)| z * w).sum();
+                            pabs[i * nb + b] += f64::from((c * p / l as f32).norm_sqr());
+                        }
+                    }
+                    Family::DsCdm => {
+                        acc.fill(Iq::new(0.0, 0.0));
+                        for s in s0..s1 {
+                            take(s, lag, &mut u);
+                            let off = (s - s0) * l;
+                            for (a, r) in acc.iter_mut().zip(&rot) {
+                                *a += u
+                                    .iter()
+                                    .zip(&r[off..off + l])
+                                    .map(|(z, w)| z * w)
+                                    .sum::<Iq>();
+                            }
+                        }
+                        let n = ((s1 - s0) * l) as f32;
+                        for (b, a) in acc.iter().enumerate() {
+                            pabs[i * nb + b] += f64::from((a / n).norm_sqr());
+                        }
+                    }
+                    Family::Csk | Family::BiCsk => {
+                        take(s0, lag, &mut u);
+                        for (b, r) in rot.iter().enumerate() {
+                            let mut v: Vec<Iq> = u.iter().zip(r).map(|(z, w)| z * w).collect();
+                            fwht(&mut v);
+                            let m = v.iter().map(|z| z.norm_sqr()).fold(0.0f32, f32::max);
+                            pabs[i * nb + b] += f64::from(m / (l * l) as f32);
+                        }
+                    }
+                }
+            }
+            s0 = s1;
+        }
+        // The pattern: each finger at its lag moved by the shift.
+        let at = |lag: f64, b: usize| -> f64 {
+            let i = ((lag - lag0) / step).round();
+            if i < 0.0 || i as usize >= nabs {
+                0.0
+            } else {
+                pabs[i as usize * nb + b]
+            }
+        };
+        let mut cells = vec![0.0f64; grid.cells()];
+        for (d, &delta) in grid.deltas.iter().enumerate() {
+            for b in 0..nb {
+                cells[grid.cell(d, b)] = lags.iter().map(|&g| at(g + delta, b)).sum();
+            }
+        }
+        (cells, units * lags.len())
     }
 
     /// Pass two of a CSK block: per-finger noise and amplitude, then the
@@ -1613,14 +2109,21 @@ impl PayloadRx {
     /// block is done.
     fn advance_ds(&mut self, buf: &Buf, wk: &mut DsWork) -> bool {
         let l = usize::from(self.header.mode.spread);
-        let per = PILOT_INTERVAL as usize;
+        let cdm = wk.cdm;
+        // DS-PSK: symbols from one pilot to the next; `dsc`: in a pilot chunk.
+        let per = if cdm {
+            cdm_chunk(l)
+        } else {
+            PILOT_INTERVAL as usize
+        };
+        let (amp_d, amp_p) = cdm_amplitudes();
         let t_sym = l as f64 * wk.t.step / wk.t.rate;
         let t_pilot = per as f64 * t_sym;
         let freq_every = ((FREQ_UPDATE_S / t_pilot).ceil() as usize).max(3);
         let chunk_pilots = ((SEARCH_S / t_pilot).ceil() as usize).max(SEARCH_MIN_PILOTS);
         let chunk = chunk_pilots * per;
         let win = ((rewind::WATCH_S / t_sym).ceil() as usize).max(rewind::WATCH_MIN_SYMBOLS);
-        let max_windows = ((rewind::LOST_MAX_S / (win as f64 * t_sym)).ceil() as usize).max(2);
+        let max_windows = ((lost_max_s() / (win as f64 * t_sym)).ceil() as usize).max(2);
         let reach = rewind::SLIP_REACH_S * f64::from(self.header.profile.chip_rate());
         while wk.s < wk.s_count {
             if wk.t.pos + (l as f64 + AHEAD_CHIPS) * wk.t.step + 16.0 > buf.end() as f64 {
@@ -1635,7 +2138,10 @@ impl PayloadRx {
                 }
                 wk.search = false;
                 let at_start = std::mem::take(&mut self.start_search);
-                if self.resync_ds(buf, wk, win) {
+                self.probing_start = at_start;
+                let rewound = self.resync_ds(buf, wk, win);
+                self.probing_start = false;
+                if rewound {
                     if at_start {
                         // What the watch settled to was the wrong lag's.
                         self.watch.settled = None;
@@ -1647,12 +2153,14 @@ impl PayloadRx {
                     self.watch.lost = None;
                 }
             }
-            if let Some((at, d)) = wk.slip
+            if let Some((at, d, df)) = wk.slip
                 && at == wk.s
             {
                 // The signal goes on `d` chips away from here (a slip of the
-                // audio): the track moves, the fingers with it.
+                // audio, or where the reacquisition found it, `df` off the
+                // carrier): the track moves, the fingers with it.
                 wk.t.pos += d * wk.t.step;
+                wk.t.freq += df;
                 wk.slip = None;
                 wk.slipped_at = Some(wk.s);
                 // The searcher's chunk starts again here: a chunk that straddles
@@ -1673,17 +2181,40 @@ impl PayloadRx {
             wk.ts.push((wk.t, wk.shifted));
             let sc = &wk.scr[s * l..(s + 1) * l];
             let (mut e_sum, mut l_sum, mut p_sum) = (0.0f64, 0.0f64, 0.0f64);
+            // The magnitude a finger collects: the symbol's, or for `dsc` the pilot
+            // and data codes' together (the root of their summed power).
+            let mag = |u: &[Iq]| -> f64 {
+                if cdm {
+                    f64::from(sum(u).norm_sqr() + cdm_data(u).norm_sqr()).sqrt()
+                } else {
+                    f64::from(sum(u).norm())
+                }
+            };
             for (fi, f) in self.fingers.iter().enumerate().take(SLOTS) {
                 despread(buf, &wk.t, sc, f.lag, &mut wk.u);
                 wk.y[s][fi] = sum(&wk.u);
+                if cdm {
+                    wk.yd[s][fi] = cdm_data(&wk.u);
+                }
                 if fi == 0 {
                     self.live.despread_chips = wk.u.clone();
+                    if cdm {
+                        // The Walsh bank of the main finger: pilot, data, the rest.
+                        let w = walsh_correlate(&wk.u);
+                        let n2 = (l * l) as f32;
+                        let others = w.iter().skip(2).map(|z| z.norm_sqr()).sum::<f32>()
+                            / (l - 2).max(1) as f32;
+                        let now = [w[0].norm_sqr() / n2, w[1].norm_sqr() / n2, others / n2];
+                        for (c, x) in self.live.code_power.iter_mut().zip(now) {
+                            *c += 0.05 * (x - *c);
+                        }
+                    }
                 }
-                p_sum += f64::from(wk.y[s][fi].norm());
+                p_sum += mag(&wk.u);
                 despread(buf, &wk.t, sc, f.lag - 0.25, &mut wk.ue);
                 despread(buf, &wk.t, sc, f.lag + 0.25, &mut wk.ul);
-                e_sum += f64::from(sum(&wk.ue).norm());
-                l_sum += f64::from(sum(&wk.ul).norm());
+                e_sum += mag(&wk.ue);
+                l_sum += mag(&wk.ul);
             }
             if let Some(c) = self.dll.push(e_sum, l_sum) {
                 wk.t.pos += c * wk.t.step;
@@ -1709,6 +2240,12 @@ impl PayloadRx {
                     wk.freq_acc += a * b.conj();
                     wk.freq_norm += a.norm() * b.norm();
                 }
+                push_cap(
+                    &mut self.live.pilot_trace,
+                    wk.g[wk.pilot_no][0],
+                    LIVE_POINTS,
+                );
+                self.live.trace_dt = t_pilot;
                 wk.pilot_no += 1;
                 if wk.pilot_no.is_multiple_of(freq_every) {
                     wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, lag as f64 * t_pilot);
@@ -1718,31 +2255,45 @@ impl PayloadRx {
                     wk.freq_acc = Iq::new(0.0, 0.0);
                     wk.freq_norm = 0.0;
                 }
-            } else if wk.pilot_no > 0 {
-                // A data symbol for the display, rotated by the latest pilot's
-                // gain (the estimate the decoder will refine) and scaled to unit
-                // amplitude.
-                let mut z = Iq::new(0.0, 0.0);
-                let mut pw = 0.0f32;
-                for fi in 0..SLOTS {
-                    let h = wk.g[wk.pilot_no - 1][fi];
-                    z += h.conj() * wk.y[s][fi];
-                    pw += h.norm_sqr();
-                }
-                if pw > 0.0 {
-                    let z = z / pw;
-                    push_cap(&mut self.live.symbols, z, LIVE_POINTS);
-                    if let Some(p) = wk.prev_z {
-                        push_cap(&mut self.live.diffs, z * p.conj(), LIVE_POINTS);
+            } else {
+                if cdm {
+                    // The pilot code under every symbol, summed a chunk at a time:
+                    // the chunk's mean is the measurement the loops and the display
+                    // take, as DS-PSK takes a pilot symbol.
+                    for fi in 0..SLOTS {
+                        wk.chunk_acc[fi] += wk.y[s][fi];
                     }
-                    wk.prev_z = Some(z);
-                    // The error against the nearest QPSK point, averaged: its
-                    // inverse is the SNR of a symbol after combining.
-                    let k = std::f32::consts::FRAC_1_SQRT_2;
-                    let e = (z.re.abs() - k).powi(2) + (z.im.abs() - k).powi(2);
-                    wk.err2 += 0.02 * (e - wk.err2);
-                    // Unit-amplitude symbols: signal 1, noise the mean error.
-                    self.strip(1.0, wk.err2.max(1e-4), wk.t.freq, t_sym);
+                    wk.chunk_n += 1;
+                    if wk.chunk_n == per || s + 1 == wk.s_count {
+                        let k = wk.pilot_no;
+                        let whole = wk.chunk_n == per;
+                        for fi in 0..SLOTS {
+                            wk.g[k][fi] = wk.chunk_acc[fi] / wk.chunk_n as f32;
+                        }
+                        wk.chunk_acc = [Iq::new(0.0, 0.0); SLOTS];
+                        wk.chunk_n = 0;
+                        // The carrier from successive whole chunks, a chunk apart.
+                        if whole && k >= 1 {
+                            let (a, b) = (wk.g[k][0], wk.g[k - 1][0]);
+                            wk.freq_acc += a * b.conj();
+                            wk.freq_norm += a.norm() * b.norm();
+                        }
+                        push_cap(&mut self.live.pilot_trace, wk.g[k][0] / amp_p, LIVE_POINTS);
+                        self.live.trace_dt = t_pilot;
+                        wk.pilot_no += 1;
+                        if wk.pilot_no.is_multiple_of(freq_every) && !debug_frozen("cdm_loop") {
+                            wk.t.freq += freq_correction(wk.freq_acc, wk.freq_norm, t_pilot);
+                            wk.t.freq = wk
+                                .t
+                                .freq
+                                .clamp(self.f0 - FREQ_MAX_EXCURSION, self.f0 + FREQ_MAX_EXCURSION);
+                            wk.freq_acc = Iq::new(0.0, 0.0);
+                            wk.freq_norm = 0.0;
+                        }
+                    }
+                }
+                if wk.pilot_no > 0 {
+                    self.show_ds_symbol(wk, s, t_sym, (amp_d, amp_p));
                 }
             }
             if s.is_multiple_of(8) {
@@ -1771,14 +2322,23 @@ impl PayloadRx {
             wk.s += 1;
             self.live.symbol = wk.s;
             if wk.s > wk.replay_until && !no_rewind() {
-                let e: f64 = wk.y[s].iter().map(|y| f64::from(y.norm_sqr())).sum();
+                let mut e: f64 = wk.y[s].iter().map(|y| f64::from(y.norm_sqr())).sum();
+                if cdm {
+                    e += wk.yd[s]
+                        .iter()
+                        .map(|y| f64::from(y.norm_sqr()))
+                        .sum::<f64>();
+                }
                 // Noise: the same number of fingers where there is no path, eight
                 // chips past the last (beyond an HF delay spread at any profile).
                 let nf = self.fingers.len().min(SLOTS);
                 let off = self.fingers.iter().map(|f| f.lag).fold(0.0, f64::max) + 8.0;
                 let (t0, _) = wk.ts[s];
                 despread(buf, &t0, &wk.scr[s * l..(s + 1) * l], off, &mut wk.u);
-                let noise = nf as f64 * f64::from(sum(&wk.u).norm_sqr());
+                let mut noise = nf as f64 * f64::from(sum(&wk.u).norm_sqr());
+                if cdm {
+                    noise += nf as f64 * f64::from(cdm_data(&wk.u).norm_sqr());
+                }
                 match self.watch.push(e, noise, win, wk.s, max_windows) {
                     Some(Judged::Locked) => {
                         if std::mem::take(&mut self.check_start) {
@@ -1797,11 +2357,59 @@ impl PayloadRx {
                         wk.snaps.push(snap);
                     }
                     Some(Judged::Lost | Judged::StillLost) => wk.search = true,
-                    Some(Judged::Recovered | Judged::GiveUp) | None => {}
+                    Some(Judged::Recovered | Judged::GiveUp) => {
+                        // Back where the loops are, or given up: the search is over.
+                        wk.reacq = None;
+                        self.live.searching = false;
+                    }
+                    None => {}
                 }
             }
         }
         true
+    }
+
+    /// A data symbol for the display, rotated by the latest pilot's gain (the
+    /// estimate the decoder will refine) and scaled to unit amplitude; its error
+    /// against the nearest QPSK point feeds the SNR strip. `amps` are a `dsc` chip's
+    /// data and pilot amplitudes ([`cdm_amplitudes`]).
+    fn show_ds_symbol(&mut self, wk: &mut DsWork, s: usize, t_sym: f64, amps: (f32, f32)) {
+        let mut z = Iq::new(0.0, 0.0);
+        let mut pw = 0.0f32;
+        for fi in 0..SLOTS {
+            let h = wk.g[wk.pilot_no - 1][fi];
+            z += h.conj() * if wk.cdm { wk.yd[s][fi] } else { wk.y[s][fi] };
+            pw += h.norm_sqr();
+        }
+        if pw <= 0.0 {
+            return;
+        }
+        // For `dsc` the gain is the pilot's, which comes in at the pilot's amplitude,
+        // and the symbol the data's, at the data's.
+        let z = if wk.cdm {
+            z / pw * (amps.1 / amps.0)
+        } else {
+            z / pw
+        };
+        push_cap(&mut self.live.symbols, z, LIVE_POINTS);
+        if let Some(p) = wk.prev_z {
+            push_cap(&mut self.live.diffs, z * p.conj(), LIVE_POINTS);
+        }
+        wk.prev_z = Some(z);
+        // The error against the nearest QPSK point, averaged: its
+        // inverse is the SNR of a symbol after combining.
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        let e = (z.re.abs() - k).powi(2) + (z.im.abs() - k).powi(2);
+        wk.err2 += 0.02 * (e - wk.err2);
+        // Unit-amplitude symbols: signal 1, noise the mean error. A `dsc` data part
+        // has 1 − β of the symbol's energy, and the strip reads as a whole symbol's
+        // Es/N0 (Eb/N0 is taken from it), so it counts 1/(1 − β).
+        let signal = if wk.cdm {
+            1.0 / (1.0 - CDM_PILOT_SHARE)
+        } else {
+            1.0
+        };
+        self.strip(signal, wk.err2.max(1e-4), wk.t.freq, t_sym);
     }
 
     /// The tracking state of a DS-PSK block as it stands, for a rewind.
@@ -1810,6 +2418,8 @@ impl PayloadRx {
             s: wk.s,
             t: wk.t,
             pilot_no: wk.pilot_no,
+            chunk_acc: wk.chunk_acc,
+            chunk_n: wk.chunk_n,
             freq_acc: wk.freq_acc,
             freq_norm: wk.freq_norm,
             tc: wk.tc,
@@ -1833,6 +2443,8 @@ impl PayloadRx {
         wk.s = n.s;
         wk.t = n.t;
         wk.pilot_no = n.pilot_no;
+        wk.chunk_acc = n.chunk_acc;
+        wk.chunk_n = n.chunk_n;
         wk.freq_acc = n.freq_acc;
         wk.freq_norm = n.freq_norm;
         wk.tc = n.tc;
@@ -1907,16 +2519,6 @@ impl PayloadRx {
         let symbols = (to - from) as f64;
         let settled = self.watch.settled.unwrap_or(0.0);
         let (d, got, here) = rewind::best_shift(&energy, lag0, step, &lags, reach)?;
-        let dbg = std::env::var("DECDSSS_DEBUG_SLIP").is_ok();
-        if dbg {
-            eprintln!(
-                "DBG find_slip syms {from}..{to} d {d:.2} got {:.3} here {:.3} settled {:.3} noise {:?}",
-                got / symbols,
-                here / symbols,
-                self.watch.settled.unwrap_or(0.0),
-                self.watch.noise
-            );
-        }
         // `clear_of_noise`: `energy_at` has taken the noise off already.
         let noise_sym = if clear_of_noise {
             0.0
@@ -1941,11 +2543,8 @@ impl PayloadRx {
         let mut sorted = energy.clone();
         sorted.sort_by(f64::total_cmp);
         let noise = nf as f64 * sorted[sorted.len() / 2] / symbols;
-        let clean = rewind::is_clean_slip(&old, &new, split, win, noise);
-        if dbg {
-            eprintln!("DBG   lo {lo} split {split} noise {noise:.3} clean {clean}");
-        }
-        clean.then_some((lo + split, d))
+        rewind::is_clean_slip(&old, &new, split, win, noise)
+            .then(|| (lo + rewind::back_at(&new, split, win, noise), d))
     }
 
     /// The search for a DS-PSK block; on a slip, rewinds to before it and goes
@@ -1961,12 +2560,15 @@ impl PayloadRx {
         if wk.s == 0 {
             return false;
         }
-        let ds = |buf: &Buf, t: &Track, sc: &[Iq], lag: f64, u: &mut [Iq]| {
+        // Rust note: `move` copies `cdm` into the closure, which then borrows nothing.
+        let cdm = wk.cdm;
+        let ds = move |buf: &Buf, t: &Track, sc: &[Iq], lag: f64, u: &mut [Iq]| {
             despread(buf, t, sc, lag, u);
-            f64::from(sum(u).norm_sqr())
+            let p = sum(u).norm_sqr();
+            f64::from(if cdm { p + cdm_data(u).norm_sqr() } else { p })
         };
-        let span = (lost.since.min(wk.s - 1), wk.s);
-        let Some((k, d)) = self.find_slip(
+        let span = (self.slip_span_from(lost.since, wk.s, win), wk.s);
+        if let Some((k, d)) = self.find_slip(
             buf,
             &wk.ts,
             wk.shifted,
@@ -1976,14 +2578,58 @@ impl PayloadRx {
             win,
             &ds,
             false,
-        ) else {
+        ) {
+            if debug_usize("DEBUG_REACQ").is_some() {
+                eprintln!(
+                    "block {} symbol {}: slip at {k} of {d:+.2} chips",
+                    self.next_block, wk.s
+                );
+            }
+            self.ds_rewind(wk, k);
+            wk.slip = Some((k, d, 0.0));
+            wk.reacq = None;
+            self.watch.lost = None;
+            self.live.slips += 1;
+            return true;
+        }
+        if reacq::disabled() || self.probing_start {
             return false;
-        };
-        self.ds_rewind(wk, k);
-        wk.slip = Some((k, d));
-        self.watch.lost = None;
-        self.live.slips += 1;
-        true
+        }
+        let found = self.reacquire(
+            buf,
+            &wk.ts,
+            wk.shifted,
+            &wk.scr,
+            (lost.since, wk.s),
+            win,
+            &mut wk.reacq,
+        );
+        if let Some(f) = found
+            && debug_usize("DEBUG_REACQ").is_some()
+        {
+            eprintln!(
+                "block {} symbol {} lost since {}: {f:?} (track {:+.2} Hz)",
+                self.next_block, wk.s, lost.since, wk.t.freq
+            );
+        }
+        match found {
+            Some(f) if f.here => {
+                wk.reacq = None;
+                self.relocked_here();
+                false
+            }
+            Some(f) => {
+                wk.reacq = None;
+                let k = f.from.max(wk.snaps[0].s);
+                self.ds_rewind(wk, k);
+                wk.slip = Some((k, f.delta, f.freq));
+                self.watch.lost = None;
+                self.live.reacquired += 1;
+                self.live.searching = false;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Pass two of a DS-PSK block: smoothed, shrunk and interpolated pilot
@@ -1997,8 +2643,11 @@ impl PayloadRx {
 
         // Smooth the pilot gains (a triangle of `half` pilots either side, [1 2 1]/4
         // at SF 4; shorter at the ends) and interpolate linearly to the data symbols.
-        let half = smooth_half_width(usize::from(self.header.mode.spread));
+        let l = usize::from(self.header.mode.spread);
+        let half = smooth_half_width(l);
         let mut hs = smooth_gains(g, half);
+        let pilot_rate = f64::from(self.header.profile.chip_rate()) / (per * l) as f64;
+        self.live.est_band_hz = (smooth_noise_gain(half) * pilot_rate / 2.0) as f32;
         // Per finger, the noise in a pilot gain from the second difference (the
         // smooth channel cancels): var(g_k − (g_{k−1}+g_{k+1})/2) = 1.5 σ². A
         // smoothed estimate carries `smooth_noise_gain(half)` of σ² (0.375 for
@@ -2065,6 +2714,73 @@ impl PayloadRx {
             Some(g) => self.finish(buf, &g, Some(&llrs), snr, start, from),
             None => self.finish(buf, &llrs, None, snr, start, from),
         }
+    }
+
+    /// Pass two of a `dsc` block: each symbol's channel from its own pilot
+    /// correlation, smoothed by the triangle that cross-validates best
+    /// ([`cdm_half_width`]) and shrunk where a finger is not clearly above its noise,
+    /// then maximal-ratio combining of the data code's correlations, and the
+    /// decoder. (No G-RAKE: at SF 8 and above it gave DS-PSK nothing measurable,
+    /// DESIGN.md *G-RAKE against the rake*, and these are SF 8 to 64.)
+    fn finish_cdm(&mut self, buf: &Buf, wk: DsWork) -> BlockResult {
+        self.track = wk.t;
+        let (_, amp_p) = cdm_amplitudes();
+        let s_count = wk.s_count;
+        let nf = self.fingers.len().clamp(1, SLOTS);
+        // The raw channel at each symbol, on the scale of a whole symbol's amplitude.
+        let raw: Vec<[Iq; SLOTS]> = wk.y.iter().map(|y| y.map(|z| z / amp_p)).collect();
+        let half = debug_usize("DEBUG_CDM_HALF")
+            .unwrap_or_else(|| cdm_half_width(&raw, nf, (s_count / 4).max(1)));
+        let mut hs = smooth_gains(&raw, half);
+        let ng = smooth_noise_gain(half);
+        let sym_rate =
+            f64::from(self.header.profile.chip_rate()) / f64::from(self.header.mode.spread);
+        self.live.est_band_hz = (ng * sym_rate / 2.0) as f32;
+        // Per finger, a raw estimate's noise from the second difference (as for
+        // DS-PSK's pilot gains), and the power subtraction that cuts a finger which is
+        // not clearly above what its smoothed estimate carries of it.
+        let mut var0 = f64::NAN;
+        for fi in 0..SLOTS {
+            let (mut acc, mut cnt) = (0.0f64, 0usize);
+            for k in 1..s_count.saturating_sub(1) {
+                let d = raw[k][fi] - (raw[k - 1][fi] + raw[k + 1][fi]) * 0.5;
+                acc += f64::from(d.norm_sqr()) / 1.5;
+                cnt += 1;
+            }
+            if cnt == 0 {
+                continue;
+            }
+            let var_raw = acc / cnt as f64;
+            if fi == 0 {
+                var0 = var_raw;
+            }
+            let var = (ng * var_raw) as f32;
+            for h in hs.iter_mut() {
+                let p = h[fi].norm_sqr();
+                if p > 0.0 {
+                    h[fi] *= ((p - var).max(0.0) / p).sqrt();
+                }
+            }
+        }
+        // A whole symbol's Es/N0: the raw estimate is the pilot over its amplitude, so
+        // its SNR is β times the symbol's.
+        let p_main = hs.iter().map(|h| f64::from(h[0].norm_sqr())).sum::<f64>() / s_count as f64;
+        let snr = if var0 > 0.0 {
+            10.0 * (p_main / (var0 * f64::from(CDM_PILOT_SHARE))).log10()
+        } else {
+            f64::NAN
+        };
+        let mut llrs = Vec::with_capacity(s_count * 2);
+        // Rust note: `zip` walks the two per-symbol arrays side by side, here and
+        // across the finger slots.
+        for (h, yd) in hs.iter().zip(&wk.yd) {
+            let z: Iq = h.iter().zip(yd).map(|(h, y)| h.conj() * y).sum();
+            // As for DS-PSK, Σ conj(ĥ)·y with a readable scale.
+            llrs.push(4.0 * z.re);
+            llrs.push(4.0 * z.im);
+        }
+        let (start, from) = refine_from(&wk.ts, wk.shifted, wk.slipped_at, wk.start);
+        self.finish(buf, &llrs, None, snr, start, from)
     }
 
     /// The G-RAKE's LLRs for a DS-PSK block (see [`grake`]): at every pilot, the
@@ -2237,6 +2953,32 @@ mod tests {
             }
         });
         results.into_inner().unwrap()
+    }
+
+    /// Frame loss of DS-PSK and `dsc` from a genie start, for chasing a difference:
+    /// `DEBUG_MODES=ds64-1/2,dsc64-1/2 DEBUG_EBN0=4.5 DEBUG_FADING=moderate
+    /// DEBUG_PROFILE=500`, with the knobs `DEBUG_CDM_CHUNK` (chips) and
+    /// `DEBUG_CDM_HALF` (symbols) and `DEBUG_FREEZE=cdm_loop`.
+    #[test]
+    #[ignore]
+    fn debug_cdm_floor() {
+        let modes = std::env::var("DEBUG_MODES").unwrap_or("ds64-1/2,dsc64-1/2".into());
+        let ebn0: f64 = std::env::var("DEBUG_EBN0")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4.5);
+        let fading = std::env::var("DEBUG_FADING")
+            .ok()
+            .and_then(|v| Watterson::from_name(&v));
+        let profile = match std::env::var("DEBUG_PROFILE").as_deref() {
+            Ok("500") => Profile::N500,
+            _ => Profile::W2400,
+        };
+        let trials = debug_usize("DEBUG_TRIALS").unwrap_or(24);
+        for mode in modes.split(',') {
+            let (bad, total) = genie_fer(profile, mode, 2, 2, ebn0, trials, fading);
+            println!("{mode:10} {ebn0:4.1} dB: {bad}/{total} lost");
+        }
     }
 
     fn seg_block_seconds(seg: &crate::tx::Segment) -> f64 {
@@ -2791,6 +3533,269 @@ mod tests {
             let (ok, total, note) = recover(Profile::W2400, mode, 1, 2, &ch);
             assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");
         }
+    }
+
+    /// What happens to a transmission in a deep fade (silence) of `fade_s` seconds
+    /// from `fade_at` (audio seconds), while which the audio slips by `slip_ms`
+    /// (cut out when negative, silence put in when positive) and the carrier moves
+    /// by `step_hz` (from the fade's middle on): the clean audio, then the channel.
+    fn faded(
+        seg: &crate::tx::Segment,
+        ch: &decdsss_chan::Channel,
+        (fade_at, fade_s): (f64, f64),
+        slip_ms: f64,
+        step_hz: f64,
+    ) -> Vec<f32> {
+        let chips = crate::tx::segment_chips(seg).unwrap();
+        let audio = crate::tx::chips_to_audio(&chips, seg.header.profile, FS, LEVEL, 1.0, 1.0);
+        let x = decdsss_dsp::hilbert::analytic(&audio, 255);
+        let (a, b) = (fade_at * FS, (fade_at + fade_s) * FS);
+        let mid = 0.5 * (a + b);
+        let edge = 0.05 * FS;
+        let mut y: Vec<f32> = x
+            .iter()
+            .enumerate()
+            .map(|(n, &z)| {
+                let t = n as f64;
+                // A raised-cosine edge of 50 ms each way into the silence.
+                let g = if t <= a - edge || t >= b + edge {
+                    1.0
+                } else if t >= a && t <= b {
+                    0.0
+                } else {
+                    let d = if t < a { a - t } else { t - b };
+                    0.5 - 0.5 * (std::f64::consts::PI * d / edge).cos()
+                };
+                let z = if t > mid {
+                    let turns = (step_hz * (t - mid) / FS).fract();
+                    z * Iq::from_polar(1.0, (TAU * turns) as f32)
+                } else {
+                    z
+                };
+                (z.re as f64 * g) as f32
+            })
+            .collect();
+        let at = mid as usize;
+        let n = (slip_ms.abs() * 1e-3 * FS) as usize;
+        if slip_ms < 0.0 {
+            y.drain(at..at + n);
+        } else {
+            y.splice(at..at, std::iter::repeat_n(0.0, n));
+        }
+        ch.apply(&y, FS)
+    }
+
+    /// Frames delivered after a fade: (all good frames, frames of the blocks that
+    /// start two seconds or more after the fade ends good, those frames), and the
+    /// reacquisitions and slips the receiver counted.
+    fn after_fade(
+        profile: Profile,
+        mode: &str,
+        (fade_s, slip_ms, step_hz): (f64, f64, f64),
+        ebn0: f64,
+        seed: u64,
+    ) -> (usize, usize, usize, usize, usize) {
+        let m = decdsss_core::Mode::from_name(mode).unwrap();
+        let depth = if m.symbol_rate(profile) < 40.0 { 1 } else { 2 };
+        let layout = Layout::new(profile, m, depth);
+        // About a minute of payload, at least four blocks.
+        let nblocks = ((60.0 / layout.seconds()).ceil() as u16).max(4);
+        let seg = segment(profile, mode, depth, nblocks);
+        let mut ch = channel(profile, ebn0 + m.snr_offset_db(profile));
+        ch.seed = 900 + seed;
+        ch.offset_hz = 2.0;
+        ch.clock_ppm = 20.0;
+        let total_s =
+            crate::tx::segment_chips(&seg).unwrap().len() as f64 / f64::from(profile.chip_rate());
+        let payload_s = f64::from(nblocks) * layout.seconds();
+        // The payload starts 1 s (the lead) + the start-up in; the fade 15 s into it.
+        let pay0 = 1.0 + total_s - payload_s;
+        let fade_at = pay0 + 15.0;
+        let audio = faded(&seg, &ch, (fade_at, fade_s), slip_ms, step_hz);
+        let Ok(run) = to_header(&audio, profile) else {
+            return (0, 0, 0, 0, 0);
+        };
+        let mut rx = PayloadRx::new(&run.header, run.fe.out_rate()).unwrap();
+        let mut fe = crate::rx::frontend::Frontend::new(profile, FS);
+        let mut rest = Vec::new();
+        fe.push(&audio, &mut rest);
+        let mut buf = crate::rx::frontend::Buf::default();
+        buf.push(&rest);
+        let (mut good, mut late_good, mut late) = (0, 0, 0);
+        while let Some(r) = rx.step(&buf) {
+            let ok = r
+                .frames
+                .iter()
+                .enumerate()
+                .filter(|(i, f)| f.as_ref() == Some(&seg.frames[r.first_frame + i]))
+                .count();
+            good += ok;
+            if pay0 + r.index as f64 * layout.seconds() >= fade_at + fade_s + 2.0 {
+                late += r.frames.len();
+                late_good += ok;
+            }
+        }
+        let live = rx.live();
+        (good, late_good, late, live.reacquired, live.slips)
+    }
+
+    #[test]
+    fn a_station_that_moved_in_a_long_fade_is_found_again() {
+        // Twenty seconds of silence (five times the slip search's four), 30 ms of
+        // audio put in across it and the carrier 3 Hz lower after it. Without the
+        // reacquisition (`DECDSSS_NO_REACQ=1`) DS8 lost all 8 frames after the fade on
+        // this seed (seeds 0 and 2 survived on the slip search); with it, none, the
+        // station found again once (2026-10-20).
+        for mode in ["ds8-1/2", "dsc8-1/2"] {
+            let (_, late_good, late, reacq, slips) =
+                after_fade(Profile::W2400, mode, (20.0, 30.0, -3.0), 10.0, 1);
+            assert!(
+                late > 0 && late_good == late,
+                "{mode}: {late_good} of {late} frames after the fade \
+                 ({reacq} reacquisitions, {slips} slips)"
+            );
+        }
+    }
+
+    /// Frames delivered after a long fade in which the station moved, with the
+    /// reacquisition and without it: run twice, the second time with
+    /// `DECDSSS_NO_REACQ=1`, as
+    /// `cargo test -p decdsss-phy --release -- --ignored --nocapture reacq_fade_curve`.
+    /// `REACQ_MODES=ds8-1/2,...` and `REACQ_PROFILE=500` choose what is run.
+    #[test]
+    #[ignore]
+    fn reacq_fade_curve() {
+        let profile = match std::env::var("REACQ_PROFILE").as_deref() {
+            Ok("500") => Profile::N500,
+            _ => Profile::W2400,
+        };
+        let modes: Vec<String> = std::env::var("REACQ_MODES").map_or_else(
+            |_| {
+                [
+                    "ds8-1/2",
+                    "dsc8-1/2",
+                    "ds64-1/2",
+                    "dsc64-1/2",
+                    "csk64-1/2",
+                    "bcsk64-1/2",
+                ]
+                .map(String::from)
+                .to_vec()
+            },
+            |v| v.split(',').map(String::from).collect(),
+        );
+        let off = reacq::disabled();
+        println!("reacquisition {}", if off { "off" } else { "on" });
+        // `REACQ_CASE=20,30,-3` (fade s, slip ms, step Hz) and `REACQ_SEED=1` run one.
+        let cases: Vec<(f64, f64, f64)> = match std::env::var("REACQ_CASE") {
+            Ok(v) => {
+                let x: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                vec![(x[0], x[1], x[2])]
+            }
+            Err(_) => vec![
+                (2.0, 0.0, 0.0),
+                (8.0, 0.0, 0.0),
+                (8.0, -20.0, 0.0),
+                (8.0, 0.0, 3.0),
+                (8.0, -20.0, 3.0),
+                (20.0, 30.0, -3.0),
+            ],
+        };
+        let seeds: Vec<u64> = match debug_usize("REACQ_SEED") {
+            Some(s) => vec![s as u64],
+            None => (0..4).collect(),
+        };
+        for mode in &modes {
+            for &(fade_s, slip_ms, step_hz) in &cases {
+                let trials: Vec<_> = seeds
+                    .iter()
+                    .copied()
+                    .map(|seed| after_fade(profile, mode, (fade_s, slip_ms, step_hz), 10.0, seed))
+                    .collect();
+                let late_good: usize = trials.iter().map(|t| t.1).sum();
+                let late: usize = trials.iter().map(|t| t.2).sum();
+                let good: usize = trials.iter().map(|t| t.0).sum();
+                let reacq: usize = trials.iter().map(|t| t.3).sum();
+                let slips: usize = trials.iter().map(|t| t.4).sum();
+                println!(
+                    "{mode:11} fade {fade_s:4.0} s slip {slip_ms:+4.0} ms step {step_hz:+3.0} Hz: \
+                     after the fade {late_good:3}/{late:3}, all good {good:4}, reacquired {reacq}, slips {slips}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dsc_blocks_decode_on_a_clean_channel() {
+        for mode in ["dsc8-1/2", "dsc16-2/3", "dsc32-3/4", "dsc64-1/2"] {
+            let ch = channel(Profile::W2400, 0.0);
+            let (ok, total, note) = recover(Profile::W2400, mode, 1, 2, &ch);
+            assert_eq!(ok, total, "{mode}: {ok}/{total} {note:?}");
+        }
+    }
+
+    #[test]
+    fn dsc_decodes_with_noise_offset_and_clock_error() {
+        // 5 dB over DS-PSK's measured need at the same SF, on both narrow profiles.
+        for (profile, mode) in [
+            (Profile::W2400, "dsc8-1/2"),
+            (Profile::W3000, "dsc16-3/4"),
+            (Profile::N500, "dsc8-1/2"),
+        ] {
+            let m = decdsss_core::Mode::from_name(mode).unwrap();
+            let mut ch = channel(profile, 9.5 + m.snr_offset_db(profile));
+            ch.offset_hz = 7.0;
+            ch.clock_ppm = 40.0;
+            let (ok, total, note) = recover(profile, mode, 2, 2, &ch);
+            assert_eq!(ok, total, "{profile:?} {mode}: {ok}/{total} {note:?}");
+        }
+    }
+
+    #[test]
+    fn dsc_chunks_hold_a_pilot_symbols_energy() {
+        // Eight symbols a chunk at every SF; at β = 1/8 that is L chips at full
+        // power, a DS-PSK pilot symbol at the same SF.
+        for sf in decdsss_core::mode::CDM_SPREADS {
+            let sf = usize::from(sf);
+            assert_eq!(cdm_chunk(sf), 8);
+            assert_eq!(
+                cdm_chunk(sf) as f32 * sf as f32 * CDM_PILOT_SHARE,
+                sf as f32
+            );
+        }
+    }
+
+    #[test]
+    fn cross_validation_picks_a_long_triangle_for_a_still_channel_and_a_short_one_for_a_fast_one() {
+        use decdsss_dsp::rng::Rng;
+        let mut rng = Rng::new(5);
+        let n = 2000;
+        let noisy = |rng: &mut Rng, h: Iq, sigma: f32| {
+            h + Iq::new(rng.gauss() as f32, rng.gauss() as f32) * sigma
+        };
+        // A constant channel in noise as strong as it: the longest width allowed.
+        let still: Vec<[Iq; SLOTS]> = (0..n)
+            .map(|_| {
+                [
+                    noisy(&mut rng, Iq::new(1.0, 0.0), 1.0),
+                    Iq::new(0.0, 0.0),
+                    Iq::new(0.0, 0.0),
+                ]
+            })
+            .collect();
+        assert_eq!(cdm_half_width(&still, 1, 256), 256);
+        // A channel turning a full cycle every 20 symbols, nearly noiseless: short.
+        let fast: Vec<[Iq; SLOTS]> = (0..n)
+            .map(|k| {
+                let ph = std::f32::consts::TAU * k as f32 / 20.0;
+                [
+                    noisy(&mut rng, Iq::new(ph.cos(), ph.sin()), 0.01),
+                    Iq::new(0.0, 0.0),
+                    Iq::new(0.0, 0.0),
+                ]
+            })
+            .collect();
+        assert!(cdm_half_width(&fast, 1, 256) <= 2);
     }
 
     #[test]

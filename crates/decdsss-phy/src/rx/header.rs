@@ -98,9 +98,10 @@ struct Symbol {
 const KP: f64 = 0.15;
 const KI: f64 = 0.01;
 /// The slip watch judges at least this many header symbols at a time (with
-/// [`rewind::WATCH_S`]): a CSK header symbol is far above the noise when the
-/// header can decode at all, so a short window does, and a slip is found
-/// before it has spoilt much of a header that is only 64 to 86 symbols long.
+/// [`rewind::WATCH_S`]). A header symbol is long (27 ms, CSK64 on 3k, to 640
+/// ms, CSK256 on 500), so a quarter second may hold only one or two; four keep
+/// a window's level steadier near threshold, and a slip is still found before
+/// it has spoilt much of a header only 64 to 86 symbols long.
 const WATCH_MIN_SYMBOLS: usize = 4;
 /// Slips one header may follow.
 const MAX_SLIPS: usize = 12;

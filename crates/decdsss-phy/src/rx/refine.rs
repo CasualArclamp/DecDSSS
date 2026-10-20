@@ -31,6 +31,9 @@ pub struct Refined {
     /// RMS scatter of the segment timings about the line, chips.
     pub timing_rms: f64,
     pub segments: usize,
+    /// The segments' correlation powers summed: how well the known chips were
+    /// found (a fit on a carrier a few hertz off finds little).
+    pub energy: f64,
 }
 
 /// Lags probed per segment, chips.
@@ -176,6 +179,7 @@ pub fn refine(
         freq: t.freq + df,
         timing_rms: rms,
         segments: pts.len(),
+        energy: wsum,
     })
 }
 

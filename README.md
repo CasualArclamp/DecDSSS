@@ -53,6 +53,16 @@ side by side. Two ways of spreading, as a ladder of modes (`decdsss modes`):
 - **Bi-orthogonal CSK** (BCSK32 … 256): CSK with the code's sign as one more bit a
   symbol, read against the symbol before, so still no pilots: 12 to 20 % more
   rate for the same signal.
+- **DS-PSK with a code-multiplexed pilot** (DSC8 … 64): the pilot is a Walsh code
+  under every chip at an eighth of the power, rather than one symbol in eight, so
+  the receiver measures the channel all the time. The same overhead, 8/7 of
+  DS-PSK's rate at the same SF, and it follows fast fading (flutter) that DS-PSK's
+  pilots cannot.
+
+When a station is lost (a deep fade, the audio slipping, the carrier moving while
+it was gone), the receiver searches for it over lag and carrier on what it knows
+of the signal and carries on mid-transmission, rather than waiting for the next
+preamble.
 
 LDPC (rate ½, ⅔ or ¾, 1152-bit codewords, designed in this repository) and a
 time interleaver sit under both. The 500 Hz profile has three slots, 500 Hz apart
@@ -70,7 +80,9 @@ and every measurement. In short, on AWGN through the whole receiver every mode
 from DS4 to CSK256 delivers all its frames at about 4 dB Eb/N0, which is an
 in-band SNR from −0.8 dB (DS4 ¾) down to −15.6 dB (DS64 ½); moderate and poor
 Watterson fading deliver every frame from 9–13 dB Eb/N0 (measured for DS8 and
-CSK64 on 2.4 kHz).
+CSK64 on 2.4 kHz). The DSC modes need 0.5–1 dB less Eb/N0 than DS-PSK at the same
+SF on AWGN, and on flutter fading DSC16 delivers every frame from 15 dB where DS16
+loses 86–100 % at any SNR measured.
 
 ## Use
 
@@ -87,6 +99,10 @@ cargo run --release -p decdsss-cli -- rx noisy.wav --out-dir received
 cargo run --release -p decdsss-cli -- devices
 cargo run --release -p decdsss-cli -- rx --device "CABLE-A Output" --out-dir received
 cargo run --release -p decdsss-cli -- tx data.bin --call VK2ABC --play "CABLE-A Input"
+
+# A KiwiSDR straight off the network (no browser, no virtual cable): host or its web address,
+# the dial frequency in kHz; --save keeps the audio as a WAV. The window's SOURCE has it too.
+cargo run --release -p decdsss-cli -- rx --kiwi kiwi.example.org:8073 --freq 7074 --out-dir received
 
 # A picture: scaled and compressed to fit 120 s of signal a pass, as a progressive JPEG
 cargo run --release -p decdsss-cli -- tx photo.png --call VK2ABC --mode ds8-1/2 --picture --air 120 -o pic.wav
