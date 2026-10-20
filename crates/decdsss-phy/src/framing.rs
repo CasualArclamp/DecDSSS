@@ -474,6 +474,8 @@ mod tests {
                         profile,
                         mode,
                         depth,
+                        // 37 as it comes; a version-2 header holds 0 to 15.
+                        session: PayloadType::File.fit_session(mode.family, header().session),
                         ..header()
                     };
                     let bits = h.pack().unwrap();
@@ -600,8 +602,10 @@ mod tests {
             bits[from..from + n].iter().fold(0u8, |v, &b| v * 2 + b)
         };
         let bits_of = |name: &str| {
+            let mode = Mode::from_name(name).unwrap();
             Header {
-                mode: Mode::from_name(name).unwrap(),
+                mode,
+                session: PayloadType::File.fit_session(mode.family, header().session),
                 ..header()
             }
             .pack()
