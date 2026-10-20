@@ -268,7 +268,9 @@ pub(crate) fn cut_segments(p: &Frames, frames: &[Vec<u8>]) -> Vec<Segment> {
                 depth: p.depth,
                 ptype: p.ptype,
                 call: p.call.to_string(),
-                session: p.session,
+                // Cut to what this mode and type's header holds: 6 bits as it comes,
+                // 5 for a wide payload type, 4 for bi-orthogonal CSK.
+                session: p.ptype.fit_session(p.mode.family, p.session),
                 frame0: from as u16,
                 nblocks: n as u16,
                 total_frames: frames.len() as u16,
