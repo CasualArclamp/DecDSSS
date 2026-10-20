@@ -491,7 +491,11 @@ impl App {
 
     /// Start (green) or Stop (red). `big` makes it a wide, tall button.
     fn run_button(&mut self, ui: &mut Ui, sh: &Shared, big: bool) {
-        let size = if big { vec2(110.0, 32.0) } else { vec2(0.0, 0.0) };
+        let size = if big {
+            vec2(110.0, 32.0)
+        } else {
+            vec2(0.0, 0.0)
+        };
         let (label, fill) = if sh.running {
             ("■  Stop", col::BAD)
         } else {
@@ -500,7 +504,11 @@ impl App {
         let text = RichText::new(label)
             .strong()
             .size(if big { 15.0 } else { 13.0 })
-            .color(if sh.running { Color32::WHITE } else { Color32::BLACK });
+            .color(if sh.running {
+                Color32::WHITE
+            } else {
+                Color32::BLACK
+            });
         if ui
             .add(egui::Button::new(text).fill(fill).min_size(size))
             .clicked()
@@ -553,7 +561,11 @@ impl App {
         if !(sh.tx.active || self.tx.live_active()) {
             return;
         }
-        let size = if big { vec2(100.0, 32.0) } else { vec2(0.0, 0.0) };
+        let size = if big {
+            vec2(100.0, 32.0)
+        } else {
+            vec2(0.0, 0.0)
+        };
         if ui
             .add(
                 egui::Button::new(RichText::new("■ STOP TX").strong().color(Color32::WHITE))
