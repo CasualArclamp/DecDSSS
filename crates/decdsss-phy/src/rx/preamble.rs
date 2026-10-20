@@ -238,9 +238,13 @@ impl PreambleTracker {
             .filter(|d| (*d as f64).abs() >= SLIP_MIN)
             .map(|d| (d, at(d)))
             .max_by(|a, b| a.1.total_cmp(&b.1))?;
-        // Strong enough to be the preamble, and gone from where it was.
+        // Strong enough to be the preamble, gone from where it was, and clear
+        // of the noise at the lags searched (near threshold the strongest
+        // period itself is not far over the noise, so half of it is no test:
+        // at 500 Hz, −13 dB in-band, a quarter of the locks were moved off the
+        // path by the best of the noise lags).
         let old = (-1..=1).map(at).fold(0.0, f64::max);
-        if pk < 0.5 * self.pmax || old > 0.25 * pk {
+        if pk < 0.5 * self.pmax || old > 0.25 * pk || !super::rewind::significant(&p, 1, pk) {
             return None;
         }
         // Not a path that was there all along.
