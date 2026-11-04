@@ -3,6 +3,8 @@
 
 # DecDSSS
 
+If you've found this worth your time, please consider [donating via PayPal](https://www.paypal.me/Arclamp).
+
 A narrowband spread-spectrum modem for amateur radio. It uses direct-sequence
 (DS-PSK) and code-shift-keyed (CSK) spreading inside an SSB voice channel of
 **500 Hz, 2.4 kHz or 3 kHz**, and carries files, pictures, Codec2 speech and text (CQ packets and chat). A signal can sit 15 dB under the noise in its own bandwidth and still
