@@ -3,7 +3,7 @@
 
 # DecDSSS
 
-[![release](https://img.shields.io/github/v/release/CasualArclamp/DecDSSS?logo=github&label=release)](https://github.com/CasualArclamp/DecDSSS/releases/latest)
+[![release](https://img.shields.io/github/v/release/CasualArclamp/DecDSSS?logo=github&label=release)](https://github.com/CasualArclamp/DecDSSS/releases/latest) [![downloads](https://img.shields.io/github/downloads/CasualArclamp/DecDSSS/total?logo=github&label=downloads)](https://github.com/CasualArclamp/DecDSSS/releases)
 
 If you've found this worth your time, please consider [donating via PayPal](https://www.paypal.me/Arclamp).
 
