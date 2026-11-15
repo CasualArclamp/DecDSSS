@@ -3,6 +3,8 @@
 
 # DecDSSS
 
+[![release](https://img.shields.io/github/v/release/CasualArclamp/DecDSSS?logo=github&label=release)](https://github.com/CasualArclamp/DecDSSS/releases/latest)
+
 If you've found this worth your time, please consider [donating via PayPal](https://www.paypal.me/Arclamp).
 
 A narrowband spread-spectrum modem for amateur radio. It uses direct-sequence
