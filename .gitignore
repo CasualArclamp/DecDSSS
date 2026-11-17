@@ -12,3 +12,5 @@
 *.wav
 *.cf32
 *.cs16
+# Notes for Claude Code sessions: local only
+CLAUDE.md
